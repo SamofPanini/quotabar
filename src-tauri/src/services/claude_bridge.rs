@@ -509,9 +509,7 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), BridgeError> {
                     && !window
                         .reset_at
                         .as_deref()
-                        .is_some_and(|timestamp| {
-                            DateTime::parse_from_rfc3339(timestamp).is_err()
-                        })
+                        .is_some_and(|timestamp| DateTime::parse_from_rfc3339(timestamp).is_err())
             })
     });
     let error_valid = match (snapshot.source, envelope.error) {
