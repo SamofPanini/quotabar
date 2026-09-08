@@ -361,9 +361,7 @@ async fn fetch_codex_rate_limits_from_auth(
                 .as_str()
                 .map(ToString::to_string)
         });
-    let account_key = account_id
-        .as_deref()
-        .map(|id| profile.cache_key(id));
+    let account_key = account_id.as_deref().map(|id| profile.cache_key(id));
     let request_sequence = codex_cache::next_request_sequence();
 
     let client = shared_http_client();
@@ -614,11 +612,21 @@ pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<Cod
         match read_auth_json_with_stamp(&profile) {
             Ok((auth_json, stamp)) => {
                 let info = info_from_auth(&profile, auth_json.clone(), stamp.clone());
-                let rate_limits = fetch_codex_rate_limits_from_auth(&profile, auth_json.clone(), stamp).await;
+                let rate_limits =
+                    fetch_codex_rate_limits_from_auth(&profile, auth_json.clone(), stamp).await;
                 let reset_credits = fetch_codex_reset_credits_from_auth(&profile, auth_json).await;
-                results.push(CodexProfileQuota { profile_id: profile.profile_id().to_string(), account_id: info.account_id.clone(), info, rate_limits, reset_credits });
+                results.push(CodexProfileQuota {
+                    profile_id: profile.profile_id().to_string(),
+                    account_id: info.account_id.clone(),
+                    info,
+                    rate_limits,
+                    reset_credits,
+                });
             }
-            Err(error) => results.push(CodexProfileQuota::disconnected(profile.profile_id().to_string(), error.message)),
+            Err(error) => results.push(CodexProfileQuota::disconnected(
+                profile.profile_id().to_string(),
+                error.message,
+            )),
         }
     }
     results
