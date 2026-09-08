@@ -215,7 +215,8 @@ struct SnapshotStore {
 
 impl SnapshotStore {
     fn insert(&mut self, envelope: Envelope) {
-        self.snapshots.insert(envelope.instance_id.clone(), envelope);
+        self.snapshots
+            .insert(envelope.instance_id.clone(), envelope);
     }
 
     fn get(&self, instance_id: &InstanceId) -> Option<&Envelope> {
@@ -302,9 +303,7 @@ fn select_fallback(
             continue;
         };
         match parse_payload(payload, kind) {
-            ParsedPayload::Rejected(error) => {
-                return unavailable(instance_id, route, error)
-            }
+            ParsedPayload::Rejected(error) => return unavailable(instance_id, route, error),
             ParsedPayload::Windows(windows) if !windows.is_empty() => {
                 return candidate(instance_id, route, observed_at, windows, kind)
             }
@@ -336,7 +335,15 @@ fn candidate(
         ),
         _ => unreachable!("endpoint candidates are handled before fallback selection"),
     };
-    envelope(instance_id, route, observed_at, source, confidence, Some(windows), error)
+    envelope(
+        instance_id,
+        route,
+        observed_at,
+        source,
+        confidence,
+        Some(windows),
+        error,
+    )
 }
 
 fn envelope(
@@ -470,9 +477,7 @@ fn has_forbidden_fragment(value: &str) -> bool {
         ]
         .iter()
         .any(|fragment| lower.contains(fragment))
-        || lower
-            .split(['-', '_'])
-            .any(|component| component == "org")
+        || lower.split(['-', '_']).any(|component| component == "org")
 }
 
 fn validate_envelope(envelope: &Envelope) -> Result<(), BridgeError> {
@@ -501,13 +506,22 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), BridgeError> {
                 !window
                     .used_percent
                     .is_some_and(|percent| !(0.0..=100.0).contains(&percent))
-                    && !window.reset_at.as_deref().is_some_and(|timestamp| {
-                        DateTime::parse_from_rfc3339(timestamp).is_err()
-                    })
+                    && !window
+                        .reset_at
+                        .as_deref()
+                        .is_some_and(|timestamp| {
+                            DateTime::parse_from_rfc3339(timestamp).is_err()
+                        })
             })
     });
     let error_valid = match (snapshot.source, envelope.error) {
-        (Source::StaleCache, Some(BridgeError { code: ErrorCode::Stale, .. })) => true,
+        (
+            Source::StaleCache,
+            Some(BridgeError {
+                code: ErrorCode::Stale,
+                ..
+            }),
+        ) => true,
         (Source::StaleCache, _) => false,
         (_, None) => true,
         (_, Some(_)) => false,
@@ -622,7 +636,13 @@ mod tests {
         .unwrap();
         assert_eq!(sse.snapshot.as_ref().unwrap().source, Source::CompletionSse);
         assert_eq!(
-            sse.snapshot.as_ref().unwrap().usage_windows.as_ref().unwrap()[0].name,
+            sse.snapshot
+                .as_ref()
+                .unwrap()
+                .usage_windows
+                .as_ref()
+                .unwrap()[0]
+                .name,
             UsageWindowName::SevenDay
         );
 
@@ -703,7 +723,10 @@ mod tests {
             TIME,
         )
         .unwrap();
-        assert_eq!(estimate.snapshot.as_ref().unwrap().source, Source::LocalEstimate);
+        assert_eq!(
+            estimate.snapshot.as_ref().unwrap().source,
+            Source::LocalEstimate
+        );
 
         transport.responses.insert(
             instance("stale-instance"),
@@ -745,7 +768,10 @@ mod tests {
             ParsedPayload::Rejected(error) if error == SAFE_MALFORMED
         ));
         let cases = [
-            ("bad-sse", response(None, Some(json!({"usageWindow": []})), None, None)),
+            (
+                "bad-sse",
+                response(None, Some(json!({"usageWindow": []})), None, None),
+            ),
             (
                 "bad-estimate",
                 response(None, None, Some(json!({"usageWindows": []})), None),
@@ -759,8 +785,7 @@ mod tests {
         let mut store = SnapshotStore::default();
         for (id, payload) in cases {
             transport.responses.insert(instance(id), payload);
-            let result =
-                normalize(&transport, &mut store, id, route("bad-demo"), TIME).unwrap();
+            let result = normalize(&transport, &mut store, id, route("bad-demo"), TIME).unwrap();
             assert_eq!(result.snapshot, None);
             assert_eq!(result.error, Some(SAFE_MALFORMED));
         }
@@ -792,7 +817,12 @@ mod tests {
         .unwrap();
         assert_eq!(output.error, Some(SAFE_REDACTED));
         let debug = format!("{output:?}");
-        for hidden in ["safe-instance", "safe-route", "authorization", "DO_NOT_EMIT_SENTINEL"] {
+        for hidden in [
+            "safe-instance",
+            "safe-route",
+            "authorization",
+            "DO_NOT_EMIT_SENTINEL",
+        ] {
             assert!(!debug.contains(hidden));
         }
     }
@@ -879,7 +909,12 @@ mod tests {
         }
         transport.responses.insert(
             instance("first-instance"),
-            response(Some(json!({"usageWindows": [], "extra": true})), None, None, None),
+            response(
+                Some(json!({"usageWindows": [], "extra": true})),
+                None,
+                None,
+                None,
+            ),
         );
         let failed = normalize(
             &transport,
