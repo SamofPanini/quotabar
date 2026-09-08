@@ -680,11 +680,9 @@ pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<Cod
                 let (limits_auth, limits_stamp) = snapshot.for_rate_limits();
                 let rate_limits =
                     fetch_codex_rate_limits_from_auth(&profile, limits_auth, limits_stamp).await;
-                let reset_credits = fetch_codex_reset_credits_from_auth(
-                    &profile,
-                    snapshot.for_reset_credits(),
-                )
-                .await;
+                let reset_credits =
+                    fetch_codex_reset_credits_from_auth(&profile, snapshot.for_reset_credits())
+                        .await;
                 results.push(CodexProfileQuota {
                     profile_id: profile.profile_id().to_string(),
                     account_id: info.account_id.clone(),
@@ -704,7 +702,10 @@ pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<Cod
 
 /// Invalid descriptors are represented in place so one bad route never suppresses valid rows.
 fn aliases_default_home(profile: &CodexProfile, default_home: Option<&PathBuf>) -> bool {
-    profile.home().zip(default_home).is_some_and(|(home, default)| home == default)
+    profile
+        .home()
+        .zip(default_home)
+        .is_some_and(|(home, default)| home == default)
 }
 
 pub(crate) async fn fetch_codex_profile_inputs(
@@ -745,11 +746,11 @@ pub(crate) async fn fetch_codex_profile_inputs(
 #[cfg(test)]
 mod tests {
     use super::{
-        aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs, fetch_codex_profiles,
-        parse_rate_limit_window, parse_reset_credit, read_auth_json_with_stamp,
-        retain_last_good_info, should_preserve_for_status, should_preserve_transport_failure,
-        window_minutes_from_seconds, AuthFileStamp, BatchSnapshotProbe, CodexData, LastGoodInfo,
-        BATCH_SNAPSHOT_PROBE,
+        aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs,
+        fetch_codex_profiles, parse_rate_limit_window, parse_reset_credit,
+        read_auth_json_with_stamp, retain_last_good_info, should_preserve_for_status,
+        should_preserve_transport_failure, window_minutes_from_seconds, AuthFileStamp,
+        BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
     };
     use crate::domain::account::{CodexProfile, CodexProfileInput};
     use base64::Engine as _;
@@ -1022,10 +1023,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let malformed_dir = std::env::temp_dir().join(format!(
-            "quotabar-p2-batch-bad-{}",
-            std::process::id()
-        ));
+        let malformed_dir =
+            std::env::temp_dir().join(format!("quotabar-p2-batch-bad-{}", std::process::id()));
         fs::create_dir_all(&malformed_dir).unwrap();
         fs::write(malformed_dir.join("auth.json"), "{").unwrap();
         let rows = tauri::async_runtime::block_on(fetch_codex_profile_inputs(vec![
@@ -1088,13 +1087,8 @@ mod tests {
         let rows = tauri::async_runtime::block_on(fetch_codex_profiles(vec![profile]));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].account_id.as_deref(), Some("acct-first"));
-        let observed = BATCH_SNAPSHOT_PROBE.with(|probe| {
-            probe
-                .borrow_mut()
-                .take()
-                .unwrap()
-                .observed_id_tokens
-        });
+        let observed = BATCH_SNAPSHOT_PROBE
+            .with(|probe| probe.borrow_mut().take().unwrap().observed_id_tokens);
         assert_eq!(observed.len(), 3);
         assert!(observed
             .iter()

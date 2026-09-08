@@ -214,7 +214,10 @@ mod tests {
         let unknown = cache.retain(None, error);
         assert!(same.connected);
         assert_eq!(same.primary.unwrap().used_percent, 10.0);
-        assert_eq!(same.error.as_deref(), Some("Network error: operation timed out"));
+        assert_eq!(
+            same.error.as_deref(),
+            Some("Network error: operation timed out")
+        );
         assert!(!switched.connected);
         assert!(!unknown.connected);
     }
