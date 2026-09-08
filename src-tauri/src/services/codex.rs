@@ -1,5 +1,6 @@
 use crate::domain::account::{
-    codex_account, default_codex_profile, AccountCacheKey, CodexProfile, CodexProfileQuota,
+    default_codex_profile, AccountCacheKey, CodexProfile, CodexProfileInput, CodexProfileQuota,
+    RouteKey,
 };
 use crate::domain::models::{
     CodexCredits, CodexData, CodexRateLimitWindow, CodexRateLimits, CodexResetCredit,
@@ -22,9 +23,9 @@ struct LastGoodInfo {
 
 /// Most recent successful fetch results, retained without TTL so a transient
 /// polling failure does not erase quota that was already displayed.
-static LAST_GOOD_INFO: OnceLock<Mutex<HashMap<String, LastGoodInfo>>> = OnceLock::new();
+static LAST_GOOD_INFO: OnceLock<Mutex<HashMap<RouteKey, LastGoodInfo>>> = OnceLock::new();
 
-fn last_good_info() -> &'static Mutex<HashMap<String, LastGoodInfo>> {
+fn last_good_info() -> &'static Mutex<HashMap<RouteKey, LastGoodInfo>> {
     LAST_GOOD_INFO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -215,7 +216,7 @@ fn fallback_or_disconnected_info(profile: &CodexProfile, error: StampedAuthReadE
     let transient = is_transient_os_error(&error.message);
     if let Ok(guard) = last_good_info().lock() {
         return retain_last_good_info(
-            guard.get(profile.profile_id()),
+            guard.get(profile.route()),
             error.pre_read_stamp.as_ref(),
             error.message,
             transient,
@@ -233,7 +234,14 @@ pub(crate) async fn fetch_codex_info_for(profile: &CodexProfile) -> CodexData {
         Ok(auth) => auth,
         Err(error) => return fallback_or_disconnected_info(profile, error),
     };
+    info_from_auth(profile, auth_json, auth_stamp)
+}
 
+fn info_from_auth(
+    profile: &CodexProfile,
+    auth_json: serde_json::Value,
+    auth_stamp: AuthFileStamp,
+) -> CodexData {
     let id_token = match auth_json["tokens"]["id_token"].as_str() {
         Some(token) => token,
         None => return CodexData::disconnected("No id_token found in auth.json"),
@@ -263,7 +271,7 @@ pub(crate) async fn fetch_codex_info_for(profile: &CodexProfile) -> CodexData {
 
     if let Ok(mut guard) = last_good_info().lock() {
         guard.insert(
-            profile.profile_id().to_string(),
+            profile.route().clone(),
             LastGoodInfo {
                 stamp: auth_stamp,
                 data: info.clone(),
@@ -291,7 +299,7 @@ fn transient_auth_failure_limits(
     auth_stamp: Option<&AuthFileStamp>,
     error: String,
 ) -> CodexRateLimits {
-    match codex_cache::retain_for_auth_stamp(profile.profile_id(), auth_stamp, error.clone()) {
+    match codex_cache::retain_for_auth_stamp(profile.route(), auth_stamp, error.clone()) {
         Ok(limits) => limits,
         Err(lock_error) => {
             log_msg(&format!("[RateLimits] {lock_error}"));
@@ -328,7 +336,14 @@ pub(crate) async fn fetch_codex_rate_limits_for(profile: &CodexProfile) -> Codex
             };
         }
     };
+    fetch_codex_rate_limits_from_auth(profile, auth_json, auth_stamp).await
+}
 
+async fn fetch_codex_rate_limits_from_auth(
+    profile: &CodexProfile,
+    auth_json: serde_json::Value,
+    auth_stamp: AuthFileStamp,
+) -> CodexRateLimits {
     let access_token = match auth_json["tokens"]["access_token"].as_str() {
         Some(token) => token,
         None => {
@@ -348,7 +363,7 @@ pub(crate) async fn fetch_codex_rate_limits_for(profile: &CodexProfile) -> Codex
         });
     let account_key = account_id
         .as_deref()
-        .map(|id| codex_account(profile.clone()).cache_key_for_resolved_id(id));
+        .map(|id| profile.cache_key(id));
     let request_sequence = codex_cache::next_request_sequence();
 
     let client = shared_http_client();
@@ -400,7 +415,7 @@ pub(crate) async fn fetch_codex_rate_limits_for(profile: &CodexProfile) -> Codex
         let error = "Token expired. Please run 'codex' to re-login.";
         log_msg(&format!("[RateLimits] auth failure: status={status}"));
         if let Err(cache_error) =
-            codex_cache::invalidate(account_key.as_ref(), profile.profile_id(), request_sequence)
+            codex_cache::invalidate(profile.route(), account_key.as_ref(), request_sequence)
         {
             log_msg(&format!(
                 "[RateLimits] failed to invalidate last-good cache: {cache_error}"
@@ -515,7 +530,13 @@ pub(crate) async fn fetch_codex_reset_credits_for(profile: &CodexProfile) -> Cod
         Ok(v) => v,
         Err(error) => return CodexResetCredits::disconnected(error),
     };
+    fetch_codex_reset_credits_from_auth(profile, auth_json).await
+}
 
+async fn fetch_codex_reset_credits_from_auth(
+    profile: &CodexProfile,
+    auth_json: serde_json::Value,
+) -> CodexResetCredits {
     let access_token = match auth_json["tokens"]["access_token"].as_str() {
         Some(token) => token,
         None => return CodexResetCredits::disconnected("No access_token found in auth.json"),
@@ -588,18 +609,46 @@ pub(crate) async fn fetch_codex_reset_credits_for(profile: &CodexProfile) -> Cod
 pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<CodexProfileQuota> {
     let mut results = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        let info = fetch_codex_info_for(&profile).await;
-        let rate_limits = fetch_codex_rate_limits_for(&profile).await;
-        let reset_credits = fetch_codex_reset_credits_for(&profile).await;
-        results.push(CodexProfileQuota {
-            profile_id: profile.profile_id().to_string(),
-            account_id: info.account_id.clone(),
-            info,
-            rate_limits,
-            reset_credits,
-        });
+        // Read one immutable credential snapshot before any awaited request. A rotating auth.json
+        // can therefore never combine metadata from one account with quota from another.
+        match read_auth_json_with_stamp(&profile) {
+            Ok((auth_json, stamp)) => {
+                let info = info_from_auth(&profile, auth_json.clone(), stamp.clone());
+                let rate_limits = fetch_codex_rate_limits_from_auth(&profile, auth_json.clone(), stamp).await;
+                let reset_credits = fetch_codex_reset_credits_from_auth(&profile, auth_json).await;
+                results.push(CodexProfileQuota { profile_id: profile.profile_id().to_string(), account_id: info.account_id.clone(), info, rate_limits, reset_credits });
+            }
+            Err(error) => results.push(CodexProfileQuota::disconnected(profile.profile_id().to_string(), error.message)),
+        }
     }
     results
+}
+
+/// Invalid descriptors are represented in place so one bad route never suppresses valid rows.
+pub(crate) async fn fetch_codex_profile_inputs(
+    inputs: Vec<CodexProfileInput>,
+) -> Vec<CodexProfileQuota> {
+    use std::collections::HashSet;
+    let mut routes = HashSet::new();
+    let mut rows = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let visible_id = if input.profile_id.starts_with("codex/") {
+            input.profile_id.clone()
+        } else {
+            "codex/invalid".to_string()
+        };
+        match CodexProfile::from_input(input) {
+            Ok(profile) if routes.insert(profile.route().clone()) => {
+                rows.extend(fetch_codex_profiles(vec![profile]).await);
+            }
+            Ok(_) => rows.push(CodexProfileQuota::disconnected(
+                visible_id,
+                "Duplicate Codex credential route",
+            )),
+            Err(error) => rows.push(CodexProfileQuota::disconnected(visible_id, error)),
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
