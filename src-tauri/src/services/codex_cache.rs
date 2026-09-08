@@ -30,7 +30,7 @@ impl CodexRateLimitCache {
     fn retain_for_account(&self, key: Option<&AccountCacheKey>, error: String) -> CodexRateLimits {
         key.and_then(|key| self.cached.get(key)).map_or_else(
             || CodexRateLimits::disconnected(error.clone()),
-            |stale| stale_limits_with_error(&stale.limits, error),
+            |stale| stale_limits_with_error(&stale.limits, error.clone()),
         )
     }
     fn retain_for_auth_stamp(
@@ -47,7 +47,7 @@ impl CodexRateLimitCache {
             .find(|(key, cached)| key.profile_id() == profile_id && cached.auth_stamp == *stamp)
             .map_or_else(
                 || CodexRateLimits::disconnected(error.clone()),
-                |(_, stale)| stale_limits_with_error(&stale.limits, error),
+                |(_, stale)| stale_limits_with_error(&stale.limits, error.clone()),
             )
     }
     fn store(
