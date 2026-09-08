@@ -1,6 +1,7 @@
 use tauri::{AppHandle, State};
 
 use crate::{
+    domain::account::{CodexProfileInput, CodexProfileQuota, CodexProfile},
     domain::models::{
         AntigravityData, CodexData, CodexRateLimits, CodexResetCredits, CodexWeeklyQuotaData,
         CursorData, GrokData, QuotaData,
@@ -9,6 +10,7 @@ use crate::{
         antigravity, claude, codex, codex_weekly, cost, cursor, grok, link, tray, tray_icon, window,
     },
 };
+use std::collections::HashSet;
 
 #[tauri::command]
 pub async fn get_quota() -> Result<QuotaData, String> {
@@ -28,6 +30,22 @@ pub async fn get_codex_rate_limits() -> Result<CodexRateLimits, String> {
 #[tauri::command]
 pub async fn get_codex_reset_credits() -> Result<CodexResetCredits, String> {
     Ok(codex::fetch_codex_reset_credits().await)
+}
+
+/// P2 profile seam. The existing single-profile commands deliberately remain unchanged.
+#[tauri::command]
+pub async fn get_codex_profiles(
+    profiles: Vec<CodexProfileInput>,
+) -> Result<Vec<CodexProfileQuota>, String> {
+    let profiles = profiles
+        .into_iter()
+        .map(CodexProfile::from_input)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut ids = HashSet::new();
+    if profiles.iter().any(|profile| !ids.insert(profile.profile_id().to_string())) {
+        return Err("Codex profile_id values must be unique".to_string());
+    }
+    Ok(codex::fetch_codex_profiles(profiles).await)
 }
 
 #[tauri::command]

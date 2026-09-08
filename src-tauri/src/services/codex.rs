@@ -1,4 +1,4 @@
-use crate::domain::account::{default_codex_cache_key, AccountCacheKey};
+use crate::domain::account::{codex_account, default_codex_profile, AccountCacheKey, CodexProfile, CodexProfileQuota};
 use crate::domain::models::{
     CodexCredits, CodexData, CodexRateLimitWindow, CodexRateLimits, CodexResetCredit,
     CodexResetCredits,
@@ -9,6 +9,7 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -19,10 +20,10 @@ struct LastGoodInfo {
 
 /// Most recent successful fetch results, retained without TTL so a transient
 /// polling failure does not erase quota that was already displayed.
-static LAST_GOOD_INFO: OnceLock<Mutex<Option<LastGoodInfo>>> = OnceLock::new();
+static LAST_GOOD_INFO: OnceLock<Mutex<HashMap<String, LastGoodInfo>>> = OnceLock::new();
 
-fn last_good_info() -> &'static Mutex<Option<LastGoodInfo>> {
-    LAST_GOOD_INFO.get_or_init(|| Mutex::new(None))
+fn last_good_info() -> &'static Mutex<HashMap<String, LastGoodInfo>> {
+    LAST_GOOD_INFO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn log_msg(msg: &str) {
@@ -66,6 +67,10 @@ pub(crate) fn get_codex_home() -> Option<PathBuf> {
     }
 }
 
+fn profile_home(profile: &CodexProfile) -> Option<PathBuf> {
+    profile.home().cloned().or_else(get_codex_home)
+}
+
 fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -92,8 +97,8 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
         .and_then(|json| serde_json::from_str(&json).ok())
 }
 
-fn auth_file_path() -> Result<PathBuf, String> {
-    let codex_home = get_codex_home().ok_or_else(|| "Could not find home directory".to_string())?;
+fn auth_file_path(profile: &CodexProfile) -> Result<PathBuf, String> {
+    let codex_home = profile_home(profile).ok_or_else(|| "Could not find home directory".to_string())?;
     let auth_file = codex_home.join("auth.json");
     if !auth_file.exists() {
         return Err("Codex not configured. Please run 'codex' to login.".to_string());
@@ -118,8 +123,8 @@ struct StampedAuthReadError {
     pre_read_stamp: Option<AuthFileStamp>,
 }
 
-fn read_auth_json_with_stamp() -> Result<(serde_json::Value, AuthFileStamp), StampedAuthReadError> {
-    let auth_file = auth_file_path().map_err(|message| StampedAuthReadError {
+fn read_auth_json_with_stamp(profile: &CodexProfile) -> Result<(serde_json::Value, AuthFileStamp), StampedAuthReadError> {
+    let auth_file = auth_file_path(profile).map_err(|message| StampedAuthReadError {
         message,
         pre_read_stamp: None,
     })?;
@@ -151,8 +156,8 @@ fn read_auth_json_with_stamp() -> Result<(serde_json::Value, AuthFileStamp), Sta
         })
 }
 
-fn read_auth_json() -> Result<serde_json::Value, String> {
-    let auth_file = auth_file_path()?;
+fn read_auth_json(profile: &CodexProfile) -> Result<serde_json::Value, String> {
+    let auth_file = auth_file_path(profile)?;
     let content =
         fs::read_to_string(&auth_file).map_err(|e| format!("Failed to read auth.json: {e}"))?;
     serde_json::from_str(&content).map_err(|e| format!("Failed to parse auth.json: {e}"))
@@ -201,11 +206,11 @@ fn retain_last_good_info(
     CodexData::disconnected(error)
 }
 
-fn fallback_or_disconnected_info(error: StampedAuthReadError) -> CodexData {
+fn fallback_or_disconnected_info(profile: &CodexProfile, error: StampedAuthReadError) -> CodexData {
     let transient = is_transient_os_error(&error.message);
     if let Ok(guard) = last_good_info().lock() {
         return retain_last_good_info(
-            guard.as_ref(),
+            guard.get(profile.profile_id()),
             error.pre_read_stamp.as_ref(),
             error.message,
             transient,
@@ -215,9 +220,13 @@ fn fallback_or_disconnected_info(error: StampedAuthReadError) -> CodexData {
 }
 
 pub async fn fetch_codex_info() -> CodexData {
-    let (auth_json, auth_stamp) = match read_auth_json_with_stamp() {
+    fetch_codex_info_for(&default_codex_profile()).await
+}
+
+pub(crate) async fn fetch_codex_info_for(profile: &CodexProfile) -> CodexData {
+    let (auth_json, auth_stamp) = match read_auth_json_with_stamp(profile) {
         Ok(auth) => auth,
-        Err(error) => return fallback_or_disconnected_info(error),
+        Err(error) => return fallback_or_disconnected_info(profile, error),
     };
 
     let id_token = match auth_json["tokens"]["id_token"].as_str() {
@@ -248,7 +257,7 @@ pub async fn fetch_codex_info() -> CodexData {
     };
 
     if let Ok(mut guard) = last_good_info().lock() {
-        *guard = Some(LastGoodInfo {
+        guard.insert(profile.profile_id().to_string(), LastGoodInfo {
             stamp: auth_stamp,
             data: info.clone(),
         });
@@ -270,10 +279,11 @@ fn transient_failure_limits(
 }
 
 fn transient_auth_failure_limits(
+    profile: &CodexProfile,
     auth_stamp: Option<&AuthFileStamp>,
     error: String,
 ) -> CodexRateLimits {
-    match codex_cache::retain_for_auth_stamp(auth_stamp, error.clone()) {
+    match codex_cache::retain_for_auth_stamp(profile.profile_id(), auth_stamp, error.clone()) {
         Ok(limits) => limits,
         Err(lock_error) => {
             log_msg(&format!("[RateLimits] {lock_error}"));
@@ -295,12 +305,16 @@ fn should_preserve_transport_failure(
 }
 
 pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
-    let (auth_json, auth_stamp) = match read_auth_json_with_stamp() {
+    fetch_codex_rate_limits_for(&default_codex_profile()).await
+}
+
+pub(crate) async fn fetch_codex_rate_limits_for(profile: &CodexProfile) -> CodexRateLimits {
+    let (auth_json, auth_stamp) = match read_auth_json_with_stamp(profile) {
         Ok(auth) => auth,
         Err(error) => {
             log_msg(&format!("[RateLimits] auth read failed: {}", error.message));
             return if is_transient_os_error(&error.message) {
-                transient_auth_failure_limits(error.pre_read_stamp.as_ref(), error.message)
+                transient_auth_failure_limits(profile, error.pre_read_stamp.as_ref(), error.message)
             } else {
                 CodexRateLimits::disconnected(error.message)
             };
@@ -324,7 +338,7 @@ pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
                 .as_str()
                 .map(ToString::to_string)
         });
-    let account_key = account_id.as_deref().map(default_codex_cache_key);
+    let account_key = account_id.as_deref().map(|id| codex_account(profile.clone()).cache_key_for_resolved_id(id));
     let request_sequence = codex_cache::next_request_sequence();
 
     let client = shared_http_client();
@@ -375,7 +389,7 @@ pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
     if status.as_u16() == 401 || status.as_u16() == 403 {
         let error = "Token expired. Please run 'codex' to re-login.";
         log_msg(&format!("[RateLimits] auth failure: status={status}"));
-        if let Err(cache_error) = codex_cache::invalidate(account_key.as_ref(), request_sequence) {
+        if let Err(cache_error) = codex_cache::invalidate(account_key.as_ref(), profile.profile_id(), request_sequence) {
             log_msg(&format!(
                 "[RateLimits] failed to invalidate last-good cache: {cache_error}"
             ));
@@ -481,7 +495,11 @@ fn parse_reset_credit(credit: &serde_json::Value) -> Option<CodexResetCredit> {
 }
 
 pub async fn fetch_codex_reset_credits() -> CodexResetCredits {
-    let auth_json = match read_auth_json() {
+    fetch_codex_reset_credits_for(&default_codex_profile()).await
+}
+
+pub(crate) async fn fetch_codex_reset_credits_for(profile: &CodexProfile) -> CodexResetCredits {
+    let auth_json = match read_auth_json(profile) {
         Ok(v) => v,
         Err(error) => return CodexResetCredits::disconnected(error),
     };
@@ -554,14 +572,36 @@ pub async fn fetch_codex_reset_credits() -> CodexResetCredits {
     }
 }
 
+/// Sequential by design: profile reads are independent and P2 must not multiply login API traffic.
+pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<CodexProfileQuota> {
+    let mut results = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let info = fetch_codex_info_for(&profile).await;
+        let rate_limits = fetch_codex_rate_limits_for(&profile).await;
+        let reset_credits = fetch_codex_reset_credits_for(&profile).await;
+        results.push(CodexProfileQuota {
+            profile_id: profile.profile_id().to_string(),
+            account_id: info.account_id.clone(),
+            info,
+            rate_limits,
+            reset_credits,
+        });
+    }
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_rate_limit_window, parse_reset_credit, retain_last_good_info,
+        fetch_codex_info_for, parse_rate_limit_window, parse_reset_credit, read_auth_json_with_stamp, retain_last_good_info,
         should_preserve_for_status, should_preserve_transport_failure, window_minutes_from_seconds,
         AuthFileStamp, CodexData, LastGoodInfo,
     };
+    use crate::domain::account::{CodexProfile, CodexProfileInput};
+    use base64::Engine as _;
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -728,5 +768,53 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Too many open files"));
+    }
+
+    fn temporary_profile(name: &str) -> (CodexProfile, PathBuf) {
+        let path = std::env::temp_dir().join(format!("quotabar-p2-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        let profile = CodexProfile::from_input(CodexProfileInput {
+            profile_id: format!("codex/{name}"), home: Some(path.clone()),
+        }).unwrap();
+        (profile, path)
+    }
+
+    fn synthetic_jwt(account: &str) -> String {
+        let payload = json!({ "email": "synthetic@example.invalid", "https://api.openai.com/auth": { "chatgpt_account_id": account, "chatgpt_plan_type": "pro" } });
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(payload.to_string());
+        format!("synthetic.{encoded}.signature")
+    }
+
+    #[test]
+    fn explicit_profiles_read_independent_auth_paths_and_keep_default_route_name() {
+        let (first, first_dir) = temporary_profile("first");
+        let (second, second_dir) = temporary_profile("second");
+        fs::write(first_dir.join("auth.json"), format!(r#"{{"tokens":{{"id_token":"{}"}}}}"#, synthetic_jwt("acct-a"))).unwrap();
+        fs::write(second_dir.join("auth.json"), format!(r#"{{"tokens":{{"id_token":"{}"}}}}"#, synthetic_jwt("acct-b"))).unwrap();
+        assert_eq!(first.profile_id(), "codex/first");
+        assert_eq!(super::default_codex_profile().profile_id(), "codex/default");
+        assert_eq!(super::profile_home(&super::default_codex_profile()), super::get_codex_home());
+        assert!(read_auth_json_with_stamp(&first).is_ok());
+        assert!(read_auth_json_with_stamp(&second).is_ok());
+        let first_info = tauri::async_runtime::block_on(fetch_codex_info_for(&first));
+        let second_info = tauri::async_runtime::block_on(fetch_codex_info_for(&second));
+        assert_eq!(first_info.account_id.as_deref(), Some("acct-a"));
+        assert_eq!(second_info.account_id.as_deref(), Some("acct-b"));
+        let _ = fs::remove_dir_all(first_dir); let _ = fs::remove_dir_all(second_dir);
+    }
+
+    #[test]
+    fn malformed_one_profile_does_not_suppress_another_profiles_credentials() {
+        let (good, good_dir) = temporary_profile("good");
+        let (bad, bad_dir) = temporary_profile("bad");
+        fs::write(good_dir.join("auth.json"), format!(r#"{{"tokens":{{"id_token":"{}"}}}}"#, synthetic_jwt("acct-good"))).unwrap();
+        fs::write(bad_dir.join("auth.json"), "{").unwrap();
+        assert!(read_auth_json_with_stamp(&good).is_ok());
+        assert!(read_auth_json_with_stamp(&bad).is_err());
+        let info = tauri::async_runtime::block_on(fetch_codex_info_for(&good));
+        assert!(info.connected);
+        assert_eq!(info.account_id.as_deref(), Some("acct-good"));
+        let _ = fs::remove_dir_all(good_dir); let _ = fs::remove_dir_all(bad_dir);
     }
 }
