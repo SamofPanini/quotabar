@@ -21,20 +21,22 @@ snapshot?: {
   source: "internal_usage_api" | "completion_sse" | "local_estimate" | "stale_cache"
   confidence: "verified_server" | "observed" | "estimated" | "unknown"
   observedAt: RFC 3339 timestamp
-  usageWindows?: [{ name, usedPercent?, resetAt? }]
+  usageWindows: [{ name, usedPercent?, resetAt? }] (one or more)
 }
 error?: { code: "unavailable" | "malformed_payload" | "unsupported_route" | "redacted_field" | "stale"; retryable: boolean }
 ```
 
-`snapshot` is omitted when no validated usage observation exists. In particular, unavailable,
-malformed, and redacted results carry a safe error rather than a fabricated source or window.
+`snapshot` is omitted when no validated usage observation exists. When present, it contains at
+least one typed usage window. In particular, unavailable, malformed, and redacted results carry a
+safe error rather than a fabricated source or window.
 A `stale_cache` source is emitted only for an actual validated stale-cache fixture.
 For one instance, a later invalid update replaces its last-good snapshot with a no-snapshot safe
 error; it never becomes a fabricated stale result and never changes another instance.
 
 `instanceId` and route metadata are app-owned routing labels, not provider identities. `route.label` may contain only a synthetic/app-owned label and must not carry provider-derived identity. The internal envelope and every log line must exclude organization ID, email, provider account ID, token, cookie, session key, authorization value, and raw provider payload. The protocol validator must fail closed on unknown or forbidden fields; it must reject (or redact before construction) forbidden keys and values before a result can leave the adapter.
 
-Usage windows are optional. An empty free `/usage` response means “no endpoint usage window”, not zero use and not an error by itself. Source precedence is:
+An empty free `/usage` response means “no endpoint usage window”, not zero use and not an error
+by itself. Source precedence is:
 
 ```text
 valid endpoint > completion SSE > local estimate > stale cache
