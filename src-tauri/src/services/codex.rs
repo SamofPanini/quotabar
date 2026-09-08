@@ -603,6 +603,69 @@ async fn fetch_codex_reset_credits_from_auth(
     }
 }
 
+/// The one credential snapshot that a batch row is allowed to use.  Keeping the
+/// fan-out here makes the no-second-read rule testable without making a network
+/// request: every downstream request receives a clone of this exact value.
+struct BatchAuthSnapshot {
+    auth_json: serde_json::Value,
+    stamp: AuthFileStamp,
+}
+
+#[cfg(test)]
+struct BatchSnapshotProbe {
+    rotate_path: PathBuf,
+    replacement: String,
+    observed_id_tokens: Vec<Option<String>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_SNAPSHOT_PROBE: std::cell::RefCell<Option<BatchSnapshotProbe>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn record_batch_snapshot_use(auth_json: &serde_json::Value, rotate: bool) {
+    BATCH_SNAPSHOT_PROBE.with(|probe| {
+        let mut probe = probe.borrow_mut();
+        let Some(probe) = probe.as_mut() else {
+            return;
+        };
+        probe.observed_id_tokens.push(
+            auth_json["tokens"]["id_token"]
+                .as_str()
+                .map(ToString::to_string),
+        );
+        if rotate {
+            fs::write(&probe.rotate_path, &probe.replacement).unwrap();
+        }
+    });
+}
+
+impl BatchAuthSnapshot {
+    fn from_read(auth_json: serde_json::Value, stamp: AuthFileStamp) -> Self {
+        Self { auth_json, stamp }
+    }
+
+    fn for_info(&self) -> (serde_json::Value, AuthFileStamp) {
+        #[cfg(test)]
+        record_batch_snapshot_use(&self.auth_json, true);
+        (self.auth_json.clone(), self.stamp.clone())
+    }
+
+    fn for_rate_limits(&self) -> (serde_json::Value, AuthFileStamp) {
+        #[cfg(test)]
+        record_batch_snapshot_use(&self.auth_json, false);
+        (self.auth_json.clone(), self.stamp.clone())
+    }
+
+    fn for_reset_credits(&self) -> serde_json::Value {
+        #[cfg(test)]
+        record_batch_snapshot_use(&self.auth_json, false);
+        self.auth_json.clone()
+    }
+}
+
 /// Sequential by design: profile reads are independent and P2 must not multiply login API traffic.
 pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<CodexProfileQuota> {
     let mut results = Vec::with_capacity(profiles.len());
@@ -611,10 +674,17 @@ pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<Cod
         // can therefore never combine metadata from one account with quota from another.
         match read_auth_json_with_stamp(&profile) {
             Ok((auth_json, stamp)) => {
-                let info = info_from_auth(&profile, auth_json.clone(), stamp.clone());
+                let snapshot = BatchAuthSnapshot::from_read(auth_json, stamp);
+                let (info_auth, info_stamp) = snapshot.for_info();
+                let info = info_from_auth(&profile, info_auth, info_stamp);
+                let (limits_auth, limits_stamp) = snapshot.for_rate_limits();
                 let rate_limits =
-                    fetch_codex_rate_limits_from_auth(&profile, auth_json.clone(), stamp).await;
-                let reset_credits = fetch_codex_reset_credits_from_auth(&profile, auth_json).await;
+                    fetch_codex_rate_limits_from_auth(&profile, limits_auth, limits_stamp).await;
+                let reset_credits = fetch_codex_reset_credits_from_auth(
+                    &profile,
+                    snapshot.for_reset_credits(),
+                )
+                .await;
                 results.push(CodexProfileQuota {
                     profile_id: profile.profile_id().to_string(),
                     account_id: info.account_id.clone(),
@@ -633,10 +703,17 @@ pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<Cod
 }
 
 /// Invalid descriptors are represented in place so one bad route never suppresses valid rows.
+fn aliases_default_home(profile: &CodexProfile, default_home: Option<&PathBuf>) -> bool {
+    profile.home().zip(default_home).is_some_and(|(home, default)| home == default)
+}
+
 pub(crate) async fn fetch_codex_profile_inputs(
     inputs: Vec<CodexProfileInput>,
 ) -> Vec<CodexProfileQuota> {
     use std::collections::HashSet;
+    // Resolve once. A custom descriptor that names this exact directory is not
+    // a second credential route; reporting it in place avoids split cache state.
+    let default_home = get_codex_home().and_then(|home| home.canonicalize().ok());
     let mut routes = HashSet::new();
     let mut rows = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -646,6 +723,12 @@ pub(crate) async fn fetch_codex_profile_inputs(
             "codex/invalid".to_string()
         };
         match CodexProfile::from_input(input) {
+            Ok(profile) if aliases_default_home(&profile, default_home.as_ref()) => {
+                rows.push(CodexProfileQuota::disconnected(
+                    visible_id,
+                    "Duplicate Codex credential route",
+                ));
+            }
             Ok(profile) if routes.insert(profile.route().clone()) => {
                 rows.extend(fetch_codex_profiles(vec![profile]).await);
             }
@@ -662,10 +745,11 @@ pub(crate) async fn fetch_codex_profile_inputs(
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_codex_info_for, fetch_codex_profile_inputs, info_from_auth, parse_rate_limit_window, parse_reset_credit,
-        read_auth_json_with_stamp, retain_last_good_info, should_preserve_for_status,
-        should_preserve_transport_failure, window_minutes_from_seconds, AuthFileStamp, CodexData,
-        LastGoodInfo,
+        aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs, fetch_codex_profiles,
+        parse_rate_limit_window, parse_reset_credit, read_auth_json_with_stamp,
+        retain_last_good_info, should_preserve_for_status, should_preserve_transport_failure,
+        window_minutes_from_seconds, AuthFileStamp, BatchSnapshotProbe, CodexData, LastGoodInfo,
+        BATCH_SNAPSHOT_PROBE,
     };
     use crate::domain::account::{CodexProfile, CodexProfileInput};
     use base64::Engine as _;
@@ -895,6 +979,17 @@ mod tests {
     }
 
     #[test]
+    fn custom_default_home_alias_is_rejected_but_a_distinct_route_is_accepted() {
+        let (alias, alias_dir) = temporary_profile("default-alias");
+        let (distinct, distinct_dir) = temporary_profile("distinct-route");
+        let default_home = alias.home().cloned();
+        assert!(aliases_default_home(&alias, default_home.as_ref()));
+        assert!(!aliases_default_home(&distinct, default_home.as_ref()));
+        let _ = fs::remove_dir_all(alias_dir);
+        let _ = fs::remove_dir_all(distinct_dir);
+    }
+
+    #[test]
     fn malformed_one_profile_does_not_suppress_another_profiles_credentials() {
         let (good, good_dir) = temporary_profile("good");
         let (bad, bad_dir) = temporary_profile("bad");
@@ -962,13 +1057,49 @@ mod tests {
     }
 
     #[test]
-    fn immutable_snapshot_keeps_account_claim_consistent_when_auth_value_changes() {
+    fn batch_snapshot_fans_one_immutable_auth_read_to_info_rate_and_reset() {
         let (profile, dir) = temporary_profile("rotation");
-        let first = serde_json::json!({ "tokens": { "id_token": synthetic_jwt("acct-first") } });
-        let second = serde_json::json!({ "tokens": { "id_token": synthetic_jwt("acct-second") } });
-        let first_info = info_from_auth(&profile, first, auth_stamp(1, 1));
-        fs::write(dir.join("auth.json"), second.to_string()).unwrap();
-        assert_eq!(first_info.account_id.as_deref(), Some("acct-first"));
+        let first_token = synthetic_jwt("acct-first");
+        let first = serde_json::json!({
+            "tokens": {
+                "id_token": first_token.clone()
+            }
+        });
+        let second = serde_json::json!({
+            "tokens": {
+                "id_token": synthetic_jwt("acct-second")
+            }
+        });
+        let auth_path = dir.join("auth.json");
+        fs::write(&auth_path, first.to_string()).unwrap();
+        {
+            BATCH_SNAPSHOT_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some(BatchSnapshotProbe {
+                    rotate_path: auth_path.clone(),
+                    replacement: second.to_string(),
+                    observed_id_tokens: Vec::new(),
+                });
+            });
+        }
+
+        // This invokes the production batch seam. The probe rotates auth.json as
+        // its first downstream consumer begins; rate and reset have no access
+        // token and therefore return before any HTTP request.
+        let rows = tauri::async_runtime::block_on(fetch_codex_profiles(vec![profile]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].account_id.as_deref(), Some("acct-first"));
+        let observed = BATCH_SNAPSHOT_PROBE.with(|probe| {
+            probe
+                .borrow_mut()
+                .take()
+                .unwrap()
+                .observed_id_tokens
+        });
+        assert_eq!(observed.len(), 3);
+        assert!(observed
+            .iter()
+            .all(|token| token.as_deref() == Some(first_token.as_str())));
+        assert_eq!(fs::read_to_string(auth_path).unwrap(), second.to_string());
         let _ = fs::remove_dir_all(dir);
     }
 }
