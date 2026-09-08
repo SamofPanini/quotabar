@@ -1,5 +1,6 @@
 pub mod antigravity;
 pub mod claude;
+mod claude_bridge;
 pub mod codex;
 mod codex_cache;
 pub mod codex_weekly;
