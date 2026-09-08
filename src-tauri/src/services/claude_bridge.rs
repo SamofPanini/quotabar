@@ -742,10 +742,7 @@ mod tests {
 
         assert_eq!(malformed.snapshot, None);
         assert_eq!(malformed.error, Some(SAFE_MALFORMED));
-        assert_eq!(
-            store.get(&instance("malformed-instance")),
-            Some(&malformed)
-        );
+        assert_eq!(store.get(&instance("malformed-instance")), Some(&malformed));
         assert_eq!(store.get(&instance("other-instance")), Some(&other));
     }
 
