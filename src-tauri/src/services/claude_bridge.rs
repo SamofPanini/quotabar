@@ -701,6 +701,55 @@ mod tests {
     }
 
     #[test]
+    fn malformed_endpoint_rejects_valid_fallbacks_and_preserves_other_instance() {
+        let mut transport = MockTransport::default();
+        let mut store = SnapshotStore::default();
+        transport.responses.insert(
+            instance("other-instance"),
+            response(
+                Some(json!({"usageWindows": [window(UsageWindowName::FiveHour, 40.0)]})),
+                None,
+                None,
+                None,
+            ),
+        );
+        let other = normalize(
+            &transport,
+            &mut store,
+            "other-instance",
+            route("other-demo"),
+            TIME,
+        )
+        .unwrap();
+
+        transport.responses.insert(
+            instance("malformed-instance"),
+            response(
+                Some(json!({"usageWindows": [], "extra": true})),
+                Some(json!({"usageWindow": window(UsageWindowName::SevenDay, 20.0)})),
+                Some(json!({"usageWindows": [window(UsageWindowName::ExtraUsage, 10.0)]})),
+                Some(json!({"usageWindows": [window(UsageWindowName::FiveHour, 5.0)]})),
+            ),
+        );
+        let malformed = normalize(
+            &transport,
+            &mut store,
+            "malformed-instance",
+            route("malformed-demo"),
+            TIME,
+        )
+        .unwrap();
+
+        assert_eq!(malformed.snapshot, None);
+        assert_eq!(malformed.error, Some(SAFE_MALFORMED));
+        assert_eq!(
+            store.get(&instance("malformed-instance")),
+            Some(&malformed)
+        );
+        assert_eq!(store.get(&instance("other-instance")), Some(&other));
+    }
+
+    #[test]
     fn local_estimate_precedes_stale_and_real_stale_is_marked_stale() {
         let mut transport = MockTransport::default();
         let mut store = SnapshotStore::default();
