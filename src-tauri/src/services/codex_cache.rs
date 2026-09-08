@@ -155,15 +155,115 @@ mod tests {
     use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits};
     use std::fs;
     use std::time::{Duration, UNIX_EPOCH};
-    fn profile(name: &str) -> CodexProfile { let path = std::env::temp_dir().join(format!("quotabar-cache-{name}-{}", std::process::id())); fs::create_dir_all(&path).unwrap(); CodexProfile::from_input(CodexProfileInput { profile_id: format!("codex/{name}"), home: Some(path) }).unwrap() }
-    fn limits() -> CodexRateLimits { CodexRateLimits { connected: true, plan_type: None, primary: Some(CodexRateLimitWindow { used_percent: 10.0, window_minutes: None, resets_at: None }), secondary: None, credits: None, error: None } }
-    fn stamp(n: u64) -> AuthFileStamp { AuthFileStamp { len: n, modified: UNIX_EPOCH + Duration::from_secs(n) } }
-    #[test] fn switched_account_transient_does_not_borrow_cache() { let mut cache = Cache::default(); let p = profile("switch"); let a = p.cache_key("a"); assert!(cache.store(a, stamp(1), 1, limits())); assert!(!cache.retain(Some(&p.cache_key("b")), "x".into()).connected); }
-    #[test] fn auth_stamp_mismatch_or_replacement_does_not_retain() { let mut cache = Cache::default(); let p = profile("stamp"); assert!(cache.store(p.cache_key("a"), stamp(1), 1, limits())); assert!(!cache.retain_stamp(p.route(), Some(&stamp(2)), "x".into()).connected); }
-    #[test] fn unknown_auth_invalidation_is_route_local() { let mut cache = Cache::default(); let a = profile("ua"); let b = profile("ub"); let ka=a.cache_key("x"); let kb=b.cache_key("x"); cache.store(ka.clone(),stamp(1),1,limits()); cache.store(kb.clone(),stamp(1),1,limits()); cache.invalidate(a.route(),None,2); assert!(!cache.retain(Some(&ka),"x".into()).connected); assert!(cache.retain(Some(&kb),"x".into()).connected); }
-    #[test] fn auth_failure_blocks_older_success() { let mut cache = Cache::default(); let p=profile("block"); let k=p.cache_key("a"); cache.invalidate(p.route(),Some(&k),2); assert!(!cache.store(k,stamp(1),1,limits())); }
-    #[test] fn older_auth_failure_cannot_clear_newer_success() { let mut cache=Cache::default(); let p=profile("newer"); let k=p.cache_key("a"); cache.store(k.clone(),stamp(1),3,limits()); cache.invalidate(p.route(),Some(&k),2); assert!(cache.retain(Some(&k),"x".into()).connected); }
-    #[test] fn older_success_cannot_replace_newer_success() { let mut cache=Cache::default(); let p=profile("order"); let k=p.cache_key("a"); assert!(cache.store(k.clone(),stamp(2),2,limits())); assert!(!cache.store(k,stamp(1),1,limits())); }
-    #[test] fn other_route_is_unaffected_by_known_auth_failure() { let mut cache=Cache::default(); let a=profile("ka"); let b=profile("kb"); let ka=a.cache_key("a"); let kb=b.cache_key("b"); cache.store(ka.clone(),stamp(1),1,limits()); cache.store(kb.clone(),stamp(1),1,limits()); cache.invalidate(a.route(),Some(&ka),2); assert!(cache.retain(Some(&kb),"x".into()).connected); }
-    #[test] fn duplicate_claims_across_routes_are_isolated() { let mut cache=Cache::default(); let a=profile("da"); let b=profile("db"); let ka=a.cache_key("same"); let kb=b.cache_key("same"); cache.store(ka.clone(),stamp(1),1,limits()); cache.store(kb.clone(),stamp(1),1,limits()); cache.invalidate(a.route(),Some(&ka),2); assert!(cache.retain(Some(&kb),"x".into()).connected); }
+    fn profile(name: &str) -> CodexProfile {
+        let path =
+            std::env::temp_dir().join(format!("quotabar-cache-{name}-{}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        CodexProfile::from_input(CodexProfileInput {
+            profile_id: format!("codex/{name}"),
+            home: Some(path),
+        })
+        .unwrap()
+    }
+    fn limits() -> CodexRateLimits {
+        CodexRateLimits {
+            connected: true,
+            plan_type: None,
+            primary: Some(CodexRateLimitWindow {
+                used_percent: 10.0,
+                window_minutes: None,
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            error: None,
+        }
+    }
+    fn stamp(n: u64) -> AuthFileStamp {
+        AuthFileStamp {
+            len: n,
+            modified: UNIX_EPOCH + Duration::from_secs(n),
+        }
+    }
+    #[test]
+    fn switched_account_transient_does_not_borrow_cache() {
+        let mut cache = Cache::default();
+        let p = profile("switch");
+        let a = p.cache_key("a");
+        assert!(cache.store(a, stamp(1), 1, limits()));
+        assert!(!cache.retain(Some(&p.cache_key("b")), "x".into()).connected);
+    }
+    #[test]
+    fn auth_stamp_mismatch_or_replacement_does_not_retain() {
+        let mut cache = Cache::default();
+        let p = profile("stamp");
+        assert!(cache.store(p.cache_key("a"), stamp(1), 1, limits()));
+        assert!(
+            !cache
+                .retain_stamp(p.route(), Some(&stamp(2)), "x".into())
+                .connected
+        );
+    }
+    #[test]
+    fn unknown_auth_invalidation_is_route_local() {
+        let mut cache = Cache::default();
+        let a = profile("ua");
+        let b = profile("ub");
+        let ka = a.cache_key("x");
+        let kb = b.cache_key("x");
+        cache.store(ka.clone(), stamp(1), 1, limits());
+        cache.store(kb.clone(), stamp(1), 1, limits());
+        cache.invalidate(a.route(), None, 2);
+        assert!(!cache.retain(Some(&ka), "x".into()).connected);
+        assert!(cache.retain(Some(&kb), "x".into()).connected);
+    }
+    #[test]
+    fn auth_failure_blocks_older_success() {
+        let mut cache = Cache::default();
+        let p = profile("block");
+        let k = p.cache_key("a");
+        cache.invalidate(p.route(), Some(&k), 2);
+        assert!(!cache.store(k, stamp(1), 1, limits()));
+    }
+    #[test]
+    fn older_auth_failure_cannot_clear_newer_success() {
+        let mut cache = Cache::default();
+        let p = profile("newer");
+        let k = p.cache_key("a");
+        cache.store(k.clone(), stamp(1), 3, limits());
+        cache.invalidate(p.route(), Some(&k), 2);
+        assert!(cache.retain(Some(&k), "x".into()).connected);
+    }
+    #[test]
+    fn older_success_cannot_replace_newer_success() {
+        let mut cache = Cache::default();
+        let p = profile("order");
+        let k = p.cache_key("a");
+        assert!(cache.store(k.clone(), stamp(2), 2, limits()));
+        assert!(!cache.store(k, stamp(1), 1, limits()));
+    }
+    #[test]
+    fn other_route_is_unaffected_by_known_auth_failure() {
+        let mut cache = Cache::default();
+        let a = profile("ka");
+        let b = profile("kb");
+        let ka = a.cache_key("a");
+        let kb = b.cache_key("b");
+        cache.store(ka.clone(), stamp(1), 1, limits());
+        cache.store(kb.clone(), stamp(1), 1, limits());
+        cache.invalidate(a.route(), Some(&ka), 2);
+        assert!(cache.retain(Some(&kb), "x".into()).connected);
+    }
+    #[test]
+    fn duplicate_claims_across_routes_are_isolated() {
+        let mut cache = Cache::default();
+        let a = profile("da");
+        let b = profile("db");
+        let ka = a.cache_key("same");
+        let kb = b.cache_key("same");
+        cache.store(ka.clone(), stamp(1), 1, limits());
+        cache.store(kb.clone(), stamp(1), 1, limits());
+        cache.invalidate(a.route(), Some(&ka), 2);
+        assert!(cache.retain(Some(&kb), "x".into()).connected);
+    }
 }

@@ -662,7 +662,7 @@ pub(crate) async fn fetch_codex_profile_inputs(
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_codex_info_for, parse_rate_limit_window, parse_reset_credit,
+        fetch_codex_info_for, fetch_codex_profile_inputs, info_from_auth, parse_rate_limit_window, parse_reset_credit,
         read_auth_json_with_stamp, retain_last_good_info, should_preserve_for_status,
         should_preserve_transport_failure, window_minutes_from_seconds, AuthFileStamp, CodexData,
         LastGoodInfo,
@@ -914,5 +914,61 @@ mod tests {
         assert_eq!(info.account_id.as_deref(), Some("acct-good"));
         let _ = fs::remove_dir_all(good_dir);
         let _ = fs::remove_dir_all(bad_dir);
+    }
+
+    #[test]
+    fn batch_preserves_order_and_continues_after_invalid_missing_and_malformed_profiles() {
+        let (good, good_dir) = temporary_profile("batch-good");
+        fs::write(
+            good_dir.join("auth.json"),
+            format!(
+                r#"{{"tokens":{{"id_token":"{}"}}}}"#,
+                synthetic_jwt("acct-good")
+            ),
+        )
+        .unwrap();
+        let malformed_dir = std::env::temp_dir().join(format!(
+            "quotabar-p2-batch-bad-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&malformed_dir).unwrap();
+        fs::write(malformed_dir.join("auth.json"), "{").unwrap();
+        let rows = tauri::async_runtime::block_on(fetch_codex_profile_inputs(vec![
+            CodexProfileInput {
+                profile_id: "bad".into(),
+                home: None,
+            },
+            CodexProfileInput {
+                profile_id: "codex/missing".into(),
+                home: Some(good_dir.join("missing")),
+            },
+            CodexProfileInput {
+                profile_id: "codex/bad".into(),
+                home: Some(malformed_dir.clone()),
+            },
+            CodexProfileInput {
+                profile_id: good.profile_id().into(),
+                home: good.home().cloned(),
+            },
+        ]));
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].profile_id, "codex/invalid");
+        assert!(!rows[0].info.connected);
+        assert!(!rows[1].info.connected);
+        assert!(!rows[2].info.connected);
+        assert_eq!(rows[3].account_id.as_deref(), Some("acct-good"));
+        let _ = fs::remove_dir_all(good_dir);
+        let _ = fs::remove_dir_all(malformed_dir);
+    }
+
+    #[test]
+    fn immutable_snapshot_keeps_account_claim_consistent_when_auth_value_changes() {
+        let (profile, dir) = temporary_profile("rotation");
+        let first = serde_json::json!({ "tokens": { "id_token": synthetic_jwt("acct-first") } });
+        let second = serde_json::json!({ "tokens": { "id_token": synthetic_jwt("acct-second") } });
+        let first_info = info_from_auth(&profile, first, auth_stamp(1, 1));
+        fs::write(dir.join("auth.json"), second.to_string()).unwrap();
+        assert_eq!(first_info.account_id.as_deref(), Some("acct-first"));
+        let _ = fs::remove_dir_all(dir);
     }
 }
