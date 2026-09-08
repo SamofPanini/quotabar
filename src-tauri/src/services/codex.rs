@@ -1,3 +1,4 @@
+use crate::domain::account::{default_codex_cache_key, AccountCacheKey};
 use crate::domain::models::{
     CodexCredits, CodexData, CodexRateLimitWindow, CodexRateLimits, CodexResetCredit,
     CodexResetCredits,
@@ -255,8 +256,11 @@ pub async fn fetch_codex_info() -> CodexData {
     info
 }
 
-fn transient_failure_limits(account_id: Option<&str>, error: String) -> CodexRateLimits {
-    match codex_cache::retain_for_account(account_id, error.clone()) {
+fn transient_failure_limits(
+    account_key: Option<&AccountCacheKey>,
+    error: String,
+) -> CodexRateLimits {
+    match codex_cache::retain_for_account(account_key, error.clone()) {
         Ok(limits) => limits,
         Err(lock_error) => {
             log_msg(&format!("[RateLimits] {lock_error}"));
@@ -320,6 +324,7 @@ pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
                 .as_str()
                 .map(ToString::to_string)
         });
+    let account_key = account_id.as_deref().map(default_codex_cache_key);
     let request_sequence = codex_cache::next_request_sequence();
 
     let client = shared_http_client();
@@ -348,7 +353,7 @@ pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
                 started_at.elapsed().as_secs_f64(),
             ));
             return if should_preserve {
-                transient_failure_limits(account_id.as_deref(), error)
+                transient_failure_limits(account_key.as_ref(), error)
             } else {
                 CodexRateLimits::disconnected(error)
             };
@@ -364,13 +369,13 @@ pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
     if should_preserve_for_status(status) {
         let error = format!("API error: {status}");
         log_msg("[RateLimits] rate limited; retaining last successful quota if available");
-        return transient_failure_limits(account_id.as_deref(), error);
+        return transient_failure_limits(account_key.as_ref(), error);
     }
 
     if status.as_u16() == 401 || status.as_u16() == 403 {
         let error = "Token expired. Please run 'codex' to re-login.";
         log_msg(&format!("[RateLimits] auth failure: status={status}"));
-        if let Err(cache_error) = codex_cache::invalidate(account_id.as_deref(), request_sequence) {
+        if let Err(cache_error) = codex_cache::invalidate(account_key.as_ref(), request_sequence) {
             log_msg(&format!(
                 "[RateLimits] failed to invalidate last-good cache: {cache_error}"
             ));
@@ -401,7 +406,7 @@ pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
                 "[RateLimits] body read failed: preservable={should_preserve}, error={error}"
             ));
             return if should_preserve {
-                transient_failure_limits(account_id.as_deref(), error)
+                transient_failure_limits(account_key.as_ref(), error)
             } else {
                 CodexRateLimits::disconnected(error)
             };
@@ -446,9 +451,9 @@ pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
         error: None,
     };
 
-    match account_id {
-        Some(account_id) => {
-            match codex_cache::store(account_id, auth_stamp, request_sequence, limits.clone()) {
+    match account_key {
+        Some(account_key) => {
+            match codex_cache::store(account_key, auth_stamp, request_sequence, limits.clone()) {
                 Ok(true) => {}
                 Ok(false) => log_msg("[RateLimits] ignored out-of-order response"),
                 Err(error) => log_msg(&format!(

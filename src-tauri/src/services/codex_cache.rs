@@ -1,3 +1,4 @@
+use crate::domain::account::AccountCacheKey;
 use crate::domain::models::CodexRateLimits;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +12,7 @@ pub(super) struct AuthFileStamp {
 }
 
 struct CachedCodexRateLimits {
-    account_id: String,
+    account_key: AccountCacheKey,
     auth_stamp: AuthFileStamp,
     request_sequence: u64,
     limits: CodexRateLimits,
@@ -20,14 +21,20 @@ struct CachedCodexRateLimits {
 #[derive(Default)]
 struct CodexRateLimitCache {
     cached: Option<CachedCodexRateLimits>,
-    auth_failures: HashMap<String, u64>,
+    auth_failures: HashMap<AccountCacheKey, u64>,
     unknown_auth_failure: Option<u64>,
 }
 
 impl CodexRateLimitCache {
-    fn retain_for_account(&self, account_id: Option<&str>, error: String) -> CodexRateLimits {
-        match (&self.cached, account_id) {
-            (Some(stale), Some(current_account_id)) if stale.account_id == current_account_id => {
+    fn retain_for_account(
+        &self,
+        account_key: Option<&AccountCacheKey>,
+        error: String,
+    ) -> CodexRateLimits {
+        match (&self.cached, account_key) {
+            (Some(stale), Some(current_account_key))
+                if &stale.account_key == current_account_key =>
+            {
                 stale_limits_with_error(&stale.limits, error)
             }
             _ => CodexRateLimits::disconnected(error),
@@ -49,14 +56,14 @@ impl CodexRateLimitCache {
 
     fn store(
         &mut self,
-        account_id: String,
+        account_key: AccountCacheKey,
         auth_stamp: AuthFileStamp,
         request_sequence: u64,
         limits: CodexRateLimits,
     ) -> bool {
         let blocked_by_account = self
             .auth_failures
-            .get(&account_id)
+            .get(&account_key)
             .is_some_and(|failure_sequence| *failure_sequence >= request_sequence);
         let blocked_by_unknown = self
             .unknown_auth_failure
@@ -69,10 +76,10 @@ impl CodexRateLimitCache {
             return false;
         }
 
-        self.auth_failures.remove(&account_id);
+        self.auth_failures.remove(&account_key);
         self.unknown_auth_failure = None;
         self.cached = Some(CachedCodexRateLimits {
-            account_id,
+            account_key,
             auth_stamp,
             request_sequence,
             limits,
@@ -80,11 +87,11 @@ impl CodexRateLimitCache {
         true
     }
 
-    fn invalidate(&mut self, account_id: Option<&str>, request_sequence: u64) {
-        match account_id {
-            Some(account_id) => {
+    fn invalidate(&mut self, account_key: Option<&AccountCacheKey>, request_sequence: u64) {
+        match account_key {
+            Some(account_key) => {
                 self.auth_failures
-                    .entry(account_id.to_string())
+                    .entry(account_key.clone())
                     .and_modify(|sequence| *sequence = (*sequence).max(request_sequence))
                     .or_insert(request_sequence);
             }
@@ -98,8 +105,8 @@ impl CodexRateLimitCache {
 
         let should_clear = self.cached.as_ref().is_some_and(|cached| {
             cached.request_sequence <= request_sequence
-                && account_id
-                    .is_none_or(|current_account_id| cached.account_id == current_account_id)
+                && account_key
+                    .is_none_or(|current_account_key| &cached.account_key == current_account_key)
         });
         if should_clear {
             self.cached = None;
@@ -121,13 +128,13 @@ fn cache() -> &'static Mutex<CodexRateLimitCache> {
 }
 
 pub(super) fn retain_for_account(
-    account_id: Option<&str>,
+    account_key: Option<&AccountCacheKey>,
     error: String,
 ) -> Result<CodexRateLimits, String> {
     cache()
         .lock()
         .map_err(|lock_error| format!("last-good cache lock poisoned: {lock_error}"))
-        .map(|cache| cache.retain_for_account(account_id, error))
+        .map(|cache| cache.retain_for_account(account_key, error))
 }
 
 pub(super) fn retain_for_auth_stamp(
@@ -141,7 +148,7 @@ pub(super) fn retain_for_auth_stamp(
 }
 
 pub(super) fn store(
-    account_id: String,
+    account_key: AccountCacheKey,
     auth_stamp: AuthFileStamp,
     request_sequence: u64,
     limits: CodexRateLimits,
@@ -149,15 +156,18 @@ pub(super) fn store(
     let stored = cache()
         .lock()
         .map_err(|lock_error| format!("last-good cache lock poisoned: {lock_error}"))?
-        .store(account_id, auth_stamp, request_sequence, limits);
+        .store(account_key, auth_stamp, request_sequence, limits);
     Ok(stored)
 }
 
-pub(super) fn invalidate(account_id: Option<&str>, request_sequence: u64) -> Result<(), String> {
+pub(super) fn invalidate(
+    account_key: Option<&AccountCacheKey>,
+    request_sequence: u64,
+) -> Result<(), String> {
     cache()
         .lock()
         .map_err(|lock_error| format!("last-good cache lock poisoned: {lock_error}"))?
-        .invalidate(account_id, request_sequence);
+        .invalidate(account_key, request_sequence);
     Ok(())
 }
 
@@ -168,6 +178,7 @@ pub(super) fn next_request_sequence() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{AuthFileStamp, CodexRateLimitCache};
+    use crate::domain::account::{default_codex_cache_key, AccountCacheKey};
     use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -193,10 +204,14 @@ mod tests {
         }
     }
 
+    fn account_key(value: &str) -> AccountCacheKey {
+        default_codex_cache_key(value)
+    }
+
     fn populated_cache() -> CodexRateLimitCache {
         let mut cache = CodexRateLimitCache::default();
         assert!(cache.store(
-            "account-a".to_string(),
+            account_key("account-a"),
             auth_stamp(512, 100),
             1,
             sample_rate_limits(),
@@ -209,8 +224,9 @@ mod tests {
         let cache = populated_cache();
         let error = "Network error: operation timed out".to_string();
 
-        let same_account = cache.retain_for_account(Some("account-a"), error.clone());
-        let switched_account = cache.retain_for_account(Some("account-b"), error.clone());
+        let same_account = cache.retain_for_account(Some(&account_key("account-a")), error.clone());
+        let switched_account =
+            cache.retain_for_account(Some(&account_key("account-b")), error.clone());
         let unknown_account = cache.retain_for_account(None, error);
 
         assert!(same_account.connected);
@@ -252,7 +268,7 @@ mod tests {
 
         cache.invalidate(None, 2);
         let result = cache.retain_for_account(
-            Some("account-a"),
+            Some(&account_key("account-a")),
             "Network error: operation timed out".to_string(),
         );
 
@@ -264,9 +280,9 @@ mod tests {
     fn authentication_failure_clears_same_account_after_auth_file_changes() {
         let mut cache = populated_cache();
 
-        cache.invalidate(Some("account-a"), 2);
+        cache.invalidate(Some(&account_key("account-a")), 2);
         let result = cache.retain_for_account(
-            Some("account-a"),
+            Some(&account_key("account-a")),
             "Network error: operation timed out".to_string(),
         );
 
@@ -277,15 +293,15 @@ mod tests {
     fn older_authentication_failure_does_not_clear_new_same_account_limits() {
         let mut cache = populated_cache();
         assert!(cache.store(
-            "account-a".to_string(),
+            account_key("account-a"),
             auth_stamp(513, 101),
             3,
             sample_rate_limits(),
         ));
 
-        cache.invalidate(Some("account-a"), 2);
+        cache.invalidate(Some(&account_key("account-a")), 2);
         let result = cache.retain_for_account(
-            Some("account-a"),
+            Some(&account_key("account-a")),
             "Network error: operation timed out".to_string(),
         );
 
@@ -295,10 +311,10 @@ mod tests {
     #[test]
     fn authentication_failure_blocks_an_older_success_from_repopulating_cache() {
         let mut cache = populated_cache();
-        cache.invalidate(Some("account-a"), 3);
+        cache.invalidate(Some(&account_key("account-a")), 3);
 
         let stored = cache.store(
-            "account-a".to_string(),
+            account_key("account-a"),
             auth_stamp(512, 100),
             2,
             sample_rate_limits(),
@@ -307,7 +323,7 @@ mod tests {
         assert!(!stored);
         assert!(
             !cache
-                .retain_for_account(Some("account-a"), "timeout".to_string())
+                .retain_for_account(Some(&account_key("account-a")), "timeout".to_string())
                 .connected
         );
     }
@@ -316,14 +332,14 @@ mod tests {
     fn older_success_does_not_replace_newer_cached_limits() {
         let mut cache = populated_cache();
         assert!(cache.store(
-            "account-a".to_string(),
+            account_key("account-a"),
             auth_stamp(513, 101),
             3,
             sample_rate_limits(),
         ));
 
         let stored = cache.store(
-            "account-a".to_string(),
+            account_key("account-a"),
             auth_stamp(512, 100),
             2,
             sample_rate_limits(),
@@ -336,9 +352,9 @@ mod tests {
     fn old_authentication_failure_does_not_clear_a_different_accounts_cache() {
         let mut cache = populated_cache();
 
-        cache.invalidate(Some("account-b"), 2);
+        cache.invalidate(Some(&account_key("account-b")), 2);
         let result = cache.retain_for_account(
-            Some("account-a"),
+            Some(&account_key("account-a")),
             "Network error: operation timed out".to_string(),
         );
 
