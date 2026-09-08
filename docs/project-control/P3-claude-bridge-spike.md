@@ -2,7 +2,7 @@
 
 ## Dispatch boundary
 
-- **Base:** `daa92492288405f5224cfedeb92c1706862ee3ee`
+- **Base:** after this brief is merged, the dispatcher must resolve and state the exact `main` SHA that contains both project-control documents. The implementer must verify that SHA before writing; do not branch from the pre-document P2 SHA.
 - **Implementation branch:** `feat/claude-bridge-spike`
 - **Objective:** a contract/parser plus mock-transport spike that emits one paid-like and one free-like normalized snapshot.
 - **Not an objective:** real login, a real provider transport, a local listener/IPC, or UI wiring.
@@ -99,7 +99,7 @@ Add focused bridge tests to the relevant frontend or Rust command above; do not 
 
 ## PR body checklist
 
-- [ ] Base SHA is `daa92492288405f5224cfedeb92c1706862ee3ee` (or a separately approved rebase).
+- [ ] Base is the exact dispatcher-provided `main` SHA containing both project-control documents (or a separately approved rebase), and that SHA is recorded in the PR.
 - [ ] Scope is parser/normalizer plus synthetic mock transport only.
 - [ ] Actual changed files match the allowlist, or deviations are explained and approved.
 - [ ] `get_quota` and `claude::fetch_quota` are behavior-compatible and not rerouted.
