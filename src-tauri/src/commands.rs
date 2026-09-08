@@ -1,7 +1,7 @@
 use tauri::{AppHandle, State};
 
 use crate::{
-    domain::account::{CodexProfileInput, CodexProfileQuota, CodexProfile},
+    domain::account::{CodexProfile, CodexProfileInput, CodexProfileQuota},
     domain::models::{
         AntigravityData, CodexData, CodexRateLimits, CodexResetCredits, CodexWeeklyQuotaData,
         CursorData, GrokData, QuotaData,
@@ -42,7 +42,10 @@ pub async fn get_codex_profiles(
         .map(CodexProfile::from_input)
         .collect::<Result<Vec<_>, _>>()?;
     let mut ids = HashSet::new();
-    if profiles.iter().any(|profile| !ids.insert(profile.profile_id().to_string())) {
+    if profiles
+        .iter()
+        .any(|profile| !ids.insert(profile.profile_id().to_string()))
+    {
         return Err("Codex profile_id values must be unique".to_string());
     }
     Ok(codex::fetch_codex_profiles(profiles).await)
