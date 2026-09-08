@@ -1,6 +1,7 @@
 use tauri::{AppHandle, State};
 
 use crate::{
+    domain::account::{CodexProfileInput, CodexProfileQuota},
     domain::models::{
         AntigravityData, CodexData, CodexRateLimits, CodexResetCredits, CodexWeeklyQuotaData,
         CursorData, GrokData, QuotaData,
@@ -28,6 +29,14 @@ pub async fn get_codex_rate_limits() -> Result<CodexRateLimits, String> {
 #[tauri::command]
 pub async fn get_codex_reset_credits() -> Result<CodexResetCredits, String> {
     Ok(codex::fetch_codex_reset_credits().await)
+}
+
+/// P2 profile seam. The existing single-profile commands deliberately remain unchanged.
+#[tauri::command]
+pub async fn get_codex_profiles(
+    profiles: Vec<CodexProfileInput>,
+) -> Result<Vec<CodexProfileQuota>, String> {
+    Ok(codex::fetch_codex_profile_inputs(profiles).await)
 }
 
 #[tauri::command]
