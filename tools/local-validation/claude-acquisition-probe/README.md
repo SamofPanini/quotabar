@@ -11,12 +11,15 @@ After approval for P4B-2, load this directory as an unpacked extension only in t
 ## Install and remove
 
 1. In Chromium, open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
-2. Select this directory. The popup can select only `profile-a` or `profile-b`; set the plan class as an explicit local operator declaration (it is never inferred from provider data), and it displays only a sanitized envelope.
-3. To remove it, open `chrome://extensions` and choose **Remove**. Closing the browser also clears its in-memory observations.
+2. Select this directory. In the popup, select and confirm the synthetic slot and operator-declared plan class **before** any authorized trigger. They are never inferred from provider data.
+3. Use separate browser profiles for the two authorized accounts; record only `profile-a` and `profile-b`, never profile names or paths. The popup displays only a sanitized envelope.
+4. To remove it, open `chrome://extensions` and choose **Remove**. Selection and sanitized observations live only in `chrome.storage.session`: they survive service-worker restarts but clear when the browser session ends.
 
 ## Safety boundary
 
-The page-world observer only recognizes same-origin usage responses and completion/retry completion SSE data. The opaque route segment stays in page world. It sends the content script only an allowlisted, validated envelope; the extension does not store live observations, inspect credentials, log raw data, make network requests, modify responses, or delay Claude requests.
+The page-world observer recognizes only exact same-origin GET usage responses and POST completion/retry-completion SSE responses with `text/event-stream` content type. The opaque route segment stays in page world. It sends the content script only an allowlisted, validated envelope; the extension stores only that envelope in session storage, never credentials, raw data, or conversation content. It makes no network requests and does not modify, block, or delay Claude requests.
+
+Authenticated loading remains forbidden pending Sol High re-review.
 
 Run focused synthetic tests from the repository root:
 

@@ -1,84 +1,26 @@
-import { describe, expect, test } from "vitest";
-import { SlotStore, isSanitizedEnvelope, safeEnvelope } from "./shared.js";
-import { endpointWindows, isCompletionUrl, MAX_SSE_LINE_BYTES, observeWithoutInterference, parseMessageLimitSse } from "./probe-core.js";
-
-const at = "2026-01-02T03:04:05Z";
+import { beforeAll, describe, expect, test } from "vitest";
+let core; beforeAll(async () => { await import("./probe-core.js"); core = globalThis.QuotaBarProbeCore; });
+const at = "2026-01-02T03:04:05.000Z";
 const paid = { version: "v1", probeSlot: "profile-a", planClass: "paid", source: "usage_endpoint", observedAt: at, windows: [{ kind: "five_hour", usedPercent: 25, resetAt: at }, { kind: "weekly", usedPercent: 50, resetAt: at }], status: "available" };
 const free = { version: "v1", probeSlot: "profile-b", planClass: "free", source: "completion_sse", observedAt: at, windows: [{ kind: "five_hour", usedPercent: 10, resetAt: at }], status: "available" };
+function tracked(text, headers = { "content-type": "text/event-stream" }) { let cancelled = 0; const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(text)); }, cancel() { cancelled++; } }); return { response: new Response(body, { headers }), cancelled: () => cancelled }; }
 
-describe("sanitized envelope", () => {
-  test("accepts paid endpoint five-hour and weekly windows", () => expect(isSanitizedEnvelope(paid)).toBe(true));
-  test("accepts free SSE permitted windows without inventing an empty endpoint window", () => {
-    expect(isSanitizedEnvelope(free)).toBe(true);
-    expect(isSanitizedEnvelope({ ...free, windows: [], status: "available" })).toBe(false);
-  });
-  test("fails closed for malformed and unknown fields", () => {
-    expect(isSanitizedEnvelope({ ...paid, windows: [{ kind: "monthly" }] })).toBe(false);
-    expect(isSanitizedEnvelope({ ...paid, extra: true })).toBe(false);
-  });
-  test("rejects forbidden keys and synthetic sentinel values cannot cross the boundary", () => {
-    for (const key of ["route", "organizationId", "email", "token", "cookie", "authorization", "conversation", "messageId", "requestId"]) {
-      expect(safeEnvelope({ ...paid, [key]: "synthetic-sentinel" })).toBeNull();
-    }
-    expect(safeEnvelope({ ...paid, planClass: "synthetic-sentinel" })).toBeNull();
-  });
-  test("unavailable and malformed retain missing windows rather than zero", () => {
-    expect(isSanitizedEnvelope({ ...paid, windows: [], status: "unavailable", errorCode: "unavailable" })).toBe(true);
-    expect(isSanitizedEnvelope({ ...paid, windows: [{ kind: "five_hour", usedPercent: 0 }], status: "unavailable", errorCode: "unavailable" })).toBe(false);
-  });
+describe("shipped validator", () => {
+  test("strict timestamps normalize valid offsets and reject invalid calendar/time values", () => { expect(core.normalizeRfc3339("2026-01-02T04:04:05+01:00")).toBe(at); for (const value of ["2026-02-30T03:04:05Z", "2026-01-02T24:00:00Z", "2026-01-02T03:60:00Z", "2026-01-02T03:04:60Z"]) expect(core.normalizeRfc3339(value)).toBeUndefined(); expect(core.unixSeconds(8.64e12 + 1)).toBeUndefined(); });
+  test("rejects unknown and forbidden sentinel fields before serialization/errors", () => { for (const key of ["route", "organizationId", "email", "token", "cookie", "authorization", "conversation", "messageId", "requestId", "traceId", "headers", "body", "text"]) { const out = core.safeEnvelope({ ...paid, [key]: "FORBIDDEN-SENTINEL" }); expect(out).toBeNull(); expect(JSON.stringify(out)).not.toContain("FORBIDDEN-SENTINEL"); } expect(core.isSanitizedEnvelope({ ...paid, extra: true })).toBe(false); });
 });
 
-describe("isolated synthetic slots", () => {
-  test("never overwrites or inherits between slots", () => {
-    const store = new SlotStore();
-    expect(store.write(paid)).toBe(true);
-    expect(store.write(free)).toBe(true);
-    expect(store.read("profile-a")).toEqual(paid);
-    expect(store.read("profile-b")).toEqual(free);
-  });
-  test("paid endpoint data outranks SSE for the same slot", () => {
-    const store = new SlotStore();
-    store.write({ ...paid, probeSlot: "profile-a" });
-    store.write({ ...free, probeSlot: "profile-a" });
-    expect(store.read("profile-a")?.source).toBe("usage_endpoint");
-  });
+describe("shipped stream parsers", () => {
+  test("endpoint streams under 32 KiB and handles absent, false, and oversized Content-Length", async () => { await expect(core.drainEndpoint(new Response(JSON.stringify({ five_hour: { utilization: 25, resets_at: at } })))).resolves.toMatchObject({ kind: "found" }); await expect(core.drainEndpoint(new Response("{}", { headers: { "content-length": "false" } }))).resolves.toEqual({ kind: "found", windows: [] }); await expect(core.drainEndpoint(new Response("{}", { headers: { "content-length": "32769" } }))).resolves.toEqual({ kind: "overflow" }); });
+  test("cancels clone readers on endpoint overflow and SSE success/malformed/end", async () => { const e = tracked("x".repeat(core.MAX_ENDPOINT_BYTES + 1), { "content-type": "application/json" }); await core.drainEndpoint(e.response); expect(e.cancelled()).toBeGreaterThanOrEqual(1); for (const text of ['data: {"type":"message_limit","message_limit":{"windows":{"5h":{"utilization":.1}}}}\n', 'data: {"type":"message_limit"}\n']) { const s = tracked(text); await core.parseMessageLimitSse(s.response); expect(s.cancelled()).toBeGreaterThanOrEqual(1); } await expect(core.parseMessageLimitSse(new Response("data: ignored\n", { headers: { "content-type": "text/event-stream" } }))).resolves.toEqual({ kind: "none" }); });
+  test("fails closed for huge SSE lines with or without newline and requires content type", async () => { for (const ending of ["", "\n"]) await expect(core.parseMessageLimitSse(new Response(`data: ${"x".repeat(core.MAX_SSE_LINE_BYTES + 1)}${ending}`, { headers: { "content-type": "text/event-stream" } }))).resolves.toEqual({ kind: "overflow" }); const good = 'data: {"type":"message_limit","message_limit":{"windows":{"5h":{"utilization":0.25,"resets_at":1767323045},"7d":{"utilization":0.5,"resets_at":1767409445}}}}\n'; await expect(core.parseMessageLimitSse(new Response(good))).resolves.toEqual({ kind: "malformed" }); await expect(core.parseMessageLimitSse(new Response(good, { headers: { "content-type": "text/event-stream; charset=utf-8" } }))).resolves.toMatchObject({ kind: "found" }); });
+  test("selects only allowed windows from the documented message_limit shape with provider extras", async () => { const raw = { type: "message_limit", message_limit: { windows: { "5h": { utilization: 0.25, resets_at: 1767323045, surpassed_threshold: false }, "7d": { utilization: 0.5, resets_at: 1767409445, surpassed_threshold: false }, "7d_oi": { utilization: 0.9 }, overage: { enabled: true } }, plan_name: "FORBIDDEN-SENTINEL", unrelated: true } }; expect(core.selectSseWindows(raw)).toEqual([{ kind: "five_hour", usedPercent: 25, resetAt: at }, { kind: "weekly", usedPercent: 50, resetAt: "2026-01-03T03:04:05.000Z" }]); expect(core.selectSseWindows({ type: "message_limit", windows: {} })).toBeNull(); });
+  test("does not interfere with original responses", async () => { const response = new Response("synthetic"); let seen = false; expect(core.observeWithoutInterference(response, async (clone) => { seen = await clone.text() === "synthetic"; })).toBe(response); await new Promise((r) => setTimeout(r)); expect(await response.text()).toBe("synthetic"); expect(seen).toBe(true); });
 });
 
-describe("bounded acquisition parsing", () => {
-  test("parses paid endpoint fixture and leaves an empty free endpoint absent", () => {
-    expect(endpointWindows({ five_hour: { utilization: 25, resets_at: at }, seven_day: { utilization: 50, resets_at: at } })).toEqual([{ kind: "five_hour", usedPercent: 25, resetAt: at }, { kind: "weekly", usedPercent: 50, resetAt: at }]);
-    expect(endpointWindows({})).toEqual([]);
-  });
-  test("parses real-shaped 5h/7d message_limit fractions and Unix resets", async () => {
-    const response = new Response('data: {"type":"other_event","metric":1}\n\ndata: {"type":"message_limit","windows":{"5h":{"utilization":0.25,"resets_at":1767323045},"7d":{"utilization":0.5,"resets_at":1767409445}}}\n');
-    await expect(parseMessageLimitSse(response)).resolves.toEqual({ kind: "found", windows: [{ kind: "five_hour", usedPercent: 25, resetAt: "2026-01-02T03:04:05.000Z" }, { kind: "weekly", usedPercent: 50, resetAt: "2026-01-03T03:04:05.000Z" }] });
-  });
-  test("uses 100 percent for exceeded_limit even below one", async () => {
-    const response = new Response('data: {"type":"message_limit","windows":{"5h":{"utilization":0.1,"status":"exceeded_limit","resets_at":1767323045}}}\n');
-    await expect(parseMessageLimitSse(response)).resolves.toEqual({ kind: "found", windows: [{ kind: "five_hour", usedPercent: 100, resetAt: "2026-01-02T03:04:05.000Z" }] });
-  });
-  test("matches only exact same-origin completion and retry_completion paths", () => {
-    const origin = "https://claude.ai";
-    expect(isCompletionUrl("/api/organizations/synthetic/chat_conversations/synthetic/completion", origin)).toBe(true);
-    expect(isCompletionUrl("/api/organizations/synthetic/chat_conversations/synthetic/retry_completion", origin)).toBe(true);
-    expect(isCompletionUrl("/api/organizations/synthetic/chat_conversations/synthetic/retry-completion", origin)).toBe(false);
-    expect(isCompletionUrl("/api/organizations/synthetic/completion", origin)).toBe(false);
-    expect(isCompletionUrl("https://example.invalid/api/organizations/synthetic/chat_conversations/synthetic/completion", origin)).toBe(false);
-  });
-  test("fails closed on malformed candidate and bounded parser overflow", async () => {
-    await expect(parseMessageLimitSse(new Response('data: {"type":"message_limit"}\n'))).resolves.toEqual({ kind: "malformed" });
-    await expect(parseMessageLimitSse(new Response(`data: ${"x".repeat(MAX_SSE_LINE_BYTES + 1)}\n`))).resolves.toEqual({ kind: "overflow" });
-  });
-  test("observation returns the original response without blocking or mutation", async () => {
-    const response = new Response("synthetic"); let seen = false;
-    expect(observeWithoutInterference(response, async (copy) => { seen = await copy.text() === "synthetic"; })).toBe(response);
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(await response.text()).toBe("synthetic"); expect(seen).toBe(true);
-  });
+describe("routes and session state", () => {
+  test("shipped installer enforces methods, origin, and event-stream before it clones", async () => { const calls = []; const target = { fetch: (...args) => Promise.resolve(args[2]) }; const undo = core.installFetchObserver(target, "https://claude.ai", async () => calls.push("usage"), async () => calls.push("sse")); const fake = (type) => ({ headers: { get: () => type }, clone: () => { calls.push("clone"); return {}; } }); await target.fetch("https://other.invalid/api/organizations/x/usage", { method: "GET" }, fake("application/json")); await target.fetch("/api/organizations/x/chat_conversations/y/completion", { method: "GET" }, fake("text/event-stream")); await target.fetch("/api/organizations/x/chat_conversations/y/completion", { method: "POST" }, fake("application/json")); await new Promise((r) => setTimeout(r)); expect(calls).toEqual([]); await target.fetch("/api/organizations/x/usage", { method: "GET" }, fake("application/json")); await target.fetch("/api/organizations/x/chat_conversations/y/retry_completion", { method: "POST" }, fake("text/event-stream")); await new Promise((r) => setTimeout(r)); expect(calls).toEqual(["clone", "usage", "clone", "sse"]); undo(); });
+  test("shipped session handler survives worker restart, keeps slots isolated, and maps popup state", async () => { let stored = {}; const session = { get: async () => structuredClone(stored), set: async (value) => { stored = structuredClone(value); } }; let handle = core.createSessionHandler(session); await handle({ type: "set-settings", slot: "profile-a", planClass: "paid" }); await handle({ type: "observation", output: paid }); handle = core.createSessionHandler(session); await handle({ type: "set-settings", slot: "profile-b", planClass: "free" }); await handle({ type: "observation", output: free }); const state = (await handle({ type: "get-state" })).state; expect(state.observations["profile-a"]).toEqual(paid); expect(core.popupView(state)).toEqual({ slot: "profile-b", planClass: "free", observation: free }); await handle({ type: "set-settings", slot: "profile-a", planClass: "paid" }); await handle({ type: "observation", output: free }); expect((await handle({ type: "get-state" })).state.observations["profile-a"].source).toBe("usage_endpoint"); });
 });
 
-test("manifest uses MAIN-world injection without web-accessible resources", async () => {
-  const manifest = await import("./manifest.json", { with: { type: "json" } });
-  expect(manifest.default.web_accessible_resources).toBeUndefined();
-  expect(manifest.default.content_scripts).toContainEqual(expect.objectContaining({ js: ["page-observer.js"], world: "MAIN", run_at: "document_start" }));
-});
+test("manifest, popup dependency order, and shipped-source capability scans stay local-only", async () => { const m = (await import("./manifest.json", { with: { type: "json" } })).default, fs = await import("node:fs/promises"); expect(m.permissions).toEqual(["storage"]); expect(m.host_permissions).toEqual(["https://claude.ai/*"]); expect(m.web_accessible_resources).toBeUndefined(); expect(m.content_scripts[0].js).toEqual(["probe-core.js", "content.js"]); expect(m.content_scripts[1].js).toEqual(["probe-core.js", "page-observer.js"]); const source = await Promise.all(["background.js", "content.js", "page-observer.js", "popup.js", "probe-core.js"].map((file) => fs.readFile(new URL(file, import.meta.url), "utf8"))), html = await fs.readFile(new URL("popup.html", import.meta.url), "utf8"); expect(html.indexOf('src="probe-core.js"')).toBeGreaterThanOrEqual(0); expect(html.indexOf('src="probe-core.js"')).toBeLessThan(html.indexOf('src="popup.js"')); for (const forbidden of ["storage.local", "console.", "nativeMessaging", "localhost", "XMLHttpRequest", "WebSocket", "FORBIDDEN-SENTINEL"]) expect(source.join("\n")).not.toContain(forbidden); });

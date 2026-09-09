@@ -1,69 +1,38 @@
-export const MAX_SSE_LINE_BYTES = 64 * 1024;
-
-const endpointPercent = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : undefined;
-const sseFraction = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
-const isoTimestamp = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value) ? value : undefined;
-const unixTimestamp = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? new Date(value * 1000).toISOString() : undefined;
-
-function endpointWindow(raw, kind) {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const usedPercent = endpointPercent(raw.utilization);
-  const resetAt = isoTimestamp(raw.resets_at);
-  return usedPercent === undefined && resetAt === undefined ? null : { kind, ...(usedPercent === undefined ? {} : { usedPercent }), ...(resetAt === undefined ? {} : { resetAt }) };
-}
-
-function sseWindow(raw, kind) {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const fraction = sseFraction(raw.utilization);
-  const usedPercent = raw.status === "exceeded_limit" ? 100 : fraction === undefined ? undefined : fraction * 100;
-  const resetAt = unixTimestamp(raw.resets_at);
-  return usedPercent === undefined && resetAt === undefined ? null : { kind, ...(usedPercent === undefined ? {} : { usedPercent }), ...(resetAt === undefined ? {} : { resetAt }) };
-}
-
-/** Paid endpoint values are already percentages and use ISO reset timestamps. */
-export function endpointWindows(raw) {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  return [endpointWindow(raw.five_hour, "five_hour"), endpointWindow(raw.seven_day, "weekly")].filter(Boolean);
-}
-
-/** Exact same-origin completion or retry_completion pathname matcher. */
-export function isCompletionUrl(url, origin) {
-  try {
-    const parsed = new URL(url, origin);
-    return parsed.origin === origin && /^\/api\/organizations\/[^/]+\/chat_conversations\/[^/]+\/(?:retry_)?completion$/.test(parsed.pathname);
-  } catch { return false; }
-}
-
-/** Reads bounded lines and parses JSON only for a message_limit candidate. */
-export async function parseMessageLimitSse(response) {
-  if (!response.body) return { kind: "none" };
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let remainder = "";
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      remainder += decoder.decode(value || new Uint8Array(), { stream: !done });
-      if (new TextEncoder().encode(remainder).byteLength > MAX_SSE_LINE_BYTES && !remainder.includes("\n")) return { kind: "overflow" };
-      let newline;
-      while ((newline = remainder.indexOf("\n")) !== -1) {
-        const line = remainder.slice(0, newline).replace(/\r$/, "");
-        remainder = remainder.slice(newline + 1);
-        if (new TextEncoder().encode(line).byteLength > MAX_SSE_LINE_BYTES) return { kind: "overflow" };
-        if (!line.startsWith("data:") || !/"type"\s*:\s*"message_limit"/.test(line)) continue;
-        let raw;
-        try { raw = JSON.parse(line.slice(5)); } catch { return { kind: "malformed" }; }
-        if (raw?.type !== "message_limit" || raw.windows === null || typeof raw.windows !== "object" || Array.isArray(raw.windows)) return { kind: "malformed" };
-        const windows = [sseWindow(raw.windows["5h"], "five_hour"), sseWindow(raw.windows["7d"], "weekly")].filter(Boolean);
-        return windows.length ? { kind: "found", windows } : { kind: "malformed" };
-      }
-      if (done) return { kind: "none" };
-    }
-  } finally { reader.releaseLock(); }
-}
-
-/** Observation returns the exact original response immediately. */
-export function observeWithoutInterference(response, observe) {
-  void observe(response.clone()).catch(() => undefined);
-  return response;
-}
+/* Classic side-effect core: runtime and Vitest execute these exact functions. */
+(() => {
+  "use strict";
+  const MAX_ENDPOINT_BYTES = 32 * 1024, MAX_SSE_LINE_BYTES = 64 * 1024;
+  const SLOTS = Object.freeze(["profile-a", "profile-b"]), PLANS = Object.freeze(["paid", "free", "unknown"]), ERRORS = Object.freeze(["unavailable", "malformed_payload", "redacted_field", "overflow"]);
+  const envelopeKeys = new Set(["version", "probeSlot", "planClass", "source", "observedAt", "windows", "status", "errorCode"]), windowKeys = new Set(["kind", "usedPercent", "resetAt"]);
+  const forbiddenKeys = new Set(["route", "organization", "organizationId", "account", "accountId", "user", "userId", "email", "token", "cookie", "authorization", "session", "conversation", "messageId", "requestId", "traceId", "headers", "body", "url", "path", "payload", "text", "thinking", "toolInput"]);
+  const object = (v, keys) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).every((k) => keys.has(k));
+  const forbidden = (v) => v !== null && typeof v === "object" && (Array.isArray(v) ? v.some(forbidden) : Object.entries(v).some(([k, x]) => forbiddenKeys.has(k) || forbidden(x)));
+  function normalizeRfc3339(value) {
+    if (typeof value !== "string") return undefined;
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value); if (!m) return undefined;
+    const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number), days = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    if (month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59) return undefined;
+    if (m[7] !== "Z") { const [h, min] = m[7].slice(1).split(":").map(Number); if (h > 23 || min > 59) return undefined; }
+    const date = new Date(value); return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+  }
+  function unixSeconds(value) { const ms = typeof value === "number" && Number.isFinite(value) ? value * 1000 : NaN; if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return undefined; const date = new Date(ms); return Number.isFinite(date.getTime()) ? date.toISOString() : undefined; }
+  function endpointWindow(raw, kind) { if (!object(raw, new Set(["utilization", "resets_at"]))) return null; const usedPercent = typeof raw.utilization === "number" && Number.isFinite(raw.utilization) && raw.utilization >= 0 && raw.utilization <= 100 ? raw.utilization : undefined, resetAt = normalizeRfc3339(raw.resets_at); return usedPercent === undefined && resetAt === undefined ? null : { kind, ...(usedPercent === undefined ? {} : { usedPercent }), ...(resetAt === undefined ? {} : { resetAt }) }; }
+  function sseWindow(raw, kind) { if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null; const fraction = typeof raw.utilization === "number" && Number.isFinite(raw.utilization) && raw.utilization >= 0 && raw.utilization <= 1 ? raw.utilization : undefined, usedPercent = raw.status === "exceeded_limit" ? 100 : fraction === undefined ? undefined : fraction * 100, resetAt = unixSeconds(raw.resets_at); return usedPercent === undefined && resetAt === undefined ? null : { kind, ...(usedPercent === undefined ? {} : { usedPercent }), ...(resetAt === undefined ? {} : { resetAt }) }; }
+  function endpointWindows(raw) { return raw === null || typeof raw !== "object" || Array.isArray(raw) ? null : [endpointWindow(raw.five_hour, "five_hour"), endpointWindow(raw.seven_day, "weekly")].filter(Boolean); }
+  function selectSseWindows(raw) { if (raw === null || typeof raw !== "object" || Array.isArray(raw) || raw.type !== "message_limit" || raw.message_limit === null || typeof raw.message_limit !== "object" || Array.isArray(raw.message_limit) || raw.message_limit.windows === null || typeof raw.message_limit.windows !== "object" || Array.isArray(raw.message_limit.windows)) return null; const w = raw.message_limit.windows; return [sseWindow(w["5h"], "five_hour"), sseWindow(w["7d"], "weekly")].filter(Boolean); }
+  function isUsageUrl(url, origin) { try { const u = new URL(url, origin); return u.origin === origin && /^\/api\/organizations\/[^/]+\/usage$/.test(u.pathname); } catch { return false; } }
+  function isCompletionUrl(url, origin) { try { const u = new URL(url, origin); return u.origin === origin && /^\/api\/organizations\/[^/]+\/chat_conversations\/[^/]+\/(?:retry_)?completion$/.test(u.pathname); } catch { return false; } }
+  const isEventStream = (response) => /^text\/event-stream(?:\s*;|\s*$)/i.test(response.headers.get("content-type") || "");
+  async function drainEndpoint(response) { if (!response.body) return { kind: "malformed" }; const reader = response.body.getReader(), bytes = new Uint8Array(MAX_ENDPOINT_BYTES), length = response.headers.get("content-length"); let total = 0; try { if (length !== null && /^\d+$/.test(length) && Number(length) > MAX_ENDPOINT_BYTES) return { kind: "overflow" }; for (;;) { const { done, value } = await reader.read(); if (done) break; if (value.byteLength > MAX_ENDPOINT_BYTES - total) return { kind: "overflow" }; bytes.set(value, total); total += value.byteLength; } let raw; try { raw = JSON.parse(new TextDecoder().decode(bytes.subarray(0, total))); } catch { return { kind: "malformed" }; } const windows = endpointWindows(raw); return windows === null ? { kind: "malformed" } : { kind: "found", windows }; } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); } }
+  async function parseMessageLimitSse(response) { if (!response.body || !isEventStream(response)) return { kind: "malformed" }; const reader = response.body.getReader(), line = new Uint8Array(MAX_SSE_LINE_BYTES); let length = 0; try { for (;;) { const { done, value } = await reader.read(); if (value) for (const byte of value) { if (byte === 10) { const text = new TextDecoder().decode(line.subarray(0, length && line[length - 1] === 13 ? length - 1 : length)); length = 0; if (!text.startsWith("data:") || !/"type"\s*:\s*"message_limit"/.test(text)) continue; let raw; try { raw = JSON.parse(text.slice(5)); } catch { return { kind: "malformed" }; } const windows = selectSseWindows(raw); return windows?.length ? { kind: "found", windows } : { kind: "malformed" }; } if (length >= MAX_SSE_LINE_BYTES) return { kind: "overflow" }; line[length++] = byte; } if (done) return { kind: "none" }; } } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); } }
+  function isWindow(v) { return object(v, windowKeys) && (v.kind === "five_hour" || v.kind === "weekly") && (!("usedPercent" in v) || (typeof v.usedPercent === "number" && Number.isFinite(v.usedPercent) && v.usedPercent >= 0 && v.usedPercent <= 100)) && (!("resetAt" in v) || normalizeRfc3339(v.resetAt) === v.resetAt); }
+  function isSanitizedEnvelope(v) { return object(v, envelopeKeys) && !forbidden(v) && v.version === "v1" && SLOTS.includes(v.probeSlot) && PLANS.includes(v.planClass) && (v.source === "usage_endpoint" || v.source === "completion_sse") && normalizeRfc3339(v.observedAt) === v.observedAt && Array.isArray(v.windows) && v.windows.every(isWindow) && ["available", "unavailable", "malformed"].includes(v.status) && (!("errorCode" in v) || ERRORS.includes(v.errorCode)) && (v.status === "available" ? v.windows.length > 0 && !("errorCode" in v) : v.windows.length === 0 && "errorCode" in v); }
+  const safeEnvelope = (v) => isSanitizedEnvelope(v) ? structuredClone(v) : null;
+  function safeState(v) { const s = v && typeof v === "object" ? v : {}, slot = SLOTS.includes(s.slot) ? s.slot : "profile-a", planClass = PLANS.includes(s.planClass) ? s.planClass : "unknown", observations = {}; for (const key of SLOTS) { const e = safeEnvelope(s.observations?.[key]); if (e?.probeSlot === key) observations[key] = e; } return { slot, planClass, observations }; }
+  function updateState(current, action) { const state = safeState(current); if (action.type === "set-settings" && SLOTS.includes(action.slot) && PLANS.includes(action.planClass)) return { ...state, slot: action.slot, planClass: action.planClass }; if (action.type !== "observation") return null; const candidate = safeEnvelope({ ...action.output, probeSlot: state.slot, planClass: state.planClass }); if (!candidate) return null; const old = state.observations[state.slot]; if (old?.status === "available" && old.source === "usage_endpoint" && candidate.source === "completion_sse") return state; return { ...state, observations: { ...state.observations, [state.slot]: candidate } }; }
+  const observeWithoutInterference = (response, observe) => { void observe(response.clone()).catch(() => undefined); return response; };
+  function installFetchObserver(target, origin, observeUsage, observeSse) { const fetch0 = target.fetch; target.fetch = function (...args) { const request = args[0], url = typeof request === "string" ? request : request?.url, method = (args[1]?.method ?? (typeof request === "string" ? "GET" : request?.method ?? "GET")).toUpperCase(), result = fetch0.apply(this, args); if (method === "GET" && isUsageUrl(url, origin)) result.then((r) => observeWithoutInterference(r, observeUsage)).catch(() => undefined); if (method === "POST" && isCompletionUrl(url, origin)) result.then((r) => { if (isEventStream(r)) observeWithoutInterference(r, observeSse); }).catch(() => undefined); return result; }; return () => { target.fetch = fetch0; }; }
+  function createSessionHandler(session) { let serial = Promise.resolve(); const read = async () => safeState((await session.get("quotabarProbeState")).quotabarProbeState); const mutate = async (action) => { const next = updateState(await read(), action); if (!next) return { ok: false }; await session.set({ quotabarProbeState: next }); return { ok: true, state: next }; }; const enqueue = (action) => { const result = serial.then(() => mutate(action)); serial = result.catch(() => undefined); return result; }; return (message) => message?.type === "get-state" ? read().then((state) => ({ ok: true, state })) : ["set-settings", "observation"].includes(message?.type) ? enqueue(message) : Promise.resolve({ ok: false }); }
+  function popupView(state) { const safe = safeState(state); return { slot: safe.slot, planClass: safe.planClass, observation: safeEnvelope(safe.observations[safe.slot]) }; }
+  globalThis.QuotaBarProbeCore = Object.freeze({ MAX_ENDPOINT_BYTES, MAX_SSE_LINE_BYTES, SLOTS, PLANS, ERRORS, normalizeRfc3339, unixSeconds, endpointWindows, selectSseWindows, isUsageUrl, isCompletionUrl, isEventStream, drainEndpoint, parseMessageLimitSse, isSanitizedEnvelope, safeEnvelope, safeState, updateState, observeWithoutInterference, installFetchObserver, createSessionHandler, popupView });
+})();
