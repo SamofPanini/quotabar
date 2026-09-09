@@ -1,11 +1,19 @@
 # P4A — Codex profile production reachability
 
-Status: Authorized / implementation in progress  
+Status: Authorized / backend-only implementation in progress
 Base: `main` at `80bdebb585e510015753be92d638539638d141da`  
 Branch: `feat/codex-profile-reachability`  
 Implementation: Terra Medium  
 Acceptance: Sol High after PR and terminal CI  
 Phase stop: PR + CI + acceptance. Do not merge or start a later phase automatically.
+
+## P4A-R scope
+
+This implementation stop point is **backend-only**. It makes the P2
+multi-profile backend reachable from a path-free production IPC command and
+does not make custom profiles visible in the current UI. Notion remains the
+product and design source; this document is the executable GitHub scope for
+Codex work.
 
 ## Goal
 
@@ -43,13 +51,13 @@ Examples and tests must use synthetic paths and identities.
 7. The public DTO and frontend boundary must not expose `home`, canonical route key, config path, account ID, email, JWT/token fields, or private paths in errors.
 8. Missing config is a normal empty-custom-profile state. Malformed configuration produces a sanitized registry error and must not suppress the existing default account.
 9. Preserve P2 sequential per-profile fetching and immutable per-profile credential snapshots. Do not add unbounded concurrency.
-10. Add a minimal Codex-panel account section:
-    - existing default-account presentation remains unchanged;
-    - custom rows display only safe alias and normalized quota/status;
-    - no path input, file picker, account switcher, profile editor or frontend persistence;
-    - if there are no custom profiles and no registry error, legacy UI remains visually and behaviorally unchanged.
-11. Manual refresh and the existing minute-scale refresh reload custom profiles through the same lifecycle. Do not create another timer or polling loop.
-12. Keep configuration discovery documented. UI may say profiles are managed by local QuotaBar configuration, but must not render the resolved runtime path.
+10. The public DTO is transport-only in P4A-R. It exposes safe alias, state,
+    plan, both normalized quota windows, and reset-credit count, but no UI is
+    added to render or persist it.
+11. A caller's existing manual/automatic refresh invocation reloads the
+    registry. Do not create another timer, polling loop, watcher, or daemon.
+12. Keep configuration discovery documented without rendering the resolved
+    runtime path.
 
 ## Config validation
 
@@ -75,14 +83,12 @@ Rust:
 - serialized public DTO plus Debug/error output contain no path, account ID, email or credential material;
 - all P1/P2 ordering, cache, auth-failure and rotation tests remain green.
 
-Frontend:
+Transport boundary:
 
 - production IPC sends no profile list or path;
-- absent config/custom list preserves the current single-account UI;
-- custom rows show safe aliases and status/quota;
-- one failed row does not hide successful rows;
-- path, account ID and email are neither rendered nor written to localStorage;
-- manual/automatic refresh uses the existing lifecycle and does not add a timer.
+- the DTO has no path, account ID, email, or credential fields;
+- no TypeScript call, panel rows, account tabs, persistence, or timer is added
+  in this stop point.
 
 Canonical validation:
 
@@ -103,7 +109,10 @@ Do not implement:
 - Claude bridge/runtime/transport, Claude login or multi-instance support;
 - Account Manager, account switching, credential migration/copy/symlink;
 - frontend path entry, path display or path persistence;
-- frontend redesign, tray redesign or broad settings work;
+- account rows, account tabs, frontend redesign, tray redesign, or broad
+  settings work;
+- a tray-window setting or one-tray-icon-per-account behavior (the existing
+  one-icon-per-provider behavior remains unchanged);
 - background watcher/daemon, telemetry or an unnecessary dependency;
 - P4B/P5, release soak, sleep/network-recovery testing.
 

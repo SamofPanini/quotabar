@@ -1,13 +1,14 @@
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::{
-    domain::account::{CodexProfileInput, CodexProfileQuota},
+    domain::account::CodexProfilesResponse,
     domain::models::{
         AntigravityData, CodexData, CodexRateLimits, CodexResetCredits, CodexWeeklyQuotaData,
         CursorData, GrokData, QuotaData,
     },
     services::{
-        antigravity, claude, codex, codex_weekly, cost, cursor, grok, link, tray, tray_icon, window,
+        antigravity, claude, codex, codex_profiles, codex_weekly, cost, cursor, grok, link, tray,
+        tray_icon, window,
     },
 };
 
@@ -31,12 +32,19 @@ pub async fn get_codex_reset_credits() -> Result<CodexResetCredits, String> {
     Ok(codex::fetch_codex_reset_credits().await)
 }
 
-/// P2 profile seam. The existing single-profile commands deliberately remain unchanged.
+/// Reads the QuotaBar-owned registry on every existing refresh invocation.
+/// The webview cannot provide profile descriptors or credential paths.
 #[tauri::command]
-pub async fn get_codex_profiles(
-    profiles: Vec<CodexProfileInput>,
-) -> Result<Vec<CodexProfileQuota>, String> {
-    Ok(codex::fetch_codex_profile_inputs(profiles).await)
+pub async fn get_codex_profiles(app: AppHandle) -> Result<CodexProfilesResponse, String> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "Profile configuration is unavailable")?;
+    Ok(codex_profiles::fetch_from_config(
+        &config_dir,
+        codex::get_codex_home().as_deref(),
+    )
+    .await)
 }
 
 #[tauri::command]

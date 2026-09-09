@@ -1,6 +1,6 @@
 use crate::domain::account::{
     default_codex_profile, AccountCacheKey, CodexProfile, CodexProfileInput, CodexProfileQuota,
-    RouteKey,
+    CodexProfilePublicQuota, RouteKey,
 };
 use crate::domain::models::{
     CodexCredits, CodexData, CodexRateLimitWindow, CodexRateLimits, CodexResetCredit,
@@ -698,6 +698,35 @@ pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<Cod
         }
     }
     results
+}
+
+/// Convert P2's private result after it has completed. Never serialize the
+/// private aggregate: it contains account metadata and credential route IDs.
+pub(crate) async fn fetch_public_profile(
+    alias: String,
+    profile: CodexProfile,
+) -> CodexProfilePublicQuota {
+    let mut rows = fetch_codex_profiles(vec![profile]).await;
+    let Some(row) = rows.pop() else {
+        return CodexProfilePublicQuota::unavailable(alias);
+    };
+    let status = if row.info.connected && row.rate_limits.error.is_some() {
+        "stale"
+    } else if row.info.connected || row.rate_limits.connected {
+        "connected"
+    } else {
+        "offline"
+    };
+    CodexProfilePublicQuota {
+        alias,
+        status: status.to_string(),
+        plan_type: row.rate_limits.plan_type.or(row.info.plan_type),
+        primary: row.rate_limits.primary,
+        secondary: row.rate_limits.secondary,
+        available_reset_credits: row.reset_credits.available_count,
+        // Existing errors can include transport details. Do not relay them.
+        error: (status != "connected").then_some("Profile unavailable".to_string()),
+    }
 }
 
 /// Invalid descriptors are represented in place so one bad route never suppresses valid rows.

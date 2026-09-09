@@ -24,11 +24,12 @@ impl AccountCacheKey {
     }
 }
 
+/// P2's internal descriptor. It is deliberately not part of a Tauri command.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexProfileInput {
-    pub profile_id: String,
-    pub home: Option<PathBuf>,
+pub(crate) struct CodexProfileInput {
+    pub(crate) profile_id: String,
+    pub(crate) home: Option<PathBuf>,
 }
 
 /// Credential route is not caller label: custom routes use a canonical absolute home identity.
@@ -48,6 +49,13 @@ impl fmt::Debug for CodexProfile {
     }
 }
 impl CodexProfile {
+    pub(crate) fn from_registry(alias: String, canonical_home: PathBuf) -> Self {
+        Self {
+            profile_id: format!("codex/{alias}"),
+            route: RouteKey(format!("codex-home:{}", canonical_home.display())),
+            home: Some(canonical_home),
+        }
+    }
     pub(crate) fn from_input(input: CodexProfileInput) -> Result<Self, String> {
         if !input.profile_id.starts_with("codex/")
             || input.profile_id.len() == "codex/".len()
@@ -114,14 +122,49 @@ impl CodexProfile {
     }
 }
 
+/// The only custom-profile data serialized across the webview boundary.
+/// Private P2 route, account, and credential data must stay backend-only.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexProfileQuota {
-    pub profile_id: String,
-    pub account_id: Option<String>,
-    pub info: crate::domain::models::CodexData,
-    pub rate_limits: crate::domain::models::CodexRateLimits,
-    pub reset_credits: crate::domain::models::CodexResetCredits,
+pub(crate) struct CodexProfilePublicQuota {
+    pub(crate) alias: String,
+    pub(crate) status: String,
+    pub(crate) plan_type: Option<String>,
+    pub(crate) primary: Option<crate::domain::models::CodexRateLimitWindow>,
+    pub(crate) secondary: Option<crate::domain::models::CodexRateLimitWindow>,
+    pub(crate) available_reset_credits: u32,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexProfilesResponse {
+    pub(crate) profiles: Vec<CodexProfilePublicQuota>,
+    pub(crate) registry_error: Option<String>,
+}
+
+impl CodexProfilePublicQuota {
+    pub(crate) fn unavailable(alias: String) -> Self {
+        Self {
+            alias,
+            status: "error".to_string(),
+            plan_type: None,
+            primary: None,
+            secondary: None,
+            available_reset_credits: 0,
+            error: Some("Profile configuration is invalid".to_string()),
+        }
+    }
+}
+
+/// P2's private aggregation shape. It must never be returned from IPC.
+#[derive(Clone, Debug)]
+pub(crate) struct CodexProfileQuota {
+    pub(crate) profile_id: String,
+    pub(crate) account_id: Option<String>,
+    pub(crate) info: crate::domain::models::CodexData,
+    pub(crate) rate_limits: crate::domain::models::CodexRateLimits,
+    pub(crate) reset_credits: crate::domain::models::CodexResetCredits,
 }
 impl CodexProfileQuota {
     pub(crate) fn disconnected(profile_id: String, error: impl Into<String>) -> Self {
@@ -145,7 +188,10 @@ pub(crate) fn default_codex_cache_key(id: impl Into<String>) -> AccountCacheKey 
 
 #[cfg(test)]
 mod tests {
-    use super::{default_codex_cache_key, default_codex_profile, CodexProfile, CodexProfileInput};
+    use super::{
+        default_codex_cache_key, default_codex_profile, CodexProfile, CodexProfileInput,
+        CodexProfilePublicQuota,
+    };
     use std::fs;
     #[test]
     fn default_descriptor_is_codex_default() {
@@ -180,5 +226,30 @@ mod tests {
         assert_ne!(first.route(), second.route());
         assert_ne!(first.cache_key("acct"), second.cache_key("acct"));
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn public_profile_dto_redacts_private_identity_material() {
+        let dto = CodexProfilePublicQuota {
+            alias: "work".into(),
+            status: "connected".into(),
+            plan_type: Some("pro".into()),
+            primary: None,
+            secondary: None,
+            available_reset_credits: 1,
+            error: None,
+        };
+        let output = serde_json::to_string(&dto).unwrap();
+        for forbidden in [
+            "/private/credential-route",
+            "accountId",
+            "account_id",
+            "email",
+            "access_token",
+            "id_token",
+        ] {
+            assert!(!output.contains(forbidden));
+        }
+        assert!(!format!("{dto:?}").contains("/private/credential-route"));
     }
 }
