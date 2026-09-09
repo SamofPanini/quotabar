@@ -268,18 +268,19 @@ mod tests {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            keys,
-            std::collections::BTreeSet::from([
-                "alias",
-                "availableResetCredits",
-                "error",
-                "planType",
-                "primary",
-                "secondary",
-                "status",
-            ])
-        );
+        let expected_keys = [
+            "alias",
+            "availableResetCredits",
+            "error",
+            "planType",
+            "primary",
+            "secondary",
+            "status",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys, expected_keys);
         assert!(!format!("{dto:?}").contains("/private/credential-route"));
     }
 
