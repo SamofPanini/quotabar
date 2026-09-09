@@ -1,6 +1,6 @@
 use crate::domain::account::{
-    default_codex_profile, AccountCacheKey, CodexProfile, CodexProfileInput, CodexProfileQuota,
-    CodexProfilePublicQuota, RouteKey,
+    default_codex_profile, AccountCacheKey, CodexProfile, CodexProfileInput,
+    CodexProfilePublicQuota, CodexProfileQuota, RouteKey,
 };
 use crate::domain::models::{
     CodexCredits, CodexData, CodexRateLimitWindow, CodexRateLimits, CodexResetCredit,

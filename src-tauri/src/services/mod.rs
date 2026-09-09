@@ -3,8 +3,8 @@ pub mod claude;
 #[cfg(test)]
 mod claude_bridge;
 pub mod codex;
-pub(crate) mod codex_profiles;
 mod codex_cache;
+pub(crate) mod codex_profiles;
 pub mod codex_weekly;
 pub mod cost;
 mod cost_disk_cache;

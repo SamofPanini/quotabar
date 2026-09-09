@@ -29,14 +29,21 @@ pub(crate) struct Registry {
 }
 
 enum RegistryEntry {
-    Valid { alias: String, profile: CodexProfile },
-    Invalid { alias: String },
+    Valid {
+        alias: String,
+        profile: CodexProfile,
+    },
+    Invalid {
+        alias: String,
+    },
 }
 
 fn safe_alias(value: &str) -> Option<String> {
     let value = value.trim();
     ((1..=48).contains(&value.len())
-        && value.chars().all(|c| c.is_ascii_graphic() && c != '/' && c != '\\')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_graphic() && c != '/' && c != '\\')
         && value != "default")
         .then(|| value.to_string())
 }
@@ -45,7 +52,10 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
     let content = match fs::read_to_string(config_dir.join(CONFIG_FILE)) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Registry { entries: vec![], error: None };
+            return Registry {
+                entries: vec![],
+                error: None,
+            };
         }
         Err(_) => {
             return Registry {
@@ -86,7 +96,9 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
         .flatten();
         match (valid_alias, home) {
             (Some(alias), Some(home))
-                if default_home.as_ref().is_some_and(|default| default == &home) =>
+                if default_home
+                    .as_ref()
+                    .is_some_and(|default| default == &home) =>
             {
                 entries.push(RegistryEntry::Invalid { alias });
             }
@@ -116,7 +128,9 @@ pub(crate) async fn fetch_from_config(
             RegistryEntry::Valid { alias, profile } => {
                 profiles.push(codex::fetch_public_profile(alias, profile).await)
             }
-            RegistryEntry::Invalid { alias } => profiles.push(CodexProfilePublicQuota::unavailable(alias)),
+            RegistryEntry::Invalid { alias } => {
+                profiles.push(CodexProfilePublicQuota::unavailable(alias))
+            }
         }
     }
     CodexProfilesResponse {
@@ -191,7 +205,9 @@ mod tests {
         assert!(matches!(registry.entries[0], RegistryEntry::Invalid { .. }));
         assert!(matches!(registry.entries[1], RegistryEntry::Invalid { .. }));
         assert!(matches!(registry.entries[2], RegistryEntry::Invalid { .. }));
-        assert!(matches!(&registry.entries[3], RegistryEntry::Valid { alias, .. } if alias == "good"));
+        assert!(
+            matches!(&registry.entries[3], RegistryEntry::Valid { alias, .. } if alias == "good")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -212,11 +228,15 @@ mod tests {
             ]}),
         );
         let registry = load_registry(&dir, Some(&default));
-        assert!(matches!(&registry.entries[0], RegistryEntry::Valid { alias, .. } if alias == "first"));
+        assert!(
+            matches!(&registry.entries[0], RegistryEntry::Valid { alias, .. } if alias == "first")
+        );
         assert!(matches!(registry.entries[1], RegistryEntry::Invalid { .. }));
         assert!(matches!(registry.entries[2], RegistryEntry::Invalid { .. }));
         assert!(matches!(registry.entries[3], RegistryEntry::Invalid { .. }));
-        assert!(matches!(&registry.entries[4], RegistryEntry::Valid { alias, .. } if alias == "last"));
+        assert!(
+            matches!(&registry.entries[4], RegistryEntry::Valid { alias, .. } if alias == "last")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -227,7 +247,10 @@ mod tests {
         let b = dir.join("b");
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
-        write(&dir, serde_json::json!({ "version": 1, "profiles": [entry("a", &a)] }));
+        write(
+            &dir,
+            serde_json::json!({ "version": 1, "profiles": [entry("a", &a)] }),
+        );
         assert_eq!(load_registry(&dir, None).entries.len(), 1);
         write(
             &dir,

@@ -40,11 +40,7 @@ pub async fn get_codex_profiles(app: AppHandle) -> Result<CodexProfilesResponse,
         .path()
         .app_config_dir()
         .map_err(|_| "Profile configuration is unavailable")?;
-    Ok(codex_profiles::fetch_from_config(
-        &config_dir,
-        codex::get_codex_home().as_deref(),
-    )
-    .await)
+    Ok(codex_profiles::fetch_from_config(&config_dir, codex::get_codex_home().as_deref()).await)
 }
 
 #[tauri::command]
