@@ -7,7 +7,7 @@
 | P0 | Cloud-complete; local smoke pending | Cloud checks passed; desktop behavior remains unverified locally. |
 | P1 | Merged | `16997c93...` |
 | P2 | Merged | [`daa92492288405f5224cfedeb92c1706862ee3ee`](https://github.com/SamofPanini/quotabar/commit/daa92492288405f5224cfedeb92c1706862ee3ee), [PR #2](https://github.com/SamofPanini/quotabar/pull/2), [PR CI](https://github.com/SamofPanini/quotabar/actions/runs/34231684473), [main CI](https://github.com/SamofPanini/quotabar/actions/runs/34233334042) |
-| P3 | Implementation PR open; acceptance paused | [PR #4](https://github.com/SamofPanini/quotabar/pull/4) @ `c805ddbc3434b11ad3e6b197b410ee0bfdfc400d`; canonical [CI run 34245284319](https://github.com/SamofPanini/quotabar/actions/runs/34245284319) succeeded. |
+| P3 | Accepted / Merged | [PR #4](https://github.com/SamofPanini/quotabar/pull/4), accepted head `caf6154e778b5483e13465c675eda4311880e260`, [CI run 34306236389](https://github.com/SamofPanini/quotabar/actions/runs/34306236389), merge `9827579eed1bc465537d42c52ff916feaffafb4f`. |
 
 Read this file first, then [P3-claude-bridge-spike.md](P3-claude-bridge-spike.md), then the files named in that brief. The exact commit named by a task is the task base: inspect it before writing, and never silently substitute a newer head.
 
@@ -62,28 +62,23 @@ Cloud Codex cannot close these gates. On the target macOS 12 Intel machine, veri
 P3 is intentionally a narrow contract spike, not permission to start an integration or a multi-account product surface.
 
 
-## Pause handoff — 2026-09-08
+## P3 final acceptance — 2026-09-09
 
-### Frozen state
+- Sol High reviewed exact head `c805ddbc3434b11ad3e6b197b410ee0bfdfc400d` and found one concrete Medium blocker: the synthetic bridge module was declared unconditionally, contradicting the test-only production boundary and generating extensive dead-code warnings.
+- The only remediation was `#[cfg(test)] mod claude_bridge;` in `src-tauri/src/services/mod.rs`; no tests, dependencies, runtime paths, or scope were added.
+- Accepted head `caf6154e778b5483e13465c675eda4311880e260` passed canonical macOS CI [run 34306236389](https://github.com/SamofPanini/quotabar/actions/runs/34306236389). Production `cargo check` no longer emitted `claude_bridge.rs` warnings, while all existing bridge contract tests still ran.
+- PR #4 was squash-merged as `9827579eed1bc465537d42c52ff916feaffafb4f`.
+- `P3 = Accepted / Merged`. P4 remains unstarted and requires a new explicit dispatch.
 
-- P3 implementation remains open and unmerged in [PR #4](https://github.com/SamofPanini/quotabar/pull/4).
-- Exact base: `main` @ `51e1c96aaea068c9ebcefe8e33cb311213fd8147`.
-- Exact paused head: `c805ddbc3434b11ad3e6b197b410ee0bfdfc400d`.
-- The PR changes exactly three files: `src-tauri/src/services/claude_bridge.rs`, `src-tauri/src/services/mod.rs`, and `docs/project-control/P3-claude-bridge-spike.md`.
-- Canonical macOS CI [run 34245284319](https://github.com/SamofPanini/quotabar/actions/runs/34245284319) completed successfully at the paused head: release check, frontend tests/build, Rust formatting, `cargo check`, and Rust tests all passed.
-- A bounded Luna security re-review accepted the preceding remediation head. The final small protocol documentation/test corrections are present in the paused head; the final Sol High architecture/regression/security acceptance has not run.
-- Therefore `P3 = Implementation PR open / Acceptance paused`. P3 is not accepted or merged. P4 has not started.
-- The macOS 12.7.5 Intel runtime gate remains outstanding and is not implied by cloud CI.
+## Local validation decision points
 
-### Resume sequence
+| Node | Local macOS 12.7.5 Intel action | Decision value |
+| --- | --- | --- |
+| Now: P2 production backend | Run the app against the default Codex account and two custom `CODEX_HOME` profiles; exercise alias rejection, credential rotation, Keychain/environment discovery, startup, tray/window lifecycle, and redacted failures. | P2 changed real credential-route and cache behavior. Cloud CI cannot prove Monterey filesystem, Keychain, or app lifecycle behavior. |
+| Not now: P3 contract spike | Do not run Claude paid/free performance tests solely for P3. | P3 is compiled only under `cfg(test)` and has no production transport, IPC, UI, persistence, or runtime call path; local benchmarking would measure unrelated legacy behavior. |
+| Mandatory before merging the first real Claude bridge | As soon as a future phase introduces a real transport/process/profile seam or Tauri IPC, validate one paid and one free account before adding multi-account UI. Compare feature branch against the same-machine baseline for startup, steady CPU/RSS, refresh latency, failure isolation, logout/rotation, sleep/wake, and network loss. | This is the first point where macOS 12 compatibility, live login, resource cost, and long-running stability become observable. A failure here blocks UI expansion. |
+| Mandatory before release | Validate the packaged app, Gatekeeper/Keychain interaction, tray/window lifecycle, all supported profiles, recovery after sleep/network change, redacted diagnostics, and an extended idle/refresh soak. | Release confidence requires the target OS, packaging, and real lifecycle; cloud tests cannot substitute. |
 
-1. Re-fetch PR #4 and verify that its head is still `c805ddbc3434b11ad3e6b197b410ee0bfdfc400d`, or explicitly review every later commit.
-2. Reconfirm the three-file allowlist, synthetic/test-only transport boundary, redaction rules, instance isolation, precedence semantics, and absence of real login, credential, IPC, UI, dependency, or persistence work.
-3. Reconfirm the final protocol fixes on the current head; use Luna for bounded audit work where useful.
-4. Run Sol High once for final architecture, regression, concurrency, security, and scope acceptance on the exact head.
-5. Only after an accepting verdict and exact-head green CI may the control plane decide whether to merge PR #4.
-6. Stop after the P3 decision. Do not dispatch or implement P4 without a new explicit control-plane instruction.
+Use baseline-relative evidence on the same Mac. Start with one baseline run and one feature run; repeat only when variance or a failure needs diagnosis. Do not create synthetic performance tests for code that is not reachable in production.
 
-### Deferred local verification
-
-On macOS 12.7.5 Intel, retain the existing runtime smoke gate for app startup, tray/window lifecycle, IPC, default Claude behavior, two custom Codex profiles, credential rotation/alias behavior, and redacted diagnostics. Live Claude paid/free login and transport discovery remain local research inputs for a later explicitly approved phase; they are not part of P3 acceptance.
+If the current Codex.app build cannot run on macOS 12, use Codex CLI or Terminal to drive the same checkout and commands. The required evidence comes from the Monterey runtime and packaged application, not from the controller UI.
