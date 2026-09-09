@@ -710,9 +710,18 @@ pub(crate) async fn fetch_public_profile(
     let Some(row) = rows.pop() else {
         return CodexProfilePublicQuota::unavailable(alias);
     };
-    let status = if row.info.connected && row.rate_limits.error.is_some() {
+    public_profile_from_quota(alias, row)
+}
+
+fn public_profile_from_quota(alias: String, row: CodexProfileQuota) -> CodexProfilePublicQuota {
+    // Only a connected quota response with retained usage windows is stale. Account
+    // metadata can remain connected when a fresh rate-limit request failed, but it
+    // is not itself a quota snapshot and must not be presented as one.
+    let retained_quota = row.rate_limits.connected
+        && (row.rate_limits.primary.is_some() || row.rate_limits.secondary.is_some());
+    let status = if retained_quota && row.rate_limits.error.is_some() {
         "stale"
-    } else if row.info.connected || row.rate_limits.connected {
+    } else if row.rate_limits.connected && row.rate_limits.error.is_none() {
         "connected"
     } else {
         "offline"
@@ -777,11 +786,13 @@ mod tests {
     use super::{
         aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs,
         fetch_codex_profiles, parse_rate_limit_window, parse_reset_credit,
+        public_profile_from_quota,
         read_auth_json_with_stamp, retain_last_good_info, should_preserve_for_status,
         should_preserve_transport_failure, window_minutes_from_seconds, AuthFileStamp,
         BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
     };
-    use crate::domain::account::{CodexProfile, CodexProfileInput};
+    use crate::domain::account::{CodexProfile, CodexProfileInput, CodexProfileQuota};
+    use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits, CodexResetCredits};
     use base64::Engine as _;
     use serde_json::json;
     use std::fs;
@@ -909,6 +920,81 @@ mod tests {
             subscription_until: None,
             email: Some(email.to_string()),
             error: None,
+        }
+    }
+
+    fn public_quota(info_connected: bool, rate_limits: CodexRateLimits) -> CodexProfileQuota {
+        CodexProfileQuota {
+            profile_id: "codex/private-profile".into(),
+            account_id: Some("private-account".into()),
+            info: if info_connected {
+                connected_info("private@example.test")
+            } else {
+                CodexData::disconnected("offline")
+            },
+            rate_limits,
+            reset_credits: CodexResetCredits::disconnected("offline"),
+        }
+    }
+
+    fn connected_limits(error: Option<&str>) -> CodexRateLimits {
+        CodexRateLimits {
+            connected: true,
+            plan_type: Some("pro".into()),
+            primary: Some(CodexRateLimitWindow {
+                used_percent: 25.0,
+                window_minutes: Some(60),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn public_profile_status_uses_current_or_retained_rate_limits_not_info() {
+        let connected = public_profile_from_quota(
+            "work".into(),
+            public_quota(true, connected_limits(None)),
+        );
+        assert_eq!(connected.status, "connected");
+        assert_eq!(connected.error, None);
+
+        let stale = public_profile_from_quota(
+            "work".into(),
+            public_quota(true, connected_limits(Some("Network error"))),
+        );
+        assert_eq!(stale.status, "stale");
+        assert_eq!(stale.error.as_deref(), Some("Profile unavailable"));
+
+        let no_quota_failure = public_profile_from_quota(
+            "work".into(),
+            public_quota(
+                true,
+                CodexRateLimits {
+                    connected: true,
+                    plan_type: Some("pro".into()),
+                    primary: None,
+                    secondary: None,
+                    credits: None,
+                    error: Some("Network error".into()),
+                },
+            ),
+        );
+        assert_eq!(no_quota_failure.status, "offline");
+        assert_eq!(
+            no_quota_failure.error.as_deref(),
+            Some("Profile unavailable")
+        );
+
+        for error in ["Network error: timeout", "Token expired", "offline"] {
+            let offline = public_profile_from_quota(
+                "work".into(),
+                public_quota(true, CodexRateLimits::disconnected(error)),
+            );
+            assert_eq!(offline.status, "offline", "{error}");
+            assert_eq!(offline.error.as_deref(), Some("Profile unavailable"));
         }
     }
 

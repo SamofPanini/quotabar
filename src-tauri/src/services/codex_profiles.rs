@@ -13,7 +13,7 @@ const MAX_CUSTOM_PROFILES: usize = 12;
 #[serde(deny_unknown_fields)]
 struct Config {
     version: u32,
-    profiles: Vec<ConfigProfile>,
+    profiles: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -44,8 +44,24 @@ fn safe_alias(value: &str) -> Option<String> {
         && value
             .chars()
             .all(|c| c.is_ascii_graphic() && c != '/' && c != '\\')
-        && value != "default")
+        && !value.eq_ignore_ascii_case("default"))
         .then(|| value.to_string())
+}
+
+fn invalid_alias(index: usize, reserved: &HashSet<String>, used: &mut HashSet<String>) -> String {
+    let base = format!("profile-{}", index + 1);
+    let mut suffix = 0;
+    loop {
+        let candidate = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}-invalid-{suffix}")
+        };
+        if !reserved.contains(&candidate) && used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> Registry {
@@ -75,25 +91,41 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
     };
 
     let overflow = config.profiles.len() > MAX_CUSTOM_PROFILES;
+    // Reserve every syntactically safe alias first so an invalid row's generated
+    // label can never shadow a valid alias declared later in the file.
+    let reserved_aliases = config
+        .profiles
+        .iter()
+        .filter_map(|entry| entry.get("alias")?.as_str())
+        .filter_map(safe_alias)
+        .collect::<HashSet<_>>();
     let default_home = default_home.and_then(|home| home.canonicalize().ok());
     let mut aliases = HashSet::new();
     let mut routes = HashSet::new();
     let mut entries = Vec::new();
-    for (index, entry) in config.profiles.into_iter().enumerate() {
+    for (index, raw_entry) in config.profiles.into_iter().enumerate() {
         if index == MAX_CUSTOM_PROFILES {
             break;
         }
-        let valid_alias = safe_alias(&entry.alias).filter(|alias| aliases.insert(alias.clone()));
+        let entry = serde_json::from_value::<ConfigProfile>(raw_entry);
+        let valid_alias = entry
+            .as_ref()
+            .ok()
+            .and_then(|entry| safe_alias(&entry.alias))
+            .filter(|alias| aliases.insert(alias.clone()));
         let alias = valid_alias
             .clone()
-            .unwrap_or_else(|| format!("profile-{}", index + 1));
-        let home = (entry.home.is_absolute()
-            && !entry
-                .home
-                .components()
-                .any(|part| matches!(part, Component::ParentDir)))
-        .then(|| entry.home.canonicalize().ok())
-        .flatten();
+            .unwrap_or_else(|| invalid_alias(index, &reserved_aliases, &mut aliases));
+        let home = entry.ok().and_then(|entry| {
+            (entry.home.is_absolute()
+                && !entry
+                    .home
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir)))
+            .then(|| entry.home.canonicalize().ok())
+            .flatten()
+            .filter(|home| home.is_dir())
+        });
         match (valid_alias, home) {
             (Some(alias), Some(home))
                 if default_home
@@ -183,8 +215,55 @@ mod tests {
     fn aliases_must_be_bounded_safe_unique_and_not_default() {
         assert_eq!(safe_alias("work"), Some("work".into()));
         assert_eq!(safe_alias("default"), None);
+        assert_eq!(safe_alias("Default"), None);
+        assert_eq!(safe_alias("DEFAULT"), None);
         assert_eq!(safe_alias("contains/path"), None);
         assert_eq!(safe_alias(&"a".repeat(49)), None);
+    }
+
+    #[test]
+    fn malformed_rows_stay_in_place_without_suppressing_valid_neighbors() {
+        let dir = temp("malformed-rows");
+        let first = dir.join("first");
+        let last = dir.join("last");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&last).unwrap();
+        write(
+            &dir,
+            serde_json::json!({ "version": 1, "profiles": [
+                entry("first", &first),
+                { "alias": "missing-home" },
+                { "alias": 42, "home": &last },
+                { "alias": "unknown-field", "home": &last, "extra": true },
+                entry("last", &last)
+            ]}),
+        );
+        let registry = load_registry(&dir, None);
+        assert!(registry.error.is_none());
+        assert!(matches!(&registry.entries[0], RegistryEntry::Valid { alias, .. } if alias == "first"));
+        assert!(matches!(&registry.entries[1], RegistryEntry::Invalid { .. }));
+        assert!(matches!(&registry.entries[2], RegistryEntry::Invalid { .. }));
+        assert!(matches!(&registry.entries[3], RegistryEntry::Invalid { .. }));
+        assert!(matches!(&registry.entries[4], RegistryEntry::Valid { alias, .. } if alias == "last"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn generated_invalid_aliases_never_collide_with_declared_valid_aliases() {
+        let dir = temp("invalid-aliases");
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        write(
+            &dir,
+            serde_json::json!({ "version": 1, "profiles": [
+                { "alias": "broken" },
+                entry("profile-1", &home)
+            ]}),
+        );
+        let registry = load_registry(&dir, None);
+        assert!(matches!(&registry.entries[0], RegistryEntry::Invalid { alias } if alias != "profile-1"));
+        assert!(matches!(&registry.entries[1], RegistryEntry::Valid { alias, .. } if alias == "profile-1"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -208,6 +287,21 @@ mod tests {
         assert!(
             matches!(&registry.entries[3], RegistryEntry::Valid { alias, .. } if alias == "good")
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn canonical_home_must_be_a_directory() {
+        let dir = temp("home-file");
+        let file = dir.join("auth-file");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&file, "not a home").unwrap();
+        write(
+            &dir,
+            serde_json::json!({ "version": 1, "profiles": [entry("file", &file)] }),
+        );
+        let registry = load_registry(&dir, None);
+        assert!(matches!(&registry.entries[0], RegistryEntry::Invalid { .. }));
         let _ = fs::remove_dir_all(dir);
     }
 

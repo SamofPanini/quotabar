@@ -25,11 +25,20 @@ impl AccountCacheKey {
 }
 
 /// P2's internal descriptor. It is deliberately not part of a Tauri command.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CodexProfileInput {
     pub(crate) profile_id: String,
     pub(crate) home: Option<PathBuf>,
+}
+impl fmt::Debug for CodexProfileInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexProfileInput")
+            .field("profile_id", &"<redacted>")
+            .field("home", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Credential route is not caller label: custom routes use a canonical absolute home identity.
@@ -158,13 +167,25 @@ impl CodexProfilePublicQuota {
 }
 
 /// P2's private aggregation shape. It must never be returned from IPC.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct CodexProfileQuota {
     pub(crate) profile_id: String,
     pub(crate) account_id: Option<String>,
     pub(crate) info: crate::domain::models::CodexData,
     pub(crate) rate_limits: crate::domain::models::CodexRateLimits,
     pub(crate) reset_credits: crate::domain::models::CodexResetCredits,
+}
+impl fmt::Debug for CodexProfileQuota {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexProfileQuota")
+            .field("profile_id", &"<redacted>")
+            .field("account_id", &"<redacted>")
+            .field("info", &self.info)
+            .field("rate_limits", &self.rate_limits)
+            .field("reset_credits", &self.reset_credits)
+            .finish()
+    }
 }
 impl CodexProfileQuota {
     pub(crate) fn disconnected(profile_id: String, error: impl Into<String>) -> Self {
@@ -193,6 +214,7 @@ mod tests {
         CodexProfilePublicQuota,
     };
     use std::fs;
+    use std::path::PathBuf;
     #[test]
     fn default_descriptor_is_codex_default() {
         assert_eq!(default_codex_profile().profile_id(), "codex/default");
@@ -239,17 +261,59 @@ mod tests {
             available_reset_credits: 1,
             error: None,
         };
-        let output = serde_json::to_string(&dto).unwrap();
-        for forbidden in [
-            "/private/credential-route",
-            "accountId",
-            "account_id",
-            "email",
-            "access_token",
-            "id_token",
-        ] {
-            assert!(!output.contains(forbidden));
-        }
+        let output = serde_json::to_value(&dto).unwrap();
+        let keys = output
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "alias",
+                "availableResetCredits",
+                "error",
+                "planType",
+                "primary",
+                "secondary",
+                "status",
+            ])
+        );
         assert!(!format!("{dto:?}").contains("/private/credential-route"));
+    }
+
+    #[test]
+    fn private_debug_output_redacts_populated_identity_and_path_values() {
+        use crate::domain::models::{CodexData, CodexRateLimits, CodexResetCredits};
+
+        let input = CodexProfileInput {
+            profile_id: "codex/secret-profile".into(),
+            home: Some(PathBuf::from("/private/credential-route")),
+        };
+        let quota = super::CodexProfileQuota {
+            profile_id: "codex/secret-profile".into(),
+            account_id: Some("acct-secret".into()),
+            info: CodexData {
+                connected: true,
+                plan_type: Some("pro".into()),
+                account_id: Some("acct-secret".into()),
+                subscription_until: None,
+                email: Some("private@example.test".into()),
+                error: Some("Bearer token-like-secret".into()),
+            },
+            rate_limits: CodexRateLimits::disconnected("offline"),
+            reset_credits: CodexResetCredits::disconnected("offline"),
+        };
+        let debug = format!("{input:?} {quota:?}");
+        for secret in [
+            "/private/credential-route",
+            "secret-profile",
+            "acct-secret",
+            "private@example.test",
+            "token-like-secret",
+        ] {
+            assert!(!debug.contains(secret), "debug exposed {secret}");
+        }
     }
 }
