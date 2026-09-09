@@ -532,7 +532,7 @@ pub(crate) async fn fetch_codex_reset_credits_for(profile: &CodexProfile) -> Cod
 }
 
 async fn fetch_codex_reset_credits_from_auth(
-    profile: &CodexProfile,
+    _profile: &CodexProfile,
     auth_json: serde_json::Value,
 ) -> CodexResetCredits {
     let access_token = match auth_json["tokens"]["access_token"].as_str() {

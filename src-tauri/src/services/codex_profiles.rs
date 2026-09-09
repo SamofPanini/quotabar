@@ -64,7 +64,7 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
             };
         }
     };
-    let config: Config = match serde_json::from_str(&content) {
+    let config: Config = match serde_json::from_str::<Config>(&content) {
         Ok(config) if config.version == 1 => config,
         _ => {
             return Registry {
