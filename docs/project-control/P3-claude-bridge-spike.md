@@ -17,18 +17,26 @@ The internal normalized envelope is typed and strict. It is test-only in P3: no 
 version: "v1"
 instanceId: string
 route: { kind: "claude_desktop" | "claude_web" | "mock"; label?: synthetic/app-owned string }
-snapshot: {
+snapshot?: {
   source: "internal_usage_api" | "completion_sse" | "local_estimate" | "stale_cache"
   confidence: "verified_server" | "observed" | "estimated" | "unknown"
   observedAt: RFC 3339 timestamp
-  usageWindows?: [{ name, usedPercent?, resetAt? }]
+  usageWindows: [{ name, usedPercent?, resetAt? }] (one or more)
 }
 error?: { code: "unavailable" | "malformed_payload" | "unsupported_route" | "redacted_field" | "stale"; retryable: boolean }
 ```
 
+`snapshot` is omitted when no validated usage observation exists. When present, it contains at
+least one typed usage window. In particular, unavailable, malformed, and redacted results carry a
+safe error rather than a fabricated source or window.
+A `stale_cache` source is emitted only for an actual validated stale-cache fixture.
+For one instance, a later invalid update replaces its last-good snapshot with a no-snapshot safe
+error; it never becomes a fabricated stale result and never changes another instance.
+
 `instanceId` and route metadata are app-owned routing labels, not provider identities. `route.label` may contain only a synthetic/app-owned label and must not carry provider-derived identity. The internal envelope and every log line must exclude organization ID, email, provider account ID, token, cookie, session key, authorization value, and raw provider payload. The protocol validator must fail closed on unknown or forbidden fields; it must reject (or redact before construction) forbidden keys and values before a result can leave the adapter.
 
-Usage windows are optional. An empty free `/usage` response means “no endpoint usage window”, not zero use and not an error by itself. Source precedence is:
+An empty free `/usage` response means “no endpoint usage window”, not zero use and not an error
+by itself. Source precedence is:
 
 ```text
 valid endpoint > completion SSE > local estimate > stale cache
@@ -76,7 +84,9 @@ No fixture contains a real account, organization, email, cookie, OAuth token, se
 | Typed v1 envelope | Accept valid fixture; reject malformed version/source/confidence/window shape. |
 | Paid-like snapshot | Endpoint fixture produces `internal_usage_api`, `verified_server`, and its own instance store entry. |
 | Free empty `/usage` semantics | Empty endpoint plus SSE produces SSE data; empty endpoint alone does not fabricate a window or zero. |
+| Missing or unavailable data | Missing response produces a safe `unavailable` error with no fabricated snapshot. |
 | Precedence | Endpoint wins over SSE/estimate/cache; empty free endpoint allows SSE; malformed endpoint fails closed. |
+| Estimate precedence | Local estimate wins over stale cache and retains `local_estimate` / `estimated`. |
 | Instance isolation | Alternating paid/free fixture writes and reads never cross instances. |
 | Credential safety | Validator fails closed on unknown/forbidden fields; safe error/log formatter excludes every forbidden key and sentinel value. |
 | Legacy compatibility | Existing Claude tests and direct `get_quota` path remain unchanged and pass. |
