@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "QuotaBar local Claude acquisition probe",
+  "version": "0.1.0",
+  "description": "Temporary local-only sanitized acquisition probe. Synthetic validation only until approved.",
+  "permissions": [],
+  "host_permissions": ["https://claude.ai/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_popup": "popup.html" },
+  "content_scripts": [{
+    "matches": ["https://claude.ai/*"],
+    "js": ["content-validator.js", "content.js"],
+    "run_at": "document_start"
+  }, {
+    "matches": ["https://claude.ai/*"],
+    "js": ["page-observer.js"],
+    "run_at": "document_start",
+    "world": "MAIN"
+  }]
+}
