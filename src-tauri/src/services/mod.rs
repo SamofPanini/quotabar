@@ -4,6 +4,7 @@ pub mod claude;
 mod claude_bridge;
 pub mod codex;
 mod codex_cache;
+pub(crate) mod codex_profiles;
 pub mod codex_weekly;
 pub mod cost;
 mod cost_disk_cache;

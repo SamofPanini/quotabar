@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageInfo {
@@ -61,7 +62,7 @@ impl QuotaData {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CodexData {
     pub connected: bool,
     #[serde(rename = "planType")]
@@ -72,6 +73,20 @@ pub struct CodexData {
     pub subscription_until: Option<String>,
     pub email: Option<String>,
     pub error: Option<String>,
+}
+
+impl fmt::Debug for CodexData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexData")
+            .field("connected", &self.connected)
+            .field("plan_type", &self.plan_type)
+            .field("account_id", &"<redacted>")
+            .field("subscription_until", &self.subscription_until)
+            .field("email", &"<redacted>")
+            .field("error", &"<redacted>")
+            .finish()
+    }
 }
 
 impl CodexData {
