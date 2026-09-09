@@ -45,7 +45,7 @@ fn safe_alias(value: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_graphic() && c != '/' && c != '\\')
         && !value.eq_ignore_ascii_case("default"))
-        .then(|| value.to_string())
+    .then(|| value.to_string())
 }
 
 fn invalid_alias(index: usize, reserved: &HashSet<String>, used: &mut HashSet<String>) -> String {
@@ -240,11 +240,24 @@ mod tests {
         );
         let registry = load_registry(&dir, None);
         assert!(registry.error.is_none());
-        assert!(matches!(&registry.entries[0], RegistryEntry::Valid { alias, .. } if alias == "first"));
-        assert!(matches!(&registry.entries[1], RegistryEntry::Invalid { .. }));
-        assert!(matches!(&registry.entries[2], RegistryEntry::Invalid { .. }));
-        assert!(matches!(&registry.entries[3], RegistryEntry::Invalid { .. }));
-        assert!(matches!(&registry.entries[4], RegistryEntry::Valid { alias, .. } if alias == "last"));
+        assert!(
+            matches!(&registry.entries[0], RegistryEntry::Valid { alias, .. } if alias == "first")
+        );
+        assert!(matches!(
+            &registry.entries[1],
+            RegistryEntry::Invalid { .. }
+        ));
+        assert!(matches!(
+            &registry.entries[2],
+            RegistryEntry::Invalid { .. }
+        ));
+        assert!(matches!(
+            &registry.entries[3],
+            RegistryEntry::Invalid { .. }
+        ));
+        assert!(
+            matches!(&registry.entries[4], RegistryEntry::Valid { alias, .. } if alias == "last")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -261,8 +274,12 @@ mod tests {
             ]}),
         );
         let registry = load_registry(&dir, None);
-        assert!(matches!(&registry.entries[0], RegistryEntry::Invalid { alias } if alias != "profile-1"));
-        assert!(matches!(&registry.entries[1], RegistryEntry::Valid { alias, .. } if alias == "profile-1"));
+        assert!(
+            matches!(&registry.entries[0], RegistryEntry::Invalid { alias } if alias != "profile-1")
+        );
+        assert!(
+            matches!(&registry.entries[1], RegistryEntry::Valid { alias, .. } if alias == "profile-1")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -301,7 +318,10 @@ mod tests {
             serde_json::json!({ "version": 1, "profiles": [entry("file", &file)] }),
         );
         let registry = load_registry(&dir, None);
-        assert!(matches!(&registry.entries[0], RegistryEntry::Invalid { .. }));
+        assert!(matches!(
+            &registry.entries[0],
+            RegistryEntry::Invalid { .. }
+        ));
         let _ = fs::remove_dir_all(dir);
     }
 

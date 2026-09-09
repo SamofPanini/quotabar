@@ -786,10 +786,9 @@ mod tests {
     use super::{
         aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs,
         fetch_codex_profiles, parse_rate_limit_window, parse_reset_credit,
-        public_profile_from_quota,
-        read_auth_json_with_stamp, retain_last_good_info, should_preserve_for_status,
-        should_preserve_transport_failure, window_minutes_from_seconds, AuthFileStamp,
-        BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
+        public_profile_from_quota, read_auth_json_with_stamp, retain_last_good_info,
+        should_preserve_for_status, should_preserve_transport_failure, window_minutes_from_seconds,
+        AuthFileStamp, BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
     };
     use crate::domain::account::{CodexProfile, CodexProfileInput, CodexProfileQuota};
     use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits, CodexResetCredits};
@@ -954,10 +953,8 @@ mod tests {
 
     #[test]
     fn public_profile_status_uses_current_or_retained_rate_limits_not_info() {
-        let connected = public_profile_from_quota(
-            "work".into(),
-            public_quota(true, connected_limits(None)),
-        );
+        let connected =
+            public_profile_from_quota("work".into(), public_quota(true, connected_limits(None)));
         assert_eq!(connected.status, "connected");
         assert_eq!(connected.error, None);
 
