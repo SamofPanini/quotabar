@@ -28,3 +28,15 @@ Run focused synthetic tests from the repository root:
 ```bash
 npx vitest run tools/local-validation/claude-acquisition-probe/probe.test.js
 ```
+
+For the reviewed disposable Chrome bootstrap smoke (synthetic loopback only, no
+authenticated profile), run under Node 22 (its built-in WebSocket client is
+required):
+
+```bash
+node tools/local-validation/claude-acquisition-probe/gate-c1.mjs
+```
+
+The manifest loads exactly one generated self-contained entry per execution
+world. `generate-entries.mjs` deterministically derives both entries from the
+single authoritative `probe-core.js`; use its `--check` mode to reject drift.

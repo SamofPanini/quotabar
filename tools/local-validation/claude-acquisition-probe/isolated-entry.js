@@ -1,3 +1,5 @@
+/* Generated from probe-core.js by generate-entries.mjs; do not edit. */
+(() => {
 /* Classic side-effect core: runtime and Vitest execute these exact functions. */
 function createProbeCore() {
   "use strict";
@@ -43,4 +45,19 @@ function createProbeCore() {
   function popupView(state) { const safe = safeState(state); return { buildId: BUILD_ID, slot: safe.slot, planClass: safe.planClass, diagnostic: safe.diagnostics[safe.slot], observation: safeEnvelope(safe.observations[safe.slot]) }; }
   return Object.freeze({ MAX_ENDPOINT_BYTES, MAX_SSE_LINE_BYTES, BUILD_ID, SLOTS, PLANS, ERRORS, STAGES, normalizeRfc3339, unixSeconds, endpointWindows, selectSseWindows, isUsageUrl, isCompletionUrl, isEventStream, drainEndpoint, parseMessageLimitSse, isSanitizedEnvelope, safeEnvelope, safeState, updateState, fetchInput, observeWithoutInterference, installFetchObserver, message, mainMessage, validWindowMessage, createSessionHandler, popupView });
 }
-globalThis.QuotaBarProbeCore = createProbeCore();
+const core = createProbeCore();
+
+(() => {
+  const send = (value) => chrome.runtime.sendMessage(value);
+  const post = (type) => window.postMessage({ type, buildId: core.BUILD_ID }, location.origin);
+  send({ type: "stage", stage: "bridge_loaded" });
+  window.addEventListener("message", (event) => {
+    const data = core.validWindowMessage(event, window, location.origin);
+    if (!data) return;
+    if (data.type === "quotabar-local-probe-main-ready") send({ type: "stage", stage: "bridge_received_main_ready" });
+    else if (data.type === "quotabar-local-probe-stage") send({ type: "stage", stage: data.stage });
+    else if (data.type === "quotabar-local-probe-observation") send({ type: "observation", output: data.output });
+  });
+  post("quotabar-local-probe-ready-request");
+})();
+})();

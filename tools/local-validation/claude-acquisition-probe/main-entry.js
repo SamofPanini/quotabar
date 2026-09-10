@@ -1,3 +1,5 @@
+/* Generated from probe-core.js by generate-entries.mjs; do not edit. */
+(() => {
 /* Classic side-effect core: runtime and Vitest execute these exact functions. */
 function createProbeCore() {
   "use strict";
@@ -43,4 +45,20 @@ function createProbeCore() {
   function popupView(state) { const safe = safeState(state); return { buildId: BUILD_ID, slot: safe.slot, planClass: safe.planClass, diagnostic: safe.diagnostics[safe.slot], observation: safeEnvelope(safe.observations[safe.slot]) }; }
   return Object.freeze({ MAX_ENDPOINT_BYTES, MAX_SSE_LINE_BYTES, BUILD_ID, SLOTS, PLANS, ERRORS, STAGES, normalizeRfc3339, unixSeconds, endpointWindows, selectSseWindows, isUsageUrl, isCompletionUrl, isEventStream, drainEndpoint, parseMessageLimitSse, isSanitizedEnvelope, safeEnvelope, safeState, updateState, fetchInput, observeWithoutInterference, installFetchObserver, message, mainMessage, validWindowMessage, createSessionHandler, popupView });
 }
-globalThis.QuotaBarProbeCore = createProbeCore();
+const core = createProbeCore();
+
+(() => {
+  "use strict";
+  const post = (data) => window.postMessage({ ...data, buildId: core.BUILD_ID }, location.origin);
+  const ready = () => post({ type: "quotabar-local-probe-main-ready" });
+  const stage = (value) => post({ type: "quotabar-local-probe-stage", stage: value });
+  const emit = (output) => post({ type: "quotabar-local-probe-observation", output });
+  const fail = (source, errorCode) => ({ version: "v1", probeSlot: "profile-a", planClass: "unknown", source, observedAt: new Date().toISOString(), windows: [], status: errorCode === "unavailable" ? "unavailable" : "malformed", errorCode });
+  async function endpoint(response) { const result = await core.drainEndpoint(response); if (result.kind === "found" && result.windows.length) emit({ version: "v1", probeSlot: "profile-a", planClass: "unknown", source: "usage_endpoint", observedAt: new Date().toISOString(), windows: result.windows, status: "available" }); else emit(fail("usage_endpoint", result.kind === "overflow" ? "overflow" : result.kind === "found" || result.kind === "none" ? "unavailable" : "malformed_payload")); }
+  async function sse(response) { const result = await core.parseMessageLimitSse(response); if (result.kind === "found") { stage("message_limit_found"); emit({ version: "v1", probeSlot: "profile-a", planClass: "unknown", source: "completion_sse", observedAt: new Date().toISOString(), windows: result.windows, status: "available" }); } else { stage(result.kind === "none" ? "completion_seen_no_message_limit" : "completion_parse_failed"); if (result.kind !== "none") emit(fail("completion_sse", result.kind === "overflow" ? "overflow" : "malformed_payload")); } }
+  window.addEventListener("message", (event) => { const data = core.validWindowMessage(event, window, location.origin); if (data?.type === "quotabar-local-probe-ready-request") { stage("observer_installed"); ready(); } });
+  core.installFetchObserver(window, location.origin, endpoint, sse, stage);
+  stage("observer_installed");
+  ready();
+})();
+})();
