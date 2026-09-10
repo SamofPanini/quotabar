@@ -95,6 +95,8 @@ For completion SSE:
 
 P4B-1E-R loads one self-contained generated entry in each execution world. Both are deterministically derived from the single authoritative core source and capture that core in a closure before registering their bridge or observer; neither relies on a previous manifest file attaching a page-visible global. It may expose only a fixed build label and latest fixed stage per synthetic slot: bridge loaded, MAIN observer installed, bridge received MAIN readiness, completion matched, event stream recognized, message limit found, completion seen without message limit, closed parse failure, or sanitized observation stored. A parse failure never claims message-limit discovery, and storage is reported only for an accepted candidate. The MAIN/ISOLATED handshake is `postMessage`-based, exact-schema, source/origin checked, and has no timer or polling loop. Diagnostic state is separate from quota evidence and cannot erase an available observation.
 
+The disposable Chrome harness is a fail-closed local test only: it accepts an exit of zero only after exact extension identity, one loopback synthetic GET, origin/marker, build label, both fixed bootstrap confirmations, final handshake, and absence of extension startup exceptions are all asserted. Its CDP, browser, server, temporary profile and certificate cleanup is process-specific and bounded; it is not probe runtime capability.
+
 ### Sanitized output
 
 The probe emits exactly:
