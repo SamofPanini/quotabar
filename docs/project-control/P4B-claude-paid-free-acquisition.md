@@ -93,6 +93,8 @@ For completion SSE:
 - cap parser memory and fail closed on overflow or malformed input;
 - never delay, modify, cancel, retry, or otherwise affect the response consumed by Claude.
 
+P4B-1D may expose only a fixed build label and latest fixed stage per synthetic slot: bridge loaded, MAIN observer installed, bridge received MAIN readiness, completion matched, event stream recognized, message limit found, completion seen without message limit, or sanitized observation stored. The MAIN/ISOLATED handshake is `postMessage`-based, exact-schema, source/origin checked, and has no timer or polling loop. Diagnostic state is separate from quota evidence and cannot erase an available observation.
+
 ### Sanitized output
 
 The probe emits exactly:
@@ -119,6 +121,8 @@ It must not emit or retain:
 - conversation text, uploaded data, tool data;
 - arbitrary provider error text.
 
+The bounded parser may scan cloned SSE bytes only far enough to locate `message_limit`; raw SSE and every other event payload must never be emitted, persisted, logged, or exfiltrated.
+
 Unknown fields fail closed. Missing windows remain missing and never become zero.
 
 ### Storage and network
@@ -142,6 +146,9 @@ Unknown fields fail closed. Missing windows remain missing and never become zero
 - interception returns the original response path without mutation or blocking.
 - two synthetic slots never overwrite or inherit from one another.
 - repository production build and existing QuotaBar behavior remain unchanged.
+- relative/absolute strings, native `Request`, native `URL`, and query-string fetch inputs classify without exposing normalized URLs.
+- fixed readiness handshake accepts either registration ordering and rejects wrong source, origin, type, or unknown fields.
+- completion stages distinguish matched request, stream recognition, message-limit discovery, no-message-limit completion, and sanitized storage without changing quota evidence.
 
 ## Canonical cloud gate
 
@@ -200,7 +207,9 @@ Do not claim that a free account provides stable polling: SSE acquisition is eve
 - `BLOCKED`: probe injection/runtime cannot operate inside an authorized authenticated context.
 - `FAIL`: cross-account leakage, provider identity exposure, request mutation, credential/session disturbance, or unacceptable runtime behavior.
 
-Static-only data must never produce `PASS`. Live loading is permitted only when the control plane authorizes the exact reviewed head. P4B-2R and P4B-2S are not authorized by P4B-1R.
+Static-only data must never produce `PASS`. Live loading is permitted only when the control plane authorizes the exact reviewed head. P4B-2R and P4B-2S are not authorized by P4B-1D.
+
+Sol acceptance never automatically authorizes authenticated loading or ordinary-message sending; a later local run needs separate owner authorization.
 
 Any outcome returns to the Work control plane. Never continue automatically to a production bridge, P4C, or P4D.
 

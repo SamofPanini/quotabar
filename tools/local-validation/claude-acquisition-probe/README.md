@@ -12,12 +12,14 @@ Paid and Free both require a real completion/retry-completion SSE `message_limit
 
 1. In Chromium, open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
 2. Select this directory. In the popup, select and confirm the synthetic slot and operator-declared plan class **before** any authorized trigger. They are never inferred from provider data.
-3. Use separate browser profiles for the two authorized accounts; record only `profile-a` and `profile-b`, never profile names or paths. The popup displays only a sanitized envelope.
+3. Use separate browser profiles for the two authorized accounts; record only `profile-a` and `profile-b`, never profile names or paths. The popup displays a fixed build label, fixed readiness/acquisition stage, and a sanitized envelope.
 4. To remove it, open `chrome://extensions` and choose **Remove**. Selection and sanitized observations live only in `chrome.storage.session`: they survive service-worker restarts but clear when the browser session ends.
 
 ## Safety boundary
 
-The page-world observer recognizes only exact same-origin GET usage responses and POST completion/retry-completion SSE responses with `text/event-stream` content type. The opaque route segment stays in page world. It sends the content script only an allowlisted, validated envelope; the extension stores only that envelope in session storage, never credentials, raw data, route/account identifiers, provider error strings, or conversation content. It never inspects or emits raw SSE, assistant text, prompt text, thinking/tool data, cookies, tokens, or headers. It makes no network requests and does not modify, block, or delay Claude requests.
+The page-world observer recognizes only exact same-origin GET usage responses and POST completion/retry-completion SSE responses with `text/event-stream` content type. The opaque route segment stays in page world. It uses a bounded scan of each cloned SSE stream only to locate `message_limit`; it never emits, persists, logs, or exfiltrates raw SSE or other event content. It sends the content script only a fixed-stage `postMessage` or an allowlisted, validated envelope. The extension stores only fixed diagnostic stages and sanitized envelopes in session storage, never credentials, raw data, route/account identifiers, provider error strings, assistant text, prompt text, thinking/tool data, cookies, tokens, or headers. It makes no network requests and does not modify, block, or delay Claude requests.
+
+The fixed stages distinguish bridge load, MAIN observer installation, MAIN readiness received by the bridge, completion match, event-stream recognition, `message_limit` discovery, stream completion without `message_limit`, and sanitized observation storage. They contain no request, provider, identity, or arbitrary error data. Sol acceptance never itself authorizes authenticated loading or message sending.
 
 The lugia19 projects are mechanism references only: no GPL code, assets, runtime dependency, or Firebase path is used.
 
