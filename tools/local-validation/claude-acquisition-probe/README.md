@@ -2,11 +2,11 @@
 
 This is a temporary MV3 Chromium probe for the P4B acquisition gate. It is not part of QuotaBar, has no production dependency, and does not add a bridge, listener, persistence, or network service.
 
-## Synthetic validation only
+## Synthetic validation and live authorization
 
-Live validation is forbidden until Sol High accepts the PR. Do not load this against an authenticated browser profile, send a Claude message, or capture provider traffic. The included tests use only synthetic, secret-free data.
+The included tests use only synthetic, secret-free data. Live loading is allowed only when the control plane authorizes the exact reviewed head, and only in the separately authorized browser contexts. Assign only the synthetic ledger labels `profile-a` and `profile-b`; never record actual browser profile names or paths. P4B-2R and P4B-2S are not authorized by this implementation task.
 
-After approval for P4B-2, load this directory as an unpacked extension only in the two separately authorized browser contexts. Assign only the synthetic ledger labels `profile-a` and `profile-b`. Never record actual browser profile names or paths.
+Paid and Free both require a real completion/retry-completion SSE `message_limit.windows` observation as primary live acquisition evidence. Static Settings or same-origin `/usage` data is optional, provisional cross-check only: its absence is not failure, and its presence is never enough for a P4B live PASS. A live gate requires one separately owner-authorized ordinary message in each profile. A no-message run proves injection readiness only, not acquisition.
 
 ## Install and remove
 
@@ -17,9 +17,9 @@ After approval for P4B-2, load this directory as an unpacked extension only in t
 
 ## Safety boundary
 
-The page-world observer recognizes only exact same-origin GET usage responses and POST completion/retry-completion SSE responses with `text/event-stream` content type. The opaque route segment stays in page world. It sends the content script only an allowlisted, validated envelope; the extension stores only that envelope in session storage, never credentials, raw data, or conversation content. It makes no network requests and does not modify, block, or delay Claude requests.
+The page-world observer recognizes only exact same-origin GET usage responses and POST completion/retry-completion SSE responses with `text/event-stream` content type. The opaque route segment stays in page world. It sends the content script only an allowlisted, validated envelope; the extension stores only that envelope in session storage, never credentials, raw data, route/account identifiers, provider error strings, or conversation content. It never inspects or emits raw SSE, assistant text, prompt text, thinking/tool data, cookies, tokens, or headers. It makes no network requests and does not modify, block, or delay Claude requests.
 
-Authenticated loading remains forbidden pending Sol High re-review.
+The lugia19 projects are mechanism references only: no GPL code, assets, runtime dependency, or Firebase path is used.
 
 Run focused synthetic tests from the repository root:
 

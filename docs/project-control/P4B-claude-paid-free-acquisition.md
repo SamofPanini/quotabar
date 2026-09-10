@@ -29,10 +29,7 @@ Pinned reference revisions:
 
 The launcher demonstrates that isolated Desktop instances and extensions are technically possible, but it is an unofficial patched client. Its own documentation identifies macOS notarization, first-launch network/Keychain, and Cowork/signature limitations. It is not an acceptable production dependency for a stability-first QuotaBar path.
 
-The usage extension demonstrates two acquisition mechanisms:
-
-1. paid-like data from same-origin `/api/organizations/<route>/usage`;
-2. free-like 5h/7d windows from the completion SSE `message_limit.windows` payload when the free `/usage` result is empty.
+The usage extension demonstrates static same-origin `/usage` data and completion SSE `message_limit.windows` data. P4B treats it only as an interoperability reference: Paid and Free both require completion/retry-completion SSE `message_limit.windows` as primary live evidence. Static Settings or `/usage` data is optional provisional cross-check only; its absence is not failure and its presence cannot replace the live SSE gate.
 
 It is GPL-3.0 and must remain a mechanism reference only. Do not copy code or assets into this MIT repository. Its published privacy policy also states that organization ID and usage statistics are synchronized through Firebase. Installing or depending on it for this project's live validation would violate QuotaBar's provider-identity boundary.
 
@@ -55,7 +52,7 @@ This is preferred over patching Claude Desktop because it:
 
 ### P4B-1 — cloud implementation and review of a local probe
 
-Terra Medium may implement only the temporary probe and its synthetic tests on `spike/claude-paid-free-acquisition`. Sol High must review it before any live account is used.
+Terra Medium may implement only the temporary probe and its synthetic tests on `spike/claude-paid-free-acquisition`. Live loading is allowed only when the control plane authorizes an exact reviewed head.
 
 Expected location:
 
@@ -84,6 +81,8 @@ The probe may observe only these same-origin response classes:
 
 - `GET /api/organizations/<opaque-route>/usage`
 - completion/retry-completion SSE events containing `type: "message_limit"`
+
+For both operator-declared plan classes, an available SSE observation is authoritative over an earlier static observation. A later static observation cannot replace available SSE evidence. Static data may remain visible only before valid SSE arrives.
 
 The opaque route segment may exist transiently inside the page-world acquisition function only. It must never cross into the content script, extension service worker, popup, storage, logs, test output, screenshots, or Notion/GitHub evidence.
 
@@ -135,7 +134,8 @@ Unknown fields fail closed. Missing windows remain missing and never become zero
 - paid endpoint fixture produces five-hour and weekly windows.
 - free empty endpoint does not fabricate zero or a window.
 - free SSE fixture produces only permitted five-hour/weekly fields.
-- paid endpoint data outranks SSE for the same observation cycle.
+- for both paid and free metadata, endpoint-first then valid SSE stores SSE, and SSE-first is not replaced by endpoint data.
+- malformed, unavailable, or overflowed SSE cannot erase an available sanitized observation.
 - malformed/unknown fields fail closed.
 - route, organization ID, email, token, cookie, authorization, conversation text, message/request IDs, and sentinel values cannot appear in output, Debug/console formatting, storage serialization, or errors.
 - SSE parser ignores all events except `message_limit` and enforces its memory cap.
@@ -189,16 +189,18 @@ For each slot record only:
 - whether browser login remained intact;
 - whether probe storage was cleared and extension removed.
 
-Paid success requires a real endpoint-derived five-hour window and at least one weekly window. Free success requires either a real SSE-derived five-hour window or an explicit `UNAVAILABLE` result proving that current free responses contain no usable window. The free account may require one user-authorized ordinary Claude message; Terra must not send a message or spend quota without that explicit authorization.
+Paid and Free live success each require sanitized completion-SSE `message_limit.windows` evidence. Static Settings or `/usage` is optional cross-check/provisional evidence only and cannot produce P4B live PASS. One separately owner-authorized ordinary message is required in each profile to create the live completion SSE gate; a no-message run proves injection readiness only. Terra must not send a message or spend quota without that explicit authorization.
 
 Do not claim that a free account provides stable polling: SSE acquisition is event-driven and can be unavailable until a completion or rejected send occurs.
 
 ## Phase outcomes
 
-- `PASS`: paid endpoint snapshot plus free SSE snapshot are both obtained and sanitized.
-- `PASS_WITH_LIMITATION`: paid succeeds; free is safely unavailable or event-triggered only, with no fabricated usage.
-- `BLOCKED`: authenticated browser contexts are unavailable or the probe cannot meet the credential/identity boundary.
+- `PASS`: both Paid and Free have sanitized completion-SSE evidence.
+- `INCOMPLETE / SSE_TRIGGER_NOT_AUTHORIZED`: no authorized completion occurred.
+- `BLOCKED`: probe injection/runtime cannot operate inside an authorized authenticated context.
 - `FAIL`: cross-account leakage, provider identity exposure, request mutation, credential/session disturbance, or unacceptable runtime behavior.
+
+Static-only data must never produce `PASS`. Live loading is permitted only when the control plane authorizes the exact reviewed head. P4B-2R and P4B-2S are not authorized by P4B-1R.
 
 Any outcome returns to the Work control plane. Never continue automatically to a production bridge, P4C, or P4D.
 
