@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { assertSmokeReport, createCdpClient, expectedExtension, normalizeAbort, openWebSocket, raceStartup, terminateChild, withDeadline } from "./gate-c1-lib.mjs";
+import { assertSmokeReport, coordinateCleanup, createCdpClient, expectedExtension, normalizeAbort, openWebSocket, raceStartup, terminateChild, withDeadline } from "./gate-c1-lib.mjs";
 
 const execFileAsync = promisify(execFile);
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
@@ -90,14 +90,18 @@ try {
   await raceStartup(withinOverall(mainRun, "overall-deadline"), earlyExit);
 } catch (error) { primaryFailure = error instanceof Error ? error.message : "unknown"; process.exitCode = 1; }
 finally {
-  let cleanup = "complete"; const cleanupEndsAt = Date.now() + 4_000;
+  const cleanupEndsAt = Date.now() + 4_000;
   const cleanupWithin = (promise, code) => withDeadline(promise, Math.max(1, cleanupEndsAt - Date.now()), `harness:cleanup-${code}`);
-  try { if (!primaryFailure && client && !client.closed) { for (const targetId of createdTargets.reverse()) await cleanupWithin(client.call("Target.closeTarget", { targetId }).catch(() => undefined), "target"); for (const sessionId of attached.reverse()) await cleanupWithin(closeSession(client.call, sessionId), "session"); } } catch { cleanup = "partial"; }
-  freeze();
-  try { if (child) await cleanupWithin(terminateChild(child, sleep, 500, 500), "child"); } catch { cleanup = "partial"; }
-  try { if (mainRun) await cleanupWithin(mainRun.catch(() => undefined), "main-settlement"); } catch { cleanup = "partial"; }
-  try { if (server) { server.closeAllConnections?.(); await cleanupWithin(new Promise((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())), "server"); } } catch { cleanup = "partial"; }
-  try { if (root?.startsWith(`${resolve(tmpdir())}/quotabar-c1-`)) await cleanupWithin(rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }), "temp"); else cleanup = "partial"; } catch { cleanup = "partial"; }
+  const result = await coordinateCleanup({
+    primaryFailure,
+    gracefulTimeoutMs: 1_000,
+    gracefulClose: !primaryFailure && client && !client.closed ? async () => { for (const targetId of createdTargets.reverse()) await client.call("Target.closeTarget", { targetId }).catch(() => undefined); for (const sessionId of attached.reverse()) await closeSession(client.call, sessionId); } : undefined,
+    freeze,
+    terminateChild: async () => { if (child) await terminateChild(child, sleep, 500, 500); },
+    settleMain: async () => { if (mainRun) await cleanupWithin(mainRun.catch(() => undefined), "main-settlement"); },
+    postChildCleanup: async () => { if (server) { server.closeAllConnections?.(); await cleanupWithin(new Promise((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())), "server"); } if (root?.startsWith(`${resolve(tmpdir())}/quotabar-c1-`)) await cleanupWithin(rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }), "temp"); else fail("cleanup-root"); },
+  });
+  const cleanup = result.cleanup;
   if (primaryFailure) process.stdout.write(`${JSON.stringify({ gate: "R2", verdict: "blocked", failure: primaryFailure, cleanup, postOrder: lastReport?.postOrder || [], targetSummary: lastReport?.targetSummary || [] })}\n`);
   else if (cleanup !== "complete") { process.stdout.write(`${JSON.stringify({ gate: "R2", verdict: "blocked", failure: "harness:cleanup-partial", cleanup })}\n`); process.exitCode = 1; }
   else if (lastReport) process.stdout.write(`${JSON.stringify({ gate: "R2", ...lastReport, cleanup })}\n`);

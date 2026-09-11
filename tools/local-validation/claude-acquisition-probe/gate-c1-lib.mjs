@@ -22,6 +22,17 @@ export function raceStartup(operation, earlyExit) { return Promise.race([operati
 
 export function normalizeAbort(error, signal, code) { if (signal?.aborted || error?.name === "AbortError") throw new Error(code); throw error; }
 
+export async function coordinateCleanup({ primaryFailure, gracefulClose, gracefulTimeoutMs, freeze, terminateChild, settleMain, postChildCleanup }) {
+  let partial = false; let frozen = false;
+  const freezeOnce = () => { if (!frozen) { frozen = true; freeze(); } };
+  if (!primaryFailure && gracefulClose) { try { await withDeadline(gracefulClose(), gracefulTimeoutMs, "harness:cleanup-graceful-timeout"); } catch { partial = true; } }
+  freezeOnce();
+  try { await terminateChild(); } catch { partial = true; }
+  try { await settleMain(); } catch { partial = true; }
+  try { await postChildCleanup(); } catch { partial = true; }
+  return { cleanup: partial ? "partial" : "complete", frozen };
+}
+
 export function createCdpClient(socket, onEvent, signal) {
   let nextId = 0; let closed = false; const pending = new Map();
   const rejectPending = (code) => { if (closed) return; closed = true; for (const { reject, timer } of pending.values()) { clearTimeout(timer); reject(new Error(code)); } pending.clear(); };
