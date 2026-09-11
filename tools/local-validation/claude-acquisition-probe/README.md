@@ -37,6 +37,10 @@ required):
 node tools/local-validation/claude-acquisition-probe/gate-c1.mjs
 ```
 
+That smoke observes only synthetic page/same-frame request events. Its success
+means no unexpected external/provider request appeared in that watched scope;
+it does not claim extension-worker or process-wide Chrome network silence.
+
 The manifest loads exactly one generated self-contained entry per execution
 world. `generate-entries.mjs` deterministically derives both entries from the
 single authoritative `probe-core.js`; use its `--check` mode to reject drift.

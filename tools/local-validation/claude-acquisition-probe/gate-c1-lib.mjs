@@ -10,7 +10,7 @@ export function assertSmokeReport(report) {
   if (report.sessionView?.bootstrap?.bridgeLoaded !== true || report.sessionView?.bootstrap?.observerReady !== true) fail("bootstrap-confirmation");
   if (!Array.isArray(report.postOrder) || report.postOrder.join(",") !== "observer_installed,main_ready,observer_installed,main_ready") fail("main-readiness-order");
   if (report.exceptions?.length !== 0) fail("startup-exception");
-  if (report.networkObserved !== true || report.targetObserved !== true) fail("observation-incomplete");
+  if (report.pageSameFrameObservationComplete !== true || report.targetObserved !== true) fail("observation-incomplete");
   if (JSON.stringify(report.requests) !== JSON.stringify(expectedRequests)) fail("loopback-request-set");
   if (report.externalRequest !== false || report.unexpectedRequest !== false || report.unexpectedTarget !== false) fail("unexpected-target-or-network");
   return true;
@@ -19,6 +19,26 @@ export function assertSmokeReport(report) {
 export function smokeExitCode(report) { try { assertSmokeReport(report); return 0; } catch { return 1; } }
 
 export function raceStartup(operation, earlyExit) { return Promise.race([operation, earlyExit]); }
+
+export function normalizeAbort(error, signal, code) { if (signal?.aborted || error?.name === "AbortError") throw new Error(code); throw error; }
+
+export function createCdpClient(socket, onEvent, signal) {
+  let nextId = 0; let closed = false; const pending = new Map();
+  const rejectPending = (code) => { if (closed) return; closed = true; for (const { reject, timer } of pending.values()) { clearTimeout(timer); reject(new Error(code)); } pending.clear(); };
+  const message = (event) => { if (closed) return; const value = JSON.parse(event.data); if (value.id && pending.has(value.id)) { const entry = pending.get(value.id); pending.delete(value.id); clearTimeout(entry.timer); entry.resolve(value); } else onEvent(value); };
+  const close = () => { rejectPending("harness:cdp-closed"); try { socket.removeEventListener("message", message); socket.removeEventListener("close", closedEvent); socket.removeEventListener("error", errorEvent); signal?.removeEventListener("abort", abort); socket.close(); } catch {} };
+  const closedEvent = () => rejectPending("harness:cdp-socket-closed");
+  const errorEvent = () => rejectPending("harness:cdp-socket-error");
+  const abort = () => close();
+  socket.addEventListener("message", message); socket.addEventListener("close", closedEvent); socket.addEventListener("error", errorEvent); signal?.addEventListener("abort", abort, { once: true });
+  const call = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+    if (closed || signal?.aborted) { reject(new Error("harness:cdp-closed")); return; }
+    const id = ++nextId; const timer = setTimeout(() => { pending.delete(id); reject(new Error(`harness:cdp-timeout:${method}`)); }, 4_000);
+    pending.set(id, { resolve, reject, timer });
+    try { socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); } catch { pending.delete(id); clearTimeout(timer); reject(new Error("harness:cdp-send-failed")); }
+  });
+  return { call, close, get closed() { return closed; }, get pendingCount() { return pending.size; } };
+}
 
 export function withDeadline(promise, timeoutMs, code, onTimeout = () => undefined) {
   return new Promise((resolve, reject) => {

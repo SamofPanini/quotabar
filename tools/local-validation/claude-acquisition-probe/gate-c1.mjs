@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { assertSmokeReport, expectedExtension, openWebSocket, raceStartup, terminateChild, withDeadline } from "./gate-c1-lib.mjs";
+import { assertSmokeReport, createCdpClient, expectedExtension, normalizeAbort, openWebSocket, raceStartup, terminateChild, withDeadline } from "./gate-c1-lib.mjs";
 
 const execFileAsync = promisify(execFile);
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
@@ -13,11 +13,12 @@ const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const probe = dirname(fileURLToPath(import.meta.url));
 const overallDeadlineMs = 20_000;
 const overallDeadlineAt = Date.now() + overallDeadlineMs;
-let root; let child; let server; let rootSocket; let lastReport; let primaryFailure; const attached = []; const createdTargets = [];
+let root; let child; let server; let rootSocket; let client; let mainRun; let lastReport; let primaryFailure; let finalized = false; const attached = []; const createdTargets = [];
 const aborter = new AbortController();
 
 function fail(code) { throw new Error(`harness:${code}`); }
-function withinOverall(promise, code) { const remaining = overallDeadlineAt - Date.now(); if (remaining <= 0) return Promise.reject(new Error(`harness:${code}`)); return withDeadline(promise, remaining, `harness:${code}`, () => aborter.abort()); }
+function freeze() { if (finalized) return; finalized = true; aborter.abort(); client?.close(); }
+function withinOverall(promise, code) { const remaining = overallDeadlineAt - Date.now(); if (remaining <= 0) { freeze(); return Promise.reject(new Error(`harness:${code}`)); } return withDeadline(promise, remaining, `harness:${code}`, freeze); }
 function sanitizedException(details) {
   const source = ["isolated-entry.js", "main-entry.js", "probe-core.js"].find((name) => String(details.url || "").endsWith(`/${name}`));
   if (!source) return null;
@@ -35,11 +36,6 @@ async function waitForPort(profile, signal) {
   for (let attempt = 0; attempt < 40; attempt += 1) { if (signal.aborted) fail("startup-aborted"); try { return (await readFile(join(profile, "DevToolsActivePort"), "utf8")).trim().split("\n"); } catch { await sleep(100); } }
   fail("devtools-active-port-unavailable");
 }
-function createCdp(socket, onEvent) {
-  let nextId = 0; const pending = new Map();
-  socket.addEventListener("message", (event) => { const message = JSON.parse(event.data); if (message.id && pending.has(message.id)) { const done = pending.get(message.id); pending.delete(message.id); done(message); } else onEvent(message); });
-  return (method, params = {}, sessionId) => new Promise((resolveCall, rejectCall) => { const id = ++nextId; const timer = setTimeout(() => { pending.delete(id); rejectCall(new Error(`harness:cdp-timeout:${method}`)); }, 4_000); pending.set(id, (message) => { clearTimeout(timer); resolveCall(message); }); socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); });
-}
 async function startServer(cert, key) {
   const requests = [];
   server = createServer({ cert, key }, (request, response) => { requests.push({ method: fixedMethod(request.method), path: request.url === "/" ? "/" : "other" }); response.writeHead(200, { "content-type": "text/html" }); response.end("<!doctype html><head><link rel=\"icon\" href=\"data:,\"></head><body data-qb-marker=\"quotabar-synthetic\"></body>"); });
@@ -52,7 +48,7 @@ async function closeSession(call, sessionId) { if (sessionId) await call("Target
 try {
   root = await mkdtemp(join(tmpdir(), "quotabar-c1-"));
   const profile = join(root, "profile"), certPath = join(root, "cert.pem"), keyPath = join(root, "key.pem");
-  await withinOverall(execFileAsync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyPath, "-out", certPath, "-subj", "/CN=claude.ai", "-addext", "subjectAltName=DNS:claude.ai", "-days", "1"]), "certificate-timeout");
+  await withinOverall(execFileAsync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyPath, "-out", certPath, "-subj", "/CN=claude.ai", "-addext", "subjectAltName=DNS:claude.ai", "-days", "1"], { signal: aborter.signal }).catch((error) => normalizeAbort(error, aborter.signal, "harness:openssl-aborted")), "certificate-timeout");
   const synthetic = await startServer(await readFile(certPath), await readFile(keyPath));
   const args = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-component-update", "--disable-sync", "--no-pings", "--ignore-certificate-errors", "--host-resolver-rules=MAP * 127.0.0.1, EXCLUDE localhost", "about:blank"];
   child = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"] });
@@ -61,8 +57,10 @@ try {
   const [port, wsPath] = await startup(withinOverall(waitForPort(profile, aborter.signal), "devtools-timeout"));
   rootSocket = await startup(withinOverall(openWebSocket(WebSocket, `ws://127.0.0.1:${port}${wsPath}`, 2_000, aborter.signal), "websocket-timeout"));
   const contexts = []; const frames = []; const exceptions = []; const postOrder = []; const requests = []; const targetsSeen = []; let extensionId; const syntheticOrigin = `https://claude.ai:${synthetic.port}`;
-  const call = createCdp(rootSocket, (event) => { if (event.method === "Runtime.executionContextCreated") contexts.push(event.params.context); if (event.method === "Page.frameNavigated") frames.push(event.params.frame); if (event.method === "Runtime.exceptionThrown") { const value = sanitizedException(event.params.exceptionDetails); if (value) exceptions.push(value); } if (event.method === "Network.requestWillBeSent") { const category = classifyUrl(event.params.request?.url, syntheticOrigin, extensionId); requests.push({ category, method: fixedMethod(event.params.request?.method), path: category === "synthetic" ? "/" : "none" }); } if (["Target.targetCreated", "Target.targetInfoChanged"].includes(event.method)) { const target = event.params.targetInfo; targetsSeen.push({ type: ["page", "worker", "service_worker", "shared_worker", "background_page"].includes(target?.type) ? target.type : "other", category: classifyUrl(target?.url, syntheticOrigin, extensionId) }); } });
-  await raceStartup(withinOverall((async () => {
+  const record = (array, value) => { if (!finalized) array.push(value); };
+  client = createCdpClient(rootSocket, (event) => { if (finalized) return; if (event.method === "Runtime.executionContextCreated") record(contexts, event.params.context); if (event.method === "Page.frameNavigated") record(frames, event.params.frame); if (event.method === "Runtime.exceptionThrown") { const value = sanitizedException(event.params.exceptionDetails); if (value) record(exceptions, value); } if (event.method === "Network.requestWillBeSent") { const category = classifyUrl(event.params.request?.url, syntheticOrigin, extensionId); record(requests, { category, method: fixedMethod(event.params.request?.method), path: category === "synthetic" ? "/" : "none" }); } if (["Target.targetCreated", "Target.targetInfoChanged"].includes(event.method)) { const target = event.params.targetInfo; record(targetsSeen, { type: ["page", "worker", "service_worker", "shared_worker", "background_page"].includes(target?.type) ? target.type : "other", category: classifyUrl(target?.url, syntheticOrigin, extensionId) }); } }, aborter.signal);
+  const call = client.call;
+  mainRun = (async () => {
     await call("Target.setDiscoverTargets", { discover: true });
     const load = await call("Extensions.loadUnpacked", { path: probe }); if (!load.result?.id) fail("extension-load"); extensionId = load.result.id;
     const extension = (await call("Extensions.getExtensions")).result?.extensions?.find((item) => item.id === extensionId);
@@ -85,16 +83,19 @@ try {
     const unexpectedRequest = requests.some((request) => !["synthetic", "probe_extension", "browser_internal"].includes(request.category));
     const externalRequest = requests.some((request) => request.category === "unexpected_external");
     const targetObserved = targetsSeen.some((target) => target.type === "page" && target.category === "synthetic") && targetSummary.some((entry) => entry.endsWith(":probe_extension"));
-    const networkObserved = requests.some((request) => request.category === "synthetic");
-    const report = { extension: { id: extension.id, name: extension.name, version: extension.version, enabled: extension.enabled }, synthetic: { origin: origin === syntheticOrigin ? "exact" : "mismatch", marker: marker === "quotabar-synthetic" }, buildIdExpected: "p4b-1e-r", sessionView: view, postOrder, exceptions, requests, targetSummary, networkObserved, targetObserved, unexpectedRequest, unexpectedTarget, externalRequest };
+    const pageSameFrameObservationComplete = requests.some((request) => request.category === "synthetic");
+    const report = { extension: { id: extension.id, name: extension.name, version: extension.version, enabled: extension.enabled }, synthetic: { origin: origin === syntheticOrigin ? "exact" : "mismatch", marker: marker === "quotabar-synthetic" }, buildIdExpected: "p4b-1e-r", sessionView: view, postOrder, exceptions, requests, targetSummary, pageSameFrameObservationComplete, targetObserved, unexpectedRequest, unexpectedTarget, externalRequest };
     lastReport = report; assertSmokeReport(report);
-  })(), "overall-deadline"), earlyExit);
+  })();
+  await raceStartup(withinOverall(mainRun, "overall-deadline"), earlyExit);
 } catch (error) { primaryFailure = error instanceof Error ? error.message : "unknown"; process.exitCode = 1; }
 finally {
   let cleanup = "complete"; const cleanupEndsAt = Date.now() + 4_000;
   const cleanupWithin = (promise, code) => withDeadline(promise, Math.max(1, cleanupEndsAt - Date.now()), `harness:cleanup-${code}`);
-  try { if (rootSocket) { const call = createCdp(rootSocket, () => undefined); for (const targetId of createdTargets.reverse()) await cleanupWithin(call("Target.closeTarget", { targetId }).catch(() => undefined), "target"); for (const sessionId of attached.reverse()) await cleanupWithin(closeSession(call, sessionId), "session"); rootSocket.close(); } } catch { cleanup = "partial"; }
+  try { if (!primaryFailure && client && !client.closed) { for (const targetId of createdTargets.reverse()) await cleanupWithin(client.call("Target.closeTarget", { targetId }).catch(() => undefined), "target"); for (const sessionId of attached.reverse()) await cleanupWithin(closeSession(client.call, sessionId), "session"); } } catch { cleanup = "partial"; }
+  freeze();
   try { if (child) await cleanupWithin(terminateChild(child, sleep, 500, 500), "child"); } catch { cleanup = "partial"; }
+  try { if (mainRun) await cleanupWithin(mainRun.catch(() => undefined), "main-settlement"); } catch { cleanup = "partial"; }
   try { if (server) { server.closeAllConnections?.(); await cleanupWithin(new Promise((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())), "server"); } } catch { cleanup = "partial"; }
   try { if (root?.startsWith(`${resolve(tmpdir())}/quotabar-c1-`)) await cleanupWithin(rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }), "temp"); else cleanup = "partial"; } catch { cleanup = "partial"; }
   if (primaryFailure) process.stdout.write(`${JSON.stringify({ gate: "R2", verdict: "blocked", failure: primaryFailure, cleanup, postOrder: lastReport?.postOrder || [], targetSummary: lastReport?.targetSummary || [] })}\n`);
