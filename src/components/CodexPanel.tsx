@@ -379,6 +379,18 @@ export default function CodexPanel({
     { id: 'default', label: 'Default' },
     ...customProfiles.map((profile) => ({ id: profile.alias, label: profile.alias })),
   ];
+  // Cost data is always owned by the default account. Keep its component mounted
+  // while a custom quota tab is selected so tab navigation cannot retrigger its
+  // local IPC-backed initial load.
+  const renderDefaultCostSummary = sections.cost && showCostSummary ? (
+    <div
+      key="codex-default-cost-summary"
+      hidden={selectedCustomProfile !== null}
+      aria-hidden={selectedCustomProfile !== null}
+    >
+      <CostSummarySection source="codex" refreshKey={manualRefreshNonce} showTrend={sections.trend} />
+    </div>
+  ) : null;
 
   if (loading && !codexData && !rateLimits) {
     return (
@@ -594,6 +606,7 @@ export default function CodexPanel({
             <div className="empty-state"><p>Custom Codex quota unavailable</p></div>
           )}
         </div>
+        {renderDefaultCostSummary}
       </div>
     );
   }
@@ -843,12 +856,10 @@ export default function CodexPanel({
             </div>
           )}
 
-          {sections.cost && showCostSummary && (
-            <CostSummarySection source="codex" refreshKey={manualRefreshNonce} showTrend={sections.trend} />
-          )}
-
         </div>
       )}
+
+      {renderDefaultCostSummary}
 
       {!connected && !error && customProfiles.length === 0 && (
         <div className="empty-state">

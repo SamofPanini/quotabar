@@ -3,7 +3,12 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import CodexPanel from '../src/components/CodexPanel';
 import { backend } from '../src/services/backend';
-import type { CodexProfileQuota, CodexProfilesResponse } from '../src/types/models';
+import type {
+  CodexProfileQuota,
+  CodexProfilesResponse,
+  CostDailySeries,
+  CostOverview,
+} from '../src/types/models';
 
 const hiddenSections = { timeline: false, cost: false, trend: false, tips: false };
 
@@ -48,6 +53,8 @@ async function renderPanel(options: {
   profiles?: CodexProfilesResponse;
   onUsageChange?: (used: number | null) => void;
   manualRefreshNonce?: number;
+  showCostSummary?: boolean;
+  sections?: typeof hiddenSections;
 } = {}): Promise<ReactTestRenderer> {
   mockDefaultCalls();
   vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue(options.profiles ?? { profiles: [], registryError: null });
@@ -55,14 +62,28 @@ async function renderPanel(options: {
   await act(async () => {
     renderer = create(createElement(CodexPanel, {
       autoRefreshIntervalMs: 0,
-      showCostSummary: false,
-      sections: hiddenSections,
+      showCostSummary: options.showCostSummary ?? false,
+      sections: options.sections ?? hiddenSections,
       onUsageChange: options.onUsageChange,
       manualRefreshNonce: options.manualRefreshNonce,
     }));
     await flush();
   });
   return renderer;
+}
+
+function emptyCostOverview(): CostOverview {
+  return {
+    source: 'codex', displayName: 'Codex', currency: 'USD',
+    generatedAt: '2026-09-16T00:00:00Z', cached: false, ranges: [],
+  };
+}
+
+function emptyCostDaily(): CostDailySeries {
+  return {
+    source: 'codex', currency: 'USD',
+    generatedAt: '2026-09-16T00:00:00Z', cached: false, days: [],
+  };
 }
 
 describe('Codex account tabs', () => {
@@ -188,6 +209,43 @@ describe('Codex account tabs', () => {
     });
     expect(renderer.root.findAllByProps({ role: 'tab' }).map((tab) => tab.children.join('')))
       .toEqual(['Default', 'Newer']);
+    await act(async () => renderer.unmount());
+  });
+
+  it('does not remount default cost IPC when tabs round-trip through a custom account', async () => {
+    vi.spyOn(backend, 'getCostOverview').mockResolvedValue(emptyCostOverview());
+    vi.spyOn(backend, 'getCostDaily').mockResolvedValue(emptyCostDaily());
+    const renderer = await renderPanel({
+      profiles: { profiles: [profile('Work')], registryError: null },
+      showCostSummary: true,
+      sections: { ...hiddenSections, cost: true },
+    });
+    await act(async () => { await flush(); });
+
+    const callCounts = () => ({
+      info: vi.mocked(backend.getCodexInfo).mock.calls.length,
+      limits: vi.mocked(backend.getCodexRateLimits).mock.calls.length,
+      credits: vi.mocked(backend.getCodexResetCredits).mock.calls.length,
+      weekly: vi.mocked(backend.getCodexWeeklyQuota).mock.calls.length,
+      profiles: vi.mocked(backend.getCodexProfiles).mock.calls.length,
+      costOverview: vi.mocked(backend.getCostOverview).mock.calls.length,
+      costDaily: vi.mocked(backend.getCostDaily).mock.calls.length,
+    });
+    const initialCalls = callCounts();
+    expect(initialCalls.costOverview).toBe(1);
+    expect(initialCalls.costDaily).toBe(1);
+
+    await act(async () => {
+      renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick();
+      await flush();
+    });
+    await act(async () => {
+      renderer.root.findAllByProps({ role: 'tab' })[0].props.onClick();
+      await flush();
+    });
+
+    expect(callCounts()).toEqual(initialCalls);
+    expect(JSON.stringify(renderer.toJSON())).toContain('API-equivalent usage');
     await act(async () => renderer.unmount());
   });
 });
