@@ -36,9 +36,7 @@ Read-only IPC is limited to quota-snapshot reads. A foreground, locally authenti
 | Message | Required fields | Forbidden / validation |
 | --- | --- | --- |
 | `PairRequest` | `type:"pair_request"`, `version:"v1"`, `installId` (UUIDv4), `pairCode` (32 base64url chars), `requestNonce` (16 base64url chars) | No `slot`, key, snapshot, error, credential, identity, or extra field. Pair code is one-use, host-generated, 5-minute TTL, not persisted by the extension. |
-| `PairResponse` | `type:"pair_response"`, `version:"v1"`, `slot`, `bindingId` (UUIDv4), `installId`, `requestNonce`, `keyId` (UUIDv4), `bindingKey` (43 base64url chars), `nextSequence:"1"`, `pairProof` | Echoes `installId` and `requestNonce`; `pairProof` is exact 43-character unpadded base64url HMAC-SHA-256 over `quotabar-claude-pair/v1\0` + RFC 8785 response-without-`pairProof`, keyed by the 24-byte pair-code bytes. Host atomically persists this exact response/digest with consumed pair state so an identical request nonce/code retry receives the same response without a second binding. |
-| `UnpairRequest` | `type:"unpair_request"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `proof` | No windows/source/error. Host authenticates then transactionally invalidates binding and deletes its snapshot. |
-| `UnpairResponse` | `type:"unpair_response"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `result:"removed"`, `proof` | Authenticated/correlated with the binding key. Aggregate state retains one bounded tombstone `{bindingId,installId,requestDigest,response,expiresAtHost}` for 10 minutes; only the identical request may receive it. On expiry it is deleted. Other retry/replay is rejected; lost response after expiry is safely recovered by foreground confirmation that the slot is unbound, then a new pair. |
+| `PairResponse` | `type:"pair_response"`, `version:"v1"`, `slot`, `bindingId` (UUIDv4), `installId`, `requestNonce`, `keyId` (UUIDv4), `bindingKey` (43 base64url chars), `nextSequence:"1"`, `pairProof` | Echoes `installId` and `requestNonce`; `pairProof` is exact 43-character unpadded base64url HMAC-SHA-256 over `quotabar-claude-pair/v1\0` + RFC 8785 response-without-`pairProof`, keyed by the 24-byte pair-code bytes. Host atomically persists this exact response/digest with consumed pair state, bound to the original `expiresAtHost`; only an identical request nonce/code retry before that five-minute expiry receives it. It is deleted at expiry and the binding key is never retrievable afterwards; recovery is foreground cancel/readback plus a new pair. |
 
 `slot` is exactly `slot-a` or `slot-b`; it is an app-owned routing label, never a profile name. At most two active bindings exist. Explicit local QuotaBar UI creates a pair code for one empty slot. A second binding for an occupied slot is rejected. Re-pairing requires an explicit invalidation transaction, then a new pair code; it cannot silently replace a binding.
 
@@ -74,7 +72,8 @@ The host stamps `receivedAt` after successful authentication. It accepts `observ
 | unexpired valid SSE | fresh valid endpoint | keep SSE; consume sequence but do not replace state |
 | unexpired valid SSE | valid authenticated unavailable observation | keep last-good SSE; consume sequence and update safe metadata |
 | any state | schema/auth/clock-invalid, skipped, or replayed event | reject; consume nothing and mutate neither snapshot nor safe metadata |
-| any state | identical immediately previous accepted event | return persisted PairResponse/ObservationAck/tombstone response; no mutation |
+| pairing only, before original five-minute expiry | identical PairRequest | return persisted PairResponse; no mutation |
+| any observation state | identical immediately previous accepted observation | return persisted ObservationAck; no mutation |
 | expired SSE | fresh valid endpoint | endpoint may replace expired state |
 | any snapshot | host-time TTL elapsed | IPC returns `expired` and no windows; store may retain current record only for validation then deletes it on next successful write/startup sweep |
 
@@ -82,9 +81,9 @@ IPC may return last-good windows with a fixed `lastErrorCode` while still unexpi
 
 ## Current-only atomic state
 
-Production and validation each use a separate private `0700` root. Each root contains exactly one bounded owner-owned regular `0600` aggregate state file plus transient lock/temp files; no logs, history, backups, crash copies, raw payload, or per-slot files. Aggregate state contains pending pairing, both bindings, each binding's next sequence/last accepted digest/last ACK/last observed time/safe error, and up to two current snapshots. All opens use no-follow semantics and verify owner, mode, schema/version, expected inode type, and bounded size before use.
+Production and validation each use a separate private `0700` root. Each root contains exactly one bounded owner-owned regular `0600` aggregate state file plus transient lock/temp files; no logs, history, backups, crash copies, raw payload, or per-slot files. Aggregate state contains pending pairing, its single consumed PairResponse/digest retry record (until that pending pair's original `expiresAtHost`), both bindings, each binding's next sequence/last accepted digest/last ACK/last observed time/safe error, and up to two current snapshots. All opens use no-follow semantics and verify owner, mode, schema/version, expected inode type, and bounded size before use.
 
-For every accepted event, acquire a root-local exclusive lock; serialize the entire bounded aggregate to a same-directory `0600` temp created with `O_CREAT|O_EXCL|O_NOFOLLOW`; `fsync(temp)`; atomically rename it over the aggregate; then `fsync(root directory)`; release lock. Crash recovery preserves either the old or new complete aggregate. Startup deletes only owned orphan temps. Unpair/re-pair clears only its target slot atomically. “Removal” means deletion with no backup, not a claim of secure erase. A spoofed direct invocation with argv origin alone and no unexpired pair capability or valid binding HMAC mutates nothing.
+For every accepted event, acquire a root-local exclusive lock; serialize the entire bounded aggregate to a same-directory `0600` temp created with `O_CREAT|O_EXCL|O_NOFOLLOW`; `fsync(temp)`; atomically rename it over the aggregate; then `fsync(root directory)`; release lock. Crash recovery preserves either the old or new complete aggregate. Startup deletes only owned orphan temps and expired PairResponse retry state. Foreground `Unpair(bindingId)` is idempotent, OS-session-authorized, and atomically removes only its target binding and snapshot; a lost local result is recovered by read-only slot-state confirmation. The extension clears stale local binding material only after fixed host `binding_not_found`. “Removal” means deletion with no backup, not a claim of secure erase. A spoofed direct invocation with argv origin alone and no unexpired pair capability or valid binding HMAC mutates nothing.
 
 ## Distribution, support, and namespace isolation
 
@@ -119,7 +118,7 @@ QuotaBar: create one-use pairCode for empty slot
 Extension install: random installId -> PairRequest(pairCode, nonce)
 Chrome -> host: argv origin checked; host checks CWS ID, code, empty slot
 host: atomically creates binding {slot,bindingId,installId,keyId,key,nextSequence=1}
-host -> extension: atomically persisted PairResponse (binding key once; identical retry returns same response)
+host -> extension: persisted PairResponse echoes installId/nonce, has pairProof and nextSequence:"1" (identical retry only before original five-minute expiry)
 extension: stores key locally in this Chrome profile; no page-world exposure
 ```
 
@@ -129,7 +128,7 @@ extension: stores key locally in this Chrome profile; no page-world exposure
 MAIN: bounded raw parse -> sanitized candidate
 isolated extension: revalidate -> sequence N + HMAC
 Chrome -> host: argv origin + schema + binding + HMAC + N + host-time checks
-host: apply precedence, atomically commit aggregate + ObservationAck, nextSequence=N+1
+host: apply precedence, atomically commit aggregate + authenticated ObservationAck; identical-last retry returns ACK without mutation
 IPC: read-only sanitized current state
 ```
 
@@ -143,4 +142,4 @@ IPC: read-only sanitized current state
 
 ## Acceptance matrix and remaining gate
 
-Implementation must demonstrate exact-union/duplicate-key caps; persisted pair-response retry; bounded unpair tombstone recovery; string-sequence/ACK transitions; pair and binding MAC vectors; two-profile binding isolation; MAIN-to-isolated sanitization; host-time TTL and precedence; no local listener/polling; atomic interruption/corruption behavior; and hard-fail production/validation isolation. V1 has no key rotation. It must preserve `get_quota` unchanged. Sol High must review the exact ADR diff and approve the reserved CWS IDs, maintained production floor, same-user boundary, pairing proof, atomic layout, and live-validation consent plan before Stream C.
+Implementation must demonstrate exact-union/duplicate-key caps; five-minute persisted PairResponse retry and expiry deletion; local-UI-only idempotent unpair/readback recovery; string-sequence/ACK transitions; pair and binding MAC vectors; two-profile binding isolation; MAIN-to-isolated sanitization; host-time TTL and precedence; no local listener/polling; atomic interruption/corruption behavior; and hard-fail production/validation isolation. V1 has no key rotation. It must preserve `get_quota` unchanged. Sol High must review the exact ADR diff and approve the reserved CWS IDs, maintained production floor, same-user boundary, pairing proof, atomic layout, and live-validation consent plan before Stream C.
