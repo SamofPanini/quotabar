@@ -29,29 +29,32 @@ All input is UTF-8 JSON, parsed with duplicate-key rejection and exact-object va
 
 Native Messaging itself is JSON prefixed by a 32-bit **native-byte-order** length (not a fixed little-endian choice), as required by Chrome. The host rejects declared/actual lengths over 8 KiB before JSON parsing and writes no diagnostic bytes to stdout.
 
-### Pairing unions
+### Foreground pairing control and unions
+
+Read-only IPC is limited to quota-snapshot reads. A foreground, locally authenticated QuotaBar UI alone may invoke `CreatePairCode(slot)`, `CancelPairCode(slot)`, and `Unpair(bindingId)`; these commands require an explicit user gesture and OS session authorization and are not callable from the extension, page, tray automation, or remote IPC. `CreatePairCode` writes a durable pending-pair record in aggregate state: `{slot, SHA-256(canonicalPairCode), createdAtHost, expiresAtHost, requestNonce, state:"unused"}`. It generates a 24-byte CSPRNG pair code encoded as exactly 32 unpadded canonical base64url characters and a 12-byte CSPRNG request nonce encoded as exactly 16 characters. The host never treats process memory as pending-pair persistence.
 
 | Message | Required fields | Forbidden / validation |
 | --- | --- | --- |
 | `PairRequest` | `type:"pair_request"`, `version:"v1"`, `installId` (UUIDv4), `pairCode` (32 base64url chars), `requestNonce` (16 base64url chars) | No `slot`, key, snapshot, error, credential, identity, or extra field. Pair code is one-use, host-generated, 5-minute TTL, not persisted by the extension. |
-| `PairResponse` | `type:"pair_response"`, `version:"v1"`, `slot`, `bindingId` (UUIDv4), `keyId` (UUIDv4), `bindingKey` (43 base64url chars), `nextSequence:1` | Only host response to a valid pair request. `bindingKey` crosses the native channel once, is stored in extension-local storage for that profile, never page world/log/IPC/store. |
+| `PairResponse` | `type:"pair_response"`, `version:"v1"`, `slot`, `bindingId` (UUIDv4), `installId`, `requestNonce`, `keyId` (UUIDv4), `bindingKey` (43 base64url chars), `nextSequence:"1"`, `pairProof` | Echoes `installId` and `requestNonce`; `pairProof` is HMAC with the pair-code secret, so a response is correlated/authenticated before the extension persists its key. |
 | `UnpairRequest` | `type:"unpair_request"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `proof` | No windows/source/error. Host authenticates then transactionally invalidates binding and deletes its snapshot. |
-| `UnpairResponse` | `type:"unpair_response"`, `version:"v1"`, `bindingId`, `result:"removed"` | No key, snapshot, or free text. |
+| `UnpairResponse` | `type:"unpair_response"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `result:"removed"`, `proof` | Authenticated/correlated with the binding key. Lost response is recovered by repeating the identical request: it receives the persisted previous response, never re-applies removal. |
 
 `slot` is exactly `slot-a` or `slot-b`; it is an app-owned routing label, never a profile name. At most two active bindings exist. Explicit local QuotaBar UI creates a pair code for one empty slot. A second binding for an occupied slot is rejected. Re-pairing requires an explicit invalidation transaction, then a new pair code; it cannot silently replace a binding.
 
-### Steady-state observation unions
+### Steady-state unions and ACK
 
 | Message | Required fields | Forbidden / validation |
 | --- | --- | --- |
-| `AvailableSnapshot` | `type:"available"`, `version:"v1"`, `bindingId`, `installId`, `keyId`, `sequence` (positive u64), `source`, `observedAt`, `windows`, `proof` | `source` is `completion_sse` or `usage_endpoint`; `windows` has 1–2 unique kinds. No status/error/pair fields. |
-| `UnavailableObservation` | `type:"unavailable"`, `version:"v1"`, `bindingId`, `installId`, `keyId`, `sequence`, `observedAt`, `errorCode`, `proof` | No windows/source/status/pair fields. `errorCode` is exactly `unavailable`, `malformed_payload`, or `unsupported_observation`. |
+| `AvailableSnapshot` | `type:"available"`, `version:"v1"`, `bindingId`, `installId`, `keyId`, `sequence` (canonical decimal u64 string), `source`, `observedAt`, `windows`, `proof` | `source` is `completion_sse` or `usage_endpoint`; `windows` has 1–2 unique kinds in deterministic `five_hour`, then `weekly` order. No status/error/pair fields. |
+| `UnavailableObservation` | `type:"unavailable"`, `version:"v1"`, `bindingId`, `installId`, `keyId`, `sequence`, `observedAt`, `errorCode`, `proof` | No windows/source/status/pair fields. Valid unavailable observations consume sequence and update only safe metadata. |
+| `ObservationAck` | `type:"observation_ack"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `result` (`replaced`, `retained`, or `safe_error`), `proof` | HMAC-authenticated correlated response. Persisted with the accepted event; the sole immediately previous accepted digest may return this same ACK on identical retry. |
 
 A window is an exact object with `kind` (`five_hour` or `weekly`), optional `usedPercent` finite 0–100, and optional `resetAt` RFC 3339 UTC. Duplicate kinds, an empty window array, invalid/future timestamps, and unknown properties are rejected. Missing usage is never converted to zero.
 
-`proof` is `base64url(HMAC-SHA-256(bindingKey, canonical-json(message-without-proof)))`. Canonical JSON is UTF-8, lexicographically sorted keys, no whitespace, escaped per RFC 8785-style JSON string serialization, integers only for `sequence`, and the exact array order shown. The implementation must ship a single shared test-vector fixture. The host compares proof in constant time.
+`proof` is exactly 32 decoded HMAC-SHA-256 bytes, represented as 43 unpadded canonical base64url characters; padding and aliases are rejected. MAC input is `quotabar-claude-bridge/v1\0` followed by RFC 8785 canonical UTF-8 JSON of the message without proof. The host compares in constant time. The implementation ships shared JS/Rust boundary vectors covering pair proof, binding proof, window ordering, invalid padding, and BigInt boundaries.
 
-Each binding has a host-held `nextSequence`. A message is accepted only when its sequence equals that value; on atomic acceptance the host increments it. Lower, duplicate, skipped, or rollback sequence is rejected without store mutation. Key rotation is an explicit authenticated host response containing a new `keyId`, random key, and reset `nextSequence:1`; host atomically replaces the key and sequence, and the extension replaces the old key only after validating that response. Lost extension state or a failed rotation requires explicit unpair/re-pair, not a fallback binding.
+Each binding has aggregate-state `nextSequence`, a canonical decimal string parsed as BigInt in `[1, 2^64-1]`. A message is accepted only at equality; rollover requires explicit unpair/re-pair. A valid retained endpoint and valid unavailable observation consume sequence. Schema/auth/clock-invalid, skipped, and replayed messages consume nothing and mutate neither snapshot nor safe metadata, except an identical immediately previous accepted message may return the persisted ACK without mutation. V1 has no key rotation: lost key/state requires foreground unpair/re-pair.
 
 ## Acquisition and validation boundary
 
@@ -61,7 +64,7 @@ The isolated content-script bridge accepts only the exact candidate origin/sourc
 
 ## Host time, TTL, and precedence
 
-The host stamps `receivedAt` after successful authentication. It accepts `observedAt` only if it is no more than 5 minutes before or 60 seconds after host receipt and is strictly later than that binding's last accepted observation; otherwise it rejects the message. Freshness is measured exclusively from `receivedAt` with a 15-minute TTL.
+The host stamps `receivedAt` after successful authentication. It accepts `observedAt` only if it is no more than 5 minutes before or 60 seconds after host receipt; equal timestamps are permitted when ordered by accepted sequence. `resetAt` is separately bounded to a plausible future interval (0–30 days) and never controls freshness. Freshness is measured exclusively from `receivedAt` with a 15-minute TTL. During one host process monotonic time backs TTL; after restart, material wall-clock rollback fails closed and cannot extend stale TTL.
 
 | Current state | New authenticated event | Result |
 | --- | --- | --- |
@@ -77,9 +80,9 @@ IPC may return last-good windows with a fixed `lastErrorCode` while still unexpi
 
 ## Current-only atomic state
 
-Production and validation each use a separate private `0700` root. Each root contains only a binding record and up to two current snapshot records; no logs, history, backups, crash copies, or raw payload. Every final file is an owner-owned regular file, `0600`; all opens use no-follow semantics and verify owner, mode, schema/version, expected inode type, and bounded size before use.
+Production and validation each use a separate private `0700` root. Each root contains exactly one bounded owner-owned regular `0600` aggregate state file plus transient lock/temp files; no logs, history, backups, crash copies, raw payload, or per-slot files. Aggregate state contains pending pairing, both bindings, each binding's next sequence/last accepted digest/last ACK/last observed time/safe error, and up to two current snapshots. All opens use no-follow semantics and verify owner, mode, schema/version, expected inode type, and bounded size before use.
 
-For a write, acquire a root-local exclusive lock; serialize bounded data to a same-directory `0600` temp created with `O_CREAT|O_EXCL|O_NOFOLLOW`; `fsync(temp)`; atomically rename it over the final record; then `fsync(root directory)`; release lock. Startup validates all records before serving, deletes only owned invalid/orphan temp files within the same root, and never restores from backup. Pair invalidation/re-pair obtains the same lock and commits binding removal plus snapshot removal as one journaled replace transaction; crash recovery chooses only a complete committed state, otherwise removes both. “Removal” means deletion with no backup, not a claim of secure erase.
+For every accepted event, acquire a root-local exclusive lock; serialize the entire bounded aggregate to a same-directory `0600` temp created with `O_CREAT|O_EXCL|O_NOFOLLOW`; `fsync(temp)`; atomically rename it over the aggregate; then `fsync(root directory)`; release lock. Crash recovery preserves either the old or new complete aggregate. Startup deletes only owned orphan temps. Unpair/re-pair clears only its target slot atomically. “Removal” means deletion with no backup, not a claim of secure erase. A spoofed direct invocation with argv origin alone and no unexpired pair capability or valid binding HMAC mutates nothing.
 
 ## Distribution, support, and namespace isolation
 
