@@ -25,7 +25,7 @@ The page MAIN world is untrusted. It may forge an advisory usage candidate; the 
 
 ## Wire protocol v1
 
-All input is UTF-8 JSON, parsed with duplicate-key rejection and exact-object validation: unknown fields are rejected, absent fields are not defaulted, `type` is the discriminator, objects have no prototype/inherited fields, and no value is logged. Every string is at most 64 UTF-8 bytes except RFC 3339 timestamps (40) and `proof` (88 base64url bytes). Messages are at most 8 KiB; arrays are at most two entries; nesting is at most two levels.
+All input is UTF-8 JSON, parsed with duplicate-key rejection and exact-object validation: unknown fields are rejected, absent fields are not defaulted, `type` is the discriminator, objects have no prototype/inherited fields, and no value is logged. Every string is at most 64 UTF-8 bytes except RFC 3339 timestamps (40), `bindingKey`/`proof`/`pairProof` (exactly 43 canonical base64url characters), and UUIDs (36). Messages are at most 8 KiB; arrays are at most two entries; nesting is at most two levels.
 
 Native Messaging itself is JSON prefixed by a 32-bit **native-byte-order** length (not a fixed little-endian choice), as required by Chrome. The host rejects declared/actual lengths over 8 KiB before JSON parsing and writes no diagnostic bytes to stdout.
 
@@ -36,9 +36,9 @@ Read-only IPC is limited to quota-snapshot reads. A foreground, locally authenti
 | Message | Required fields | Forbidden / validation |
 | --- | --- | --- |
 | `PairRequest` | `type:"pair_request"`, `version:"v1"`, `installId` (UUIDv4), `pairCode` (32 base64url chars), `requestNonce` (16 base64url chars) | No `slot`, key, snapshot, error, credential, identity, or extra field. Pair code is one-use, host-generated, 5-minute TTL, not persisted by the extension. |
-| `PairResponse` | `type:"pair_response"`, `version:"v1"`, `slot`, `bindingId` (UUIDv4), `installId`, `requestNonce`, `keyId` (UUIDv4), `bindingKey` (43 base64url chars), `nextSequence:"1"`, `pairProof` | Echoes `installId` and `requestNonce`; `pairProof` is HMAC with the pair-code secret, so a response is correlated/authenticated before the extension persists its key. |
+| `PairResponse` | `type:"pair_response"`, `version:"v1"`, `slot`, `bindingId` (UUIDv4), `installId`, `requestNonce`, `keyId` (UUIDv4), `bindingKey` (43 base64url chars), `nextSequence:"1"`, `pairProof` | Echoes `installId` and `requestNonce`; `pairProof` is exact 43-character unpadded base64url HMAC-SHA-256 over `quotabar-claude-pair/v1\0` + RFC 8785 response-without-`pairProof`, keyed by the 24-byte pair-code bytes. Host atomically persists this exact response/digest with consumed pair state so an identical request nonce/code retry receives the same response without a second binding. |
 | `UnpairRequest` | `type:"unpair_request"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `proof` | No windows/source/error. Host authenticates then transactionally invalidates binding and deletes its snapshot. |
-| `UnpairResponse` | `type:"unpair_response"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `result:"removed"`, `proof` | Authenticated/correlated with the binding key. Lost response is recovered by repeating the identical request: it receives the persisted previous response, never re-applies removal. |
+| `UnpairResponse` | `type:"unpair_response"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `result:"removed"`, `proof` | Authenticated/correlated with the binding key. Aggregate state retains one bounded tombstone `{bindingId,installId,requestDigest,response,expiresAtHost}` for 10 minutes; only the identical request may receive it. On expiry it is deleted. Other retry/replay is rejected; lost response after expiry is safely recovered by foreground confirmation that the slot is unbound, then a new pair. |
 
 `slot` is exactly `slot-a` or `slot-b`; it is an app-owned routing label, never a profile name. At most two active bindings exist. Explicit local QuotaBar UI creates a pair code for one empty slot. A second binding for an occupied slot is rejected. Re-pairing requires an explicit invalidation transaction, then a new pair code; it cannot silently replace a binding.
 
@@ -50,7 +50,7 @@ Read-only IPC is limited to quota-snapshot reads. A foreground, locally authenti
 | `UnavailableObservation` | `type:"unavailable"`, `version:"v1"`, `bindingId`, `installId`, `keyId`, `sequence`, `observedAt`, `errorCode`, `proof` | No windows/source/status/pair fields. Valid unavailable observations consume sequence and update only safe metadata. |
 | `ObservationAck` | `type:"observation_ack"`, `version:"v1"`, `bindingId`, `installId`, `sequence`, `result` (`replaced`, `retained`, or `safe_error`), `proof` | HMAC-authenticated correlated response. Persisted with the accepted event; the sole immediately previous accepted digest may return this same ACK on identical retry. |
 
-A window is an exact object with `kind` (`five_hour` or `weekly`), optional `usedPercent` finite 0–100, and optional `resetAt` RFC 3339 UTC. Duplicate kinds, an empty window array, invalid/future timestamps, and unknown properties are rejected. Missing usage is never converted to zero.
+A window is an exact object with `kind` (`five_hour` or `weekly`), optional `usedPercent` finite 0–100, and optional `resetAt` RFC 3339 UTC. Duplicate kinds, an empty window array, unknown properties, or `resetAt` outside 0–30 days after host receipt are rejected. Missing usage is never converted to zero. `UnavailableObservation.errorCode` is exactly one of `unavailable`, `malformed_payload`, or `unsupported_observation`.
 
 `proof` is exactly 32 decoded HMAC-SHA-256 bytes, represented as 43 unpadded canonical base64url characters; padding and aliases are rejected. MAC input is `quotabar-claude-bridge/v1\0` followed by RFC 8785 canonical UTF-8 JSON of the message without proof. The host compares in constant time. The implementation ships shared JS/Rust boundary vectors covering pair proof, binding proof, window ordering, invalid padding, and BigInt boundaries.
 
@@ -72,7 +72,9 @@ The host stamps `receivedAt` after successful authentication. It accepts `observ
 | no unexpired snapshot | fresh valid endpoint | write endpoint snapshot |
 | unexpired valid endpoint | fresh valid SSE | atomically replace with SSE |
 | unexpired valid SSE | fresh valid endpoint | keep SSE; consume sequence but do not replace state |
-| unexpired valid SSE | invalid/unavailable/replayed event | keep last-good SSE; record only current safe metadata |
+| unexpired valid SSE | valid authenticated unavailable observation | keep last-good SSE; consume sequence and update safe metadata |
+| any state | schema/auth/clock-invalid, skipped, or replayed event | reject; consume nothing and mutate neither snapshot nor safe metadata |
+| any state | identical immediately previous accepted event | return persisted PairResponse/ObservationAck/tombstone response; no mutation |
 | expired SSE | fresh valid endpoint | endpoint may replace expired state |
 | any snapshot | host-time TTL elapsed | IPC returns `expired` and no windows; store may retain current record only for validation then deletes it on next successful write/startup sweep |
 
@@ -117,7 +119,7 @@ QuotaBar: create one-use pairCode for empty slot
 Extension install: random installId -> PairRequest(pairCode, nonce)
 Chrome -> host: argv origin checked; host checks CWS ID, code, empty slot
 host: atomically creates binding {slot,bindingId,installId,keyId,key,nextSequence=1}
-host -> extension: PairResponse(binding key once)
+host -> extension: atomically persisted PairResponse (binding key once; identical retry returns same response)
 extension: stores key locally in this Chrome profile; no page-world exposure
 ```
 
@@ -127,7 +129,7 @@ extension: stores key locally in this Chrome profile; no page-world exposure
 MAIN: bounded raw parse -> sanitized candidate
 isolated extension: revalidate -> sequence N + HMAC
 Chrome -> host: argv origin + schema + binding + HMAC + N + host-time checks
-host: apply precedence, atomically replace current record if eligible, nextSequence=N+1
+host: apply precedence, atomically commit aggregate + ObservationAck, nextSequence=N+1
 IPC: read-only sanitized current state
 ```
 
@@ -141,4 +143,4 @@ IPC: read-only sanitized current state
 
 ## Acceptance matrix and remaining gate
 
-Implementation must demonstrate exact-union/duplicate-key caps, pair/rotate/unpair/replay rejection, two-profile binding isolation, MAIN-to-isolated sanitization, host-time TTL and precedence, no local listener/polling, safe-error coexistence, atomic interruption/corruption behavior, and hard-fail production/validation isolation. It must preserve `get_quota` unchanged. Sol High must review the exact ADR diff and approve the reserved CWS IDs, maintained production floor, same-user boundary, pairing proof, atomic layout, and live-validation consent plan before Stream C.
+Implementation must demonstrate exact-union/duplicate-key caps; persisted pair-response retry; bounded unpair tombstone recovery; string-sequence/ACK transitions; pair and binding MAC vectors; two-profile binding isolation; MAIN-to-isolated sanitization; host-time TTL and precedence; no local listener/polling; atomic interruption/corruption behavior; and hard-fail production/validation isolation. V1 has no key rotation. It must preserve `get_quota` unchanged. Sol High must review the exact ADR diff and approve the reserved CWS IDs, maintained production floor, same-user boundary, pairing proof, atomic layout, and live-validation consent plan before Stream C.
