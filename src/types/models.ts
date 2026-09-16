@@ -60,6 +60,22 @@ export interface CodexResetCredits {
   error?: string;
 }
 
+/** The intentionally path-free public DTO returned by get_codex_profiles. */
+export interface CodexProfileQuota {
+  alias: string;
+  status: 'connected' | 'stale' | 'offline' | 'error';
+  planType?: string;
+  primary?: CodexRateLimitWindow;
+  secondary?: CodexRateLimitWindow;
+  availableResetCredits: number;
+  error?: string;
+}
+
+export interface CodexProfilesResponse {
+  profiles: CodexProfileQuota[];
+  registryError?: string | null;
+}
+
 export type CodexQuotaStatus = 'on_track' | 'watch' | 'likely_exhausted' | 'exhausted';
 
 export interface CodexWeeklyQuota {

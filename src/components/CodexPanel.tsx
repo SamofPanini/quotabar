@@ -6,6 +6,7 @@ import ResetTimeline from './ResetTimeline';
 import SmartTip from './SmartTip';
 import type {
   CodexData,
+  CodexProfileQuota,
   CodexRateLimitWindow,
   CodexRateLimits,
   CodexResetCredit,
@@ -186,6 +187,22 @@ function getTrayUsedPercent(limits: CodexRateLimits): number | null {
   return null;
 }
 
+function customProfileStatus(profile: CodexProfileQuota): {
+  label: string;
+  tone: 'online' | 'pending' | 'offline' | 'error';
+} {
+  switch (profile.status) {
+    case 'connected':
+      return { label: 'Connected', tone: 'online' };
+    case 'stale':
+      return { label: 'Stale data', tone: 'pending' };
+    case 'offline':
+      return { label: 'Offline', tone: 'offline' };
+    default:
+      return { label: 'Quota unavailable', tone: 'error' };
+  }
+}
+
 export default function CodexPanel({
   onConnectionChange,
   onUsageChange,
@@ -210,6 +227,8 @@ export default function CodexPanel({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [rateLimitsError, setRateLimitsError] = useState<string | null>(null);
+  const [customProfiles, setCustomProfiles] = useState<CodexProfileQuota[]>([]);
+  const [selectedAccountId, setSelectedAccountId] = useState('default');
   const hasResolvedData = useRef(false);
   const request_generation = useLatestRequestGeneration();
   const weekly_request_generation = useLatestRequestGeneration();
@@ -236,6 +255,11 @@ export default function CodexPanel({
 
   const fetchData = useCallback(async () => {
     const generation = request_generation.begin();
+    const profilesPromise = backend.getCodexProfiles().catch(() => ({ profiles: [], registryError: null }));
+    void profilesPromise.then((profiles) => {
+      if (!request_generation.isCurrent(generation)) return;
+      setCustomProfiles(profiles.profiles);
+    });
     try {
       setLoading(true);
       setError(null);
@@ -342,6 +366,33 @@ export default function CodexPanel({
     weeklyExhausted,
   ]);
 
+  useEffect(() => {
+    if (selectedAccountId !== 'default' && !customProfiles.some((profile) => profile.alias === selectedAccountId)) {
+      setSelectedAccountId('default');
+    }
+  }, [customProfiles, selectedAccountId]);
+
+  const selectedCustomProfile = selectedAccountId === 'default'
+    ? null
+    : customProfiles.find((profile) => profile.alias === selectedAccountId) ?? null;
+  const connected = rateLimits?.connected || codexData?.connected;
+  const accountTabs = [
+    { id: 'default', label: 'Default' },
+    ...customProfiles.map((profile) => ({ id: profile.alias, label: profile.alias })),
+  ];
+  // Cost data is always owned by the default account. Keep its component mounted
+  // while a custom quota tab is selected so tab navigation cannot retrigger its
+  // local IPC-backed initial load.
+  const renderDefaultCostSummary = sections.cost && showCostSummary && (connected || customProfiles.length > 0) ? (
+    <div
+      key="codex-default-cost-summary"
+      hidden={selectedCustomProfile !== null}
+      aria-hidden={selectedCustomProfile !== null}
+    >
+      <CostSummarySection source="codex" refreshKey={manualRefreshNonce} showTrend={sections.trend} />
+    </div>
+  ) : null;
+
   if (loading && !codexData && !rateLimits) {
     return (
       <div className="codex-panel">
@@ -351,7 +402,6 @@ export default function CodexPanel({
   }
 
   const hasRateLimits = Boolean(rateLimits?.primary || rateLimits?.secondary);
-  const connected = rateLimits?.connected || codexData?.connected;
   const planType = rateLimits?.planType || codexData?.planType;
   const windows = buildCodexQuotaWindows(rateLimits);
   const topWindow = sortMostConstrained(windows)[0];
@@ -472,6 +522,95 @@ export default function CodexPanel({
     );
   };
 
+  const renderAccountTabs = accountTabs.length > 1 ? (
+    <div className="codex-account-tabs" role="tablist" aria-label="Codex accounts">
+      {accountTabs.map((account) => (
+        <button
+          key={account.id}
+          type="button"
+          role="tab"
+          aria-selected={selectedAccountId === account.id}
+          className={`codex-account-tab ${selectedAccountId === account.id ? 'selected' : ''}`}
+          onClick={() => setSelectedAccountId(account.id)}
+        >
+          {account.label}
+        </button>
+      ))}
+    </div>
+  ) : null;
+
+  if (selectedCustomProfile) {
+    const status = customProfileStatus(selectedCustomProfile);
+    const customLimits: CodexRateLimits = {
+      connected: selectedCustomProfile.status === 'connected' || selectedCustomProfile.status === 'stale',
+      planType: selectedCustomProfile.planType,
+      primary: selectedCustomProfile.primary,
+      secondary: selectedCustomProfile.secondary,
+    };
+    const customWindows = buildCodexQuotaWindows(customLimits);
+    const customTopWindow = sortMostConstrained(customWindows)[0];
+    const hasCustomLimits = Boolean(customLimits.primary || customLimits.secondary);
+    const renderCustomWindow = (window: CodexRateLimitWindow, kind: 'primary' | 'secondary') => (
+      <div className="quota-card" key={kind}>
+        <div className="quota-header">
+          <span className="quota-label">{formatWindowLabel(window.windowMinutes, kind)}</span>
+          <span className="quota-value">{Math.round(window.usedPercent)}%</span>
+        </div>
+        <div
+          className="progress-bar"
+          role="progressbar"
+          aria-label={`${formatWindowLabel(window.windowMinutes, kind)} usage`}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={clampProgressValue(window.usedPercent)}
+          aria-valuetext={`${Math.round(window.usedPercent)}% used`}
+        >
+          <div className="progress-fill" style={getProgressStyle(window.usedPercent)} />
+        </div>
+        {window.resetsAt && (
+          <div className="reset-time">
+            <span>Resets in {formatResetTime(window.resetsAt)}</span>
+            <span>{formatResetAt(window.resetsAt)}</span>
+          </div>
+        )}
+      </div>
+    );
+
+    return (
+      <div className="codex-panel">
+        <div className="codex-content">
+          {renderAccountTabs}
+          <ProviderDetailHeader
+            service="codex"
+            status={status.label}
+            plan={formatCodexPlan(selectedCustomProfile.planType)}
+            usedPercent={customTopWindow?.usedPercent ?? null}
+            usageLabel={customTopWindow?.label}
+            tone={status.tone}
+          />
+          {hasCustomLimits ? (
+            <div className="section">
+              <div className="section-title">Usage</div>
+              <div className="quota-group">
+                {customLimits.primary && renderCustomWindow(customLimits.primary, 'primary')}
+                {customLimits.secondary && renderCustomWindow(customLimits.secondary, 'secondary')}
+                <div className="quota-card">
+                  <div className="quota-header">
+                    <span className="quota-label">Reset credits</span>
+                    <span className="quota-value">{selectedCustomProfile.availableResetCredits}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="empty-state"><p>Custom Codex quota unavailable</p></div>
+          )}
+        </div>
+        {renderDefaultCostSummary}
+      </div>
+    );
+  }
+
   return (
     <div className="codex-panel">
       {error && (
@@ -484,8 +623,9 @@ export default function CodexPanel({
         </div>
       )}
 
-      {connected && (
+      {(connected || customProfiles.length > 0) && (
         <div className="codex-content">
+          {renderAccountTabs}
           <ProviderDetailHeader
             service="codex"
             status={headerStatus}
@@ -716,14 +856,12 @@ export default function CodexPanel({
             </div>
           )}
 
-          {sections.cost && showCostSummary && (
-            <CostSummarySection source="codex" refreshKey={manualRefreshNonce} showTrend={sections.trend} />
-          )}
-
         </div>
       )}
 
-      {!connected && !error && (
+      {renderDefaultCostSummary}
+
+      {!connected && !error && customProfiles.length === 0 && (
         <div className="empty-state">
           <p>Codex not connected</p>
           <p className="hint">Run 'codex' in terminal to login</p>

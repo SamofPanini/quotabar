@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AntigravityData,
   CodexData,
+  CodexProfilesResponse,
   CodexRateLimits,
   CodexResetCredits,
   CodexWeeklyQuotaData,
@@ -52,6 +53,10 @@ export const backend = {
 
   getCodexResetCredits() {
     return invokeBackend<CodexResetCredits>('get_codex_reset_credits');
+  },
+
+  getCodexProfiles() {
+    return invokeBackend<CodexProfilesResponse>('get_codex_profiles');
   },
 
   getCodexWeeklyQuota() {
