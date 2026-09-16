@@ -179,6 +179,36 @@ describe('Codex account tabs', () => {
     await act(async () => renderer.unmount());
   });
 
+  it('does not mount default cost IPC when the default account is offline and no custom profiles exist', async () => {
+    vi.spyOn(backend, 'getCostOverview').mockResolvedValue(emptyCostOverview());
+    vi.spyOn(backend, 'getCostDaily').mockResolvedValue(emptyCostDaily());
+    mockDefaultCalls();
+    vi.mocked(backend.getCodexInfo).mockResolvedValue({ connected: false });
+    vi.mocked(backend.getCodexRateLimits).mockResolvedValue({ connected: false });
+    vi.mocked(backend.getCodexResetCredits).mockResolvedValue({
+      connected: false,
+      availableCount: 0,
+      credits: [],
+    });
+    vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue({ profiles: [], registryError: null });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        showCostSummary: true,
+        sections: { ...hiddenSections, cost: true },
+      }));
+      await flush();
+    });
+
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain('Codex not connected');
+    expect(text).not.toContain('API-equivalent usage');
+    expect(backend.getCostOverview).not.toHaveBeenCalled();
+    expect(backend.getCostDaily).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
   it('does not let an older profiles response overwrite a newer refresh', async () => {
     mockDefaultCalls();
     const older = deferred<CodexProfilesResponse>();

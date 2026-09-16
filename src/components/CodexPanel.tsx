@@ -375,6 +375,7 @@ export default function CodexPanel({
   const selectedCustomProfile = selectedAccountId === 'default'
     ? null
     : customProfiles.find((profile) => profile.alias === selectedAccountId) ?? null;
+  const connected = rateLimits?.connected || codexData?.connected;
   const accountTabs = [
     { id: 'default', label: 'Default' },
     ...customProfiles.map((profile) => ({ id: profile.alias, label: profile.alias })),
@@ -382,7 +383,7 @@ export default function CodexPanel({
   // Cost data is always owned by the default account. Keep its component mounted
   // while a custom quota tab is selected so tab navigation cannot retrigger its
   // local IPC-backed initial load.
-  const renderDefaultCostSummary = sections.cost && showCostSummary ? (
+  const renderDefaultCostSummary = sections.cost && showCostSummary && (connected || customProfiles.length > 0) ? (
     <div
       key="codex-default-cost-summary"
       hidden={selectedCustomProfile !== null}
@@ -401,7 +402,6 @@ export default function CodexPanel({
   }
 
   const hasRateLimits = Boolean(rateLimits?.primary || rateLimits?.secondary);
-  const connected = rateLimits?.connected || codexData?.connected;
   const planType = rateLimits?.planType || codexData?.planType;
   const windows = buildCodexQuotaWindows(rateLimits);
   const topWindow = sortMostConstrained(windows)[0];
