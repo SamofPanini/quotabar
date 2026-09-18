@@ -50,6 +50,12 @@ interface CodexPanelProps {
   onOpenDashboard?: () => void;
 }
 
+interface PendingTrayCoordination {
+  generation: number;
+  defaultResult?: { info: CodexData; limits: CodexRateLimits };
+  profiles?: CodexProfileQuota[];
+}
+
 function formatSubscriptionDate(dateStr?: string): string {
   if (!dateStr) return 'Unknown';
   try {
@@ -237,31 +243,34 @@ export default function CodexPanel({
   const [customProfiles, setCustomProfiles] = useState<CodexProfileQuota[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState('default');
   const hasResolvedData = useRef(false);
-  const trayDefaultResults = useRef(new Map<number, { info: CodexData; limits: CodexRateLimits }>());
-  const trayProfileResults = useRef(new Map<number, CodexProfileQuota[]>());
+  const pendingTrayCoordination = useRef<PendingTrayCoordination | null>(null);
   const request_generation = useLatestRequestGeneration();
   const weekly_request_generation = useLatestRequestGeneration();
 
   const publishTraySnapshots = useCallback((generation: number) => {
-    const defaultResult = trayDefaultResults.current.get(generation);
-    const profiles = trayProfileResults.current.get(generation);
-    if (!defaultResult || !profiles || !request_generation.isCurrent(generation)) return;
+    const pending = pendingTrayCoordination.current;
+    if (
+      !pending
+      || pending.generation !== generation
+      || !pending.defaultResult
+      || !pending.profiles
+      || !request_generation.isCurrent(generation)
+    ) return;
     onTrayQuotaSnapshotsChange?.([
       {
         accountId: 'default',
-        connected: Boolean(defaultResult.limits.connected || defaultResult.info.connected),
-        primary: defaultResult.limits.primary,
-        secondary: defaultResult.limits.secondary,
+        connected: Boolean(pending.defaultResult.limits.connected || pending.defaultResult.info.connected),
+        primary: pending.defaultResult.limits.primary,
+        secondary: pending.defaultResult.limits.secondary,
       },
-      ...profiles.map((profile) => ({
+      ...pending.profiles.map((profile) => ({
         accountId: profile.alias,
         connected: profile.status === 'connected' || profile.status === 'stale',
         primary: profile.primary,
         secondary: profile.secondary,
       })),
     ]);
-    trayDefaultResults.current.delete(generation);
-    trayProfileResults.current.delete(generation);
+    pendingTrayCoordination.current = null;
   }, [onTrayQuotaSnapshotsChange, request_generation]);
 
   const fetchWeeklyQuota = useCallback(async () => {
@@ -286,11 +295,13 @@ export default function CodexPanel({
 
   const fetchData = useCallback(async () => {
     const generation = request_generation.begin();
+    pendingTrayCoordination.current = { generation };
     const profilesPromise = backend.getCodexProfiles().catch(() => ({ profiles: [], registryError: null }));
     void profilesPromise.then((profiles) => {
       if (!request_generation.isCurrent(generation)) return;
       setCustomProfiles(profiles.profiles);
-      trayProfileResults.current.set(generation, profiles.profiles);
+      if (pendingTrayCoordination.current?.generation !== generation) return;
+      pendingTrayCoordination.current.profiles = profiles.profiles;
       publishTraySnapshots(generation);
     });
     try {
@@ -310,7 +321,8 @@ export default function CodexPanel({
       setCodexData(info);
       setRateLimits(limits);
       onQuotaWindowsChange?.(buildCodexQuotaWindows(limits));
-      trayDefaultResults.current.set(generation, { info, limits });
+      if (pendingTrayCoordination.current?.generation !== generation) return;
+      pendingTrayCoordination.current.defaultResult = { info, limits };
       publishTraySnapshots(generation);
       setResetCredits(credits);
 

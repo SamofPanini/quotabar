@@ -23,9 +23,13 @@ const profile = (alias: string, usedPercent = 12): CodexProfileQuota => ({
 });
 
 function deferred<T>() {
+  let reject!: (reason: unknown) => void;
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => { resolve = next; });
-  return { promise, resolve };
+  const promise = new Promise<T>((next, fail) => {
+    resolve = next;
+    reject = fail;
+  });
+  return { promise, reject, resolve };
 }
 
 async function flush(): Promise<void> {
@@ -153,6 +157,155 @@ describe('Codex account tabs', () => {
 
     expect(onTrayQuotaSnapshotsChange).toHaveBeenCalledTimes(callbackCount);
     await act(async () => renderer.unmount());
+  });
+
+  it('discards a profile-only failed generation before publishing a later refresh', async () => {
+    mockDefaultCalls();
+    vi.mocked(backend.getCodexInfo)
+      .mockRejectedValueOnce(new Error('default refresh failed'))
+      .mockResolvedValueOnce({ connected: true, planType: 'plus' });
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({ profiles: [profile('Failed')], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('Later')], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        showCostSummary: false,
+        sections: hiddenSections,
+        onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        manualRefreshNonce: 1,
+        showCostSummary: false,
+        sections: hiddenSections,
+        onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+
+    const published = onTrayQuotaSnapshotsChange.mock.calls
+      .map(([snapshots]) => snapshots as CodexTrayAccountSnapshot[])
+      .filter((snapshots) => snapshots.length > 0);
+    expect(published).toEqual([[
+      expect.objectContaining({ accountId: 'default' }),
+      expect.objectContaining({ accountId: 'Later' }),
+    ]]);
+    await act(async () => renderer.unmount());
+  });
+
+  it('does not let delayed profiles from an older generation publish after a newer refresh', async () => {
+    mockDefaultCalls();
+    const older = deferred<CodexProfilesResponse>();
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockReturnValueOnce(older.promise)
+      .mockResolvedValueOnce({ profiles: [profile('Newer')], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        showCostSummary: false,
+        sections: hiddenSections,
+        onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        manualRefreshNonce: 1,
+        showCostSummary: false,
+        sections: hiddenSections,
+        onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => {
+      older.resolve({ profiles: [profile('Older')], registryError: null });
+      await flush();
+    });
+
+    expect(onTrayQuotaSnapshotsChange).toHaveBeenCalledTimes(1);
+    expect(onTrayQuotaSnapshotsChange).toHaveBeenCalledWith([
+      expect.objectContaining({ accountId: 'default' }),
+      expect.objectContaining({ accountId: 'Newer' }),
+    ]);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps superseded failed coordination bounded to the latest successful refresh', async () => {
+    mockDefaultCalls();
+    vi.mocked(backend.getCodexInfo)
+      .mockRejectedValueOnce(new Error('failed 1'))
+      .mockRejectedValueOnce(new Error('failed 2'))
+      .mockRejectedValueOnce(new Error('failed 3'))
+      .mockResolvedValueOnce({ connected: true, planType: 'plus' });
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({ profiles: [profile('Failed 1')], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('Failed 2')], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('Failed 3')], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('Current')], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        showCostSummary: false,
+        sections: hiddenSections,
+        onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    for (const manualRefreshNonce of [1, 2, 3]) {
+      await act(async () => {
+        renderer.update(createElement(CodexPanel, {
+          autoRefreshIntervalMs: 0,
+          manualRefreshNonce,
+          showCostSummary: false,
+          sections: hiddenSections,
+          onTrayQuotaSnapshotsChange,
+        }));
+        await flush();
+      });
+    }
+
+    const published = onTrayQuotaSnapshotsChange.mock.calls
+      .map(([snapshots]) => snapshots as CodexTrayAccountSnapshot[])
+      .filter((snapshots) => snapshots.length > 0);
+    expect(published).toEqual([[
+      expect.objectContaining({ accountId: 'default' }),
+      expect.objectContaining({ accountId: 'Current' }),
+    ]]);
+    await act(async () => renderer.unmount());
+  });
+
+  it('does not publish pending tray coordination after unmount', async () => {
+    mockDefaultCalls();
+    const profiles = deferred<CodexProfilesResponse>();
+    vi.spyOn(backend, 'getCodexProfiles').mockReturnValue(profiles.promise);
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        showCostSummary: false,
+        sections: hiddenSections,
+        onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => renderer.unmount());
+    await act(async () => {
+      profiles.resolve({ profiles: [profile('Late')], registryError: null });
+      await flush();
+    });
+    expect(onTrayQuotaSnapshotsChange).not.toHaveBeenCalled();
   });
 
   it('falls back to Default when a selected alias disappears on a later refresh', async () => {
