@@ -26,6 +26,7 @@ import {
 } from '../src/services/switcher_providers';
 import { getSavedTrayCycle, getSavedTrayStyle } from '../src/services/tray_style';
 import { getSavedTrayEnabled } from '../src/services/tray_visibility';
+import { getSavedMenuBarQuotaWindow } from '../src/services/codex_tray_window';
 
 function installMemoryStorage(initial: Record<string, string> = {}): Map<string, string> {
   const values = new Map(Object.entries(initial));
@@ -149,6 +150,15 @@ const userVisibleReadCases: UserVisibleReadCase[] = [
     read: getSavedSwitcherVisibility,
     expectedValue: { ...defaultSwitcherVisibility(), cursor: false },
     expectedDefault: defaultSwitcherVisibility(),
+  },
+  {
+    name: 'Codex menu-bar quota window',
+    key: 'menuBarQuotaWindow',
+    validRaw: 'five_hour',
+    malformedRaw: 'monthly',
+    read: getSavedMenuBarQuotaWindow,
+    expectedValue: 'five_hour',
+    expectedDefault: 'weekly',
   },
   {
     name: 'tray style',

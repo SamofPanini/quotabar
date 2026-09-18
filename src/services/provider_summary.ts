@@ -1,7 +1,15 @@
 import type { CSSProperties } from 'react';
-import type { CodexRateLimits, CursorData, GrokData, QuotaData, UsageInfo } from '../types/models';
+import type {
+  CodexRateLimitWindow,
+  CodexRateLimits,
+  CursorData,
+  GrokData,
+  QuotaData,
+  UsageInfo,
+} from '../types/models';
 import { SERVICE_META, SERVICES } from './service_meta';
 import type { TrayServiceName } from './tray_visibility';
+import type { MenuBarQuotaWindow } from './codex_tray_window';
 import { formatResetTime, getProgressStyle } from '../utils/quota_format';
 
 export type AppTabName = TrayServiceName | 'all';
@@ -26,6 +34,32 @@ export interface QuotaWindowSummary {
   usedPercent: number;
   resetLabel?: string;
   resetAtMs?: number;
+}
+
+export interface CodexTrayAccountSnapshot {
+  accountId: string;
+  connected: boolean;
+  primary?: CodexRateLimitWindow;
+  secondary?: CodexRateLimitWindow;
+}
+
+function isValidUsedPercent(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100;
+}
+
+export function getCodexTrayUsedPercent(
+  accounts: CodexTrayAccountSnapshot[],
+  window: MenuBarQuotaWindow,
+): number | null {
+  let highest: number | null = null;
+  for (const account of accounts) {
+    if (!account.connected) continue;
+    // The provider contract identifies primary as five-hour and secondary as weekly.
+    const limit = window === 'five_hour' ? account.primary : account.secondary;
+    if (!isValidUsedPercent(limit?.usedPercent)) continue;
+    highest = highest === null ? limit.usedPercent : Math.max(highest, limit.usedPercent);
+  }
+  return highest;
 }
 
 export function isProviderTab(tab: AppViewName): tab is TrayServiceName {

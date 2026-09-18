@@ -9,6 +9,7 @@ import type {
   CostDailySeries,
   CostOverview,
 } from '../src/types/models';
+import type { CodexTrayAccountSnapshot } from '../src/services/provider_summary';
 
 const hiddenSections = { timeline: false, cost: false, trend: false, tips: false };
 
@@ -52,6 +53,7 @@ function mockDefaultCalls(): void {
 async function renderPanel(options: {
   profiles?: CodexProfilesResponse;
   onUsageChange?: (used: number | null) => void;
+  onTrayQuotaSnapshotsChange?: (snapshots: CodexTrayAccountSnapshot[]) => void;
   manualRefreshNonce?: number;
   showCostSummary?: boolean;
   sections?: typeof hiddenSections;
@@ -65,6 +67,7 @@ async function renderPanel(options: {
       showCostSummary: options.showCostSummary ?? false,
       sections: options.sections ?? hiddenSections,
       onUsageChange: options.onUsageChange,
+      onTrayQuotaSnapshotsChange: options.onTrayQuotaSnapshotsChange,
       manualRefreshNonce: options.manualRefreshNonce,
     }));
     await flush();
@@ -128,6 +131,27 @@ describe('Codex account tabs', () => {
     expect(backend.getCodexProfiles).toHaveBeenCalledTimes(1);
     expect(backend.getCodexInfo).toHaveBeenCalledTimes(1);
     expect(onUsageChange).toHaveBeenCalledTimes(callbackCount);
+    await act(async () => renderer.unmount());
+  });
+
+  it('publishes default and custom snapshots once per completed refresh, independent of tab selection', async () => {
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    const renderer = await renderPanel({
+      profiles: { profiles: [profile('Work', 35)], registryError: null },
+      onTrayQuotaSnapshotsChange,
+    });
+    expect(onTrayQuotaSnapshotsChange).toHaveBeenCalledWith([
+      expect.objectContaining({ accountId: 'default', connected: true }),
+      expect.objectContaining({ accountId: 'Work', connected: true }),
+    ]);
+    const callbackCount = onTrayQuotaSnapshotsChange.mock.calls.length;
+
+    await act(async () => {
+      renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick();
+      await flush();
+    });
+
+    expect(onTrayQuotaSnapshotsChange).toHaveBeenCalledTimes(callbackCount);
     await act(async () => renderer.unmount());
   });
 
