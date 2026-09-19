@@ -27,6 +27,7 @@ import {
   type PanelSectionKey,
   type PanelSectionVisibility,
 } from '../services/panel_sections';
+import type { MenuBarQuotaWindow } from '../services/codex_tray_window';
 
 interface SettingsViewProps {
   isMacOS: boolean;
@@ -36,6 +37,7 @@ interface SettingsViewProps {
   panelSections: PanelSectionVisibility;
   trayStyle: TrayStyle;
   trayCycle: boolean;
+  menuBarQuotaWindow: MenuBarQuotaWindow;
   events: AppEvent[];
   notificationSettings: NotificationSettings;
   switcherVisibility: SwitcherVisibility;
@@ -46,6 +48,7 @@ interface SettingsViewProps {
   onPanelSectionToggle: (key: PanelSectionKey) => void;
   onTrayStyleChange: (style: TrayStyle) => void;
   onTrayCycleToggle: () => void;
+  onMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
   onNotificationToggle: (key: NotificationKey) => void;
   onSwitcherToggle: (service: TrayServiceName) => void;
   onApplyPreset: (preset: ProviderPreset) => void;
@@ -61,6 +64,7 @@ export default function SettingsView({
   panelSections,
   trayStyle,
   trayCycle,
+  menuBarQuotaWindow,
   events,
   notificationSettings,
   switcherVisibility,
@@ -71,6 +75,7 @@ export default function SettingsView({
   onPanelSectionToggle,
   onTrayStyleChange,
   onTrayCycleToggle,
+  onMenuBarQuotaWindowChange,
   onNotificationToggle,
   onSwitcherToggle,
   onApplyPreset,
@@ -181,6 +186,25 @@ export default function SettingsView({
             onClick={onTrayCycleToggle}
           >
             <span />
+          </button>
+        </div>
+        <div className="settings-subsection-title">Codex menu-bar icon window</div>
+        <div className="settings-seg" aria-label="Codex menu-bar icon window">
+          <button
+            type="button"
+            className={`settings-seg-btn ${menuBarQuotaWindow === 'weekly' ? 'active' : ''}`}
+            onClick={() => onMenuBarQuotaWindowChange('weekly')}
+            aria-pressed={menuBarQuotaWindow === 'weekly'}
+          >
+            Weekly
+          </button>
+          <button
+            type="button"
+            className={`settings-seg-btn ${menuBarQuotaWindow === 'five_hour' ? 'active' : ''}`}
+            onClick={() => onMenuBarQuotaWindowChange('five_hour')}
+            aria-pressed={menuBarQuotaWindow === 'five_hour'}
+          >
+            5-hour
           </button>
         </div>
       </section>

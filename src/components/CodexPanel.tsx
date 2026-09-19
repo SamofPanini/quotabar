@@ -14,7 +14,12 @@ import type {
   CodexWeeklyQuota,
   CodexWeeklyValueEstimate,
 } from '../types/models';
-import { buildCodexQuotaWindows, sortMostConstrained, type QuotaWindowSummary } from '../services/provider_summary';
+import {
+  buildCodexQuotaWindows,
+  sortMostConstrained,
+  type CodexTrayAccountSnapshot,
+  type QuotaWindowSummary,
+} from '../services/provider_summary';
 import { canReportBonusReady } from '../services/bonus_ready';
 import {
   checkWeeklyQuotaWindow,
@@ -37,11 +42,18 @@ interface CodexPanelProps {
   manualRefreshNonce?: number;
   onLoadingChange?: (loading: boolean) => void;
   onQuotaWindowsChange?: (windows: QuotaWindowSummary[]) => void;
+  onTrayQuotaSnapshotsChange?: (snapshots: CodexTrayAccountSnapshot[]) => void;
   showCostSummary?: boolean;
   sections?: PanelSectionVisibility;
   onBonusExpiring?: (daysLeft: number) => void;
   onBonusReadyChange?: (ready: { exhausted: boolean; availableCount: number }) => void;
   onOpenDashboard?: () => void;
+}
+
+interface PendingTrayCoordination {
+  generation: number;
+  defaultResult?: { info: CodexData; limits: CodexRateLimits };
+  profiles?: CodexProfileQuota[];
 }
 
 function formatSubscriptionDate(dateStr?: string): string {
@@ -210,6 +222,7 @@ export default function CodexPanel({
   manualRefreshNonce = 0,
   onLoadingChange,
   onQuotaWindowsChange,
+  onTrayQuotaSnapshotsChange,
   showCostSummary = true,
   sections = defaultPanelSections(),
   onBonusExpiring,
@@ -230,8 +243,35 @@ export default function CodexPanel({
   const [customProfiles, setCustomProfiles] = useState<CodexProfileQuota[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState('default');
   const hasResolvedData = useRef(false);
+  const pendingTrayCoordination = useRef<PendingTrayCoordination | null>(null);
   const request_generation = useLatestRequestGeneration();
   const weekly_request_generation = useLatestRequestGeneration();
+
+  const publishTraySnapshots = useCallback((generation: number) => {
+    const pending = pendingTrayCoordination.current;
+    if (
+      !pending
+      || pending.generation !== generation
+      || !pending.defaultResult
+      || !pending.profiles
+      || !request_generation.isCurrent(generation)
+    ) return;
+    onTrayQuotaSnapshotsChange?.([
+      {
+        accountId: 'default',
+        connected: Boolean(pending.defaultResult.limits.connected || pending.defaultResult.info.connected),
+        primary: pending.defaultResult.limits.primary,
+        secondary: pending.defaultResult.limits.secondary,
+      },
+      ...pending.profiles.map((profile) => ({
+        accountId: profile.alias,
+        connected: profile.status === 'connected' || profile.status === 'stale',
+        primary: profile.primary,
+        secondary: profile.secondary,
+      })),
+    ]);
+    pendingTrayCoordination.current = null;
+  }, [onTrayQuotaSnapshotsChange, request_generation]);
 
   const fetchWeeklyQuota = useCallback(async () => {
     const generation = weekly_request_generation.begin();
@@ -255,10 +295,14 @@ export default function CodexPanel({
 
   const fetchData = useCallback(async () => {
     const generation = request_generation.begin();
+    pendingTrayCoordination.current = { generation };
     const profilesPromise = backend.getCodexProfiles().catch(() => ({ profiles: [], registryError: null }));
     void profilesPromise.then((profiles) => {
       if (!request_generation.isCurrent(generation)) return;
       setCustomProfiles(profiles.profiles);
+      if (pendingTrayCoordination.current?.generation !== generation) return;
+      pendingTrayCoordination.current.profiles = profiles.profiles;
+      publishTraySnapshots(generation);
     });
     try {
       setLoading(true);
@@ -277,6 +321,9 @@ export default function CodexPanel({
       setCodexData(info);
       setRateLimits(limits);
       onQuotaWindowsChange?.(buildCodexQuotaWindows(limits));
+      if (pendingTrayCoordination.current?.generation !== generation) return;
+      pendingTrayCoordination.current.defaultResult = { info, limits };
+      publishTraySnapshots(generation);
       setResetCredits(credits);
 
       if (limits.error) {
@@ -304,13 +351,22 @@ export default function CodexPanel({
         onConnectionChange?.(false);
         onUsageChange?.(null);
         onQuotaWindowsChange?.([]);
+        onTrayQuotaSnapshotsChange?.([]);
       }
     } finally {
       if (request_generation.isCurrent(generation)) {
         setLoading(false);
       }
     }
-  }, [fetchWeeklyQuota, onConnectionChange, onQuotaWindowsChange, onUsageChange, request_generation]);
+  }, [
+    fetchWeeklyQuota,
+    onConnectionChange,
+    onQuotaWindowsChange,
+    onTrayQuotaSnapshotsChange,
+    onUsageChange,
+    publishTraySnapshots,
+    request_generation,
+  ]);
 
   useEffect(() => {
     fetchData();

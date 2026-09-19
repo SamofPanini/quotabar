@@ -21,6 +21,7 @@ function settingsProps() {
     panelSections: { timeline: true, cost: true, trend: true, tips: true },
     trayStyle: 'percent' as const,
     trayCycle: false,
+    menuBarQuotaWindow: 'weekly' as const,
     events: [
       { id: '1', time: '2026-09-03T10:00:00Z', level: 'critical' as const, text: 'Codex usage crossed 95%' },
       { id: '2', time: '2026-09-03T10:00:00Z', level: 'critical' as const, text: 'Failed to persist local setting.' },
@@ -46,6 +47,7 @@ function settingsProps() {
     onPanelSectionToggle: () => {},
     onTrayStyleChange: () => {},
     onTrayCycleToggle: () => {},
+    onMenuBarQuotaWindowChange: () => {},
     onNotificationToggle: () => {},
     onSwitcherToggle: () => {},
     onApplyPreset: vi.fn(),
@@ -65,5 +67,8 @@ describe('settings event navigation', () => {
     expect(html).toContain('>Alerts<');
     expect(html).toContain('>All<');
     expect(html).toContain('>Codex<');
+    expect(html).toContain('Codex menu-bar icon window');
+    expect(html).toContain('>Weekly<');
+    expect(html).toContain('>5-hour<');
   });
 });

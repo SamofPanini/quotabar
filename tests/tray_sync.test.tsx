@@ -4,6 +4,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi 
 import { backend } from '../src/services/backend';
 import { SERVICES } from '../src/services/service_meta';
 import type { TrayServiceName } from '../src/services/tray_visibility';
+import type { CodexProfilesResponse } from '../src/types/models';
+import SettingsView from '../src/components/SettingsView';
 
 vi.mock('../src/hooks/use_popover_window', () => ({
   usePopoverWindow: () => false,
@@ -43,6 +45,12 @@ async function unmount(renderer: ReactTestRenderer): Promise<void> {
   await act(async () => renderer.unmount());
 }
 
+async function flush(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 function visible_calls(update: ReturnType<typeof vi.spyOn>) {
   const visible = new Map<TrayServiceName, boolean>();
   for (const args of update.mock.calls) {
@@ -76,6 +84,7 @@ beforeEach(() => {
     credits: [],
   });
   vi.spyOn(backend, 'getCodexWeeklyQuota').mockResolvedValue({});
+  vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue({ profiles: [], registryError: null } satisfies CodexProfilesResponse);
   vi.spyOn(backend, 'getCursorInfo').mockResolvedValue({ connected: true });
   vi.spyOn(backend, 'getGrokInfo').mockResolvedValue({ connected: true, percentage: 39, products: [] });
   vi.spyOn(backend, 'getAntigravityInfo').mockResolvedValue({ connected: false, status: 'pending' });
@@ -106,6 +115,54 @@ describe('tray icon sync', () => {
     expect(visible.get('antigravity')).toBe(false);
     expect(SERVICES.every((service) => visible.has(service))).toBe(true);
 
+    await unmount(renderer);
+  });
+
+  test('changes the Codex tray window locally without another acquisition call', async () => {
+    vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
+      connected: true,
+      primary: { usedPercent: 18, windowMinutes: 300 },
+      secondary: { usedPercent: 52, windowMinutes: 10_080 },
+    });
+    vi.mocked(backend.getCodexProfiles).mockResolvedValue({
+      profiles: [{
+        alias: 'Work', status: 'connected', availableResetCredits: 0,
+        primary: { usedPercent: 79, windowMinutes: 300 },
+        secondary: { usedPercent: 31, windowMinutes: 10_080 },
+      }],
+      registryError: null,
+    });
+    const renderer = await render_app();
+    await act(flush);
+    const acquisitionCounts = {
+      info: vi.mocked(backend.getCodexInfo).mock.calls.length,
+      limits: vi.mocked(backend.getCodexRateLimits).mock.calls.length,
+      profiles: vi.mocked(backend.getCodexProfiles).mock.calls.length,
+      credits: vi.mocked(backend.getCodexResetCredits).mock.calls.length,
+      weekly: vi.mocked(backend.getCodexWeeklyQuota).mock.calls.length,
+    };
+    vi.mocked(backend.updateTrayIcon).mockClear();
+
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Open settings' }).props.onClick();
+      await flush();
+    });
+    await act(async () => {
+      renderer.root.findByType(SettingsView).props.onMenuBarQuotaWindowChange('five_hour');
+      await flush();
+    });
+
+    expect(localStorage.getItem('menuBarQuotaWindow')).toBe('five_hour');
+    expect(acquisitionCounts).toEqual({
+      info: vi.mocked(backend.getCodexInfo).mock.calls.length,
+      limits: vi.mocked(backend.getCodexRateLimits).mock.calls.length,
+      profiles: vi.mocked(backend.getCodexProfiles).mock.calls.length,
+      credits: vi.mocked(backend.getCodexResetCredits).mock.calls.length,
+      weekly: vi.mocked(backend.getCodexWeeklyQuota).mock.calls.length,
+    });
+    const codexUpdate = vi.mocked(backend.updateTrayIcon).mock.calls.find((call) => call[0] === 'codex');
+    expect(codexUpdate?.[1]).toBe(79);
+    expect(codexUpdate?.[2]).toBe(true);
     await unmount(renderer);
   });
 });

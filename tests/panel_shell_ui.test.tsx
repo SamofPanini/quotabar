@@ -118,6 +118,7 @@ describe('panel shell UI', () => {
         panelSections={{ timeline: true, cost: true, trend: true, tips: false }}
         trayStyle="percent"
         trayCycle={false}
+        menuBarQuotaWindow="weekly"
         events={[]}
         notificationSettings={{
           q80: true,
@@ -134,6 +135,7 @@ describe('panel shell UI', () => {
         onPanelSectionToggle={() => {}}
         onTrayStyleChange={() => {}}
         onTrayCycleToggle={() => {}}
+        onMenuBarQuotaWindowChange={() => {}}
         onNotificationToggle={() => {}}
         onSwitcherToggle={() => {}}
         onApplyPreset={() => {}}

@@ -44,12 +44,19 @@ import {
 import {
   buildClaudeQuotaWindows,
   buildProviderSummaries,
+  getCodexTrayUsedPercent,
   isProviderTab,
   sortMostConstrained,
   sortUpcomingResets,
   type AppViewName,
+  type CodexTrayAccountSnapshot,
   type QuotaWindowSummary,
 } from './services/provider_summary';
+import {
+  getSavedMenuBarQuotaWindow,
+  saveMenuBarQuotaWindow,
+  type MenuBarQuotaWindow,
+} from './services/codex_tray_window';
 import type { QuotaData } from './types/models';
 import './styles/foundation.css';
 import './styles/content.css';
@@ -151,6 +158,7 @@ export default function App() {
   const [providerQuotaWindows, setProviderQuotaWindows] = useState<ServiceMap<QuotaWindowSummary[]>>(() =>
     defaultServiceMap<QuotaWindowSummary[]>([]),
   );
+  const [codexTraySnapshots, setCodexTraySnapshots] = useState<CodexTrayAccountSnapshot[]>([]);
 
   // Manual refresh nonces (per non-Claude service)
   const [refreshNonces, setRefreshNonces] = useState<ServiceMap<number>>(() => defaultServiceMap(0));
@@ -181,6 +189,9 @@ export default function App() {
   const [panelSections, setPanelSections] = useState<PanelSectionVisibility>(getSavedPanelSections);
   const [trayStyle, setTrayStyle] = useState<TrayStyle>(getSavedTrayStyle);
   const [trayCycle, setTrayCycle] = useState<boolean>(getSavedTrayCycle);
+  const [menuBarQuotaWindow, setMenuBarQuotaWindow] = useState<MenuBarQuotaWindow>(
+    getSavedMenuBarQuotaWindow,
+  );
   const [trayCycleIndex, setTrayCycleIndex] = useState(0);
   const [events, setEvents] = useState<AppEvent[]>(getSavedEvents);
   const [notifSettings, setNotifSettings] = useState<NotificationSettings>(getSavedNotificationSettings);
@@ -362,11 +373,26 @@ export default function App() {
     });
 
     for (const svc of SERVICES) {
-      const pct = svc === 'claude' ? getClaudeTrayUsedPercent(quota) : usedPercent[svc];
+      const pct = svc === 'claude'
+        ? getClaudeTrayUsedPercent(quota)
+        : svc === 'codex'
+          ? getCodexTrayUsedPercent(codexTraySnapshots, menuBarQuotaWindow)
+          : usedPercent[svc];
       const visible = resolveTrayVisible(svc, candidates, trayCycle, trayCycleIndex);
       updateTrayIcon(svc, pct, visible, force, trayStyle);
     }
-  }, [quota, connected, usedPercent, trayEnabled, trayCycle, trayCycleIndex, trayStyle, updateTrayIcon]);
+  }, [
+    quota,
+    connected,
+    usedPercent,
+    codexTraySnapshots,
+    menuBarQuotaWindow,
+    trayEnabled,
+    trayCycle,
+    trayCycleIndex,
+    trayStyle,
+    updateTrayIcon,
+  ]);
 
   useEffect(() => {
     syncTrayIcons();
@@ -500,6 +526,11 @@ export default function App() {
     setTrayCycle(next);
     setTrayCycleIndex(0);
   }, [trayCycle]);
+
+  const handleMenuBarQuotaWindowChange = useCallback((window: MenuBarQuotaWindow) => {
+    saveMenuBarQuotaWindow(window);
+    setMenuBarQuotaWindow(window);
+  }, []);
 
   const handleThemeChange = useCallback((newTheme: ThemeName) => {
     setTheme(newTheme);
@@ -715,6 +746,7 @@ export default function App() {
               panelSections={panelSections}
               trayStyle={trayStyle}
               trayCycle={trayCycle}
+              menuBarQuotaWindow={menuBarQuotaWindow}
               events={events}
               notificationSettings={notifSettings}
               switcherVisibility={switcherVisibility}
@@ -725,6 +757,7 @@ export default function App() {
               onPanelSectionToggle={handlePanelSectionToggle}
               onTrayStyleChange={handleTrayStyleChange}
               onTrayCycleToggle={handleTrayCycleToggle}
+              onMenuBarQuotaWindowChange={handleMenuBarQuotaWindowChange}
               onNotificationToggle={handleNotificationToggle}
               onSwitcherToggle={handleSwitcherToggle}
               onApplyPreset={applyProviderPreset}
@@ -761,6 +794,7 @@ export default function App() {
                   onUsageChange={usageSetters.codex}
                   onLoadingChange={loadingSetters.codex}
                   onQuotaWindowsChange={quotaWindowSetters.codex}
+                  onTrayQuotaSnapshotsChange={setCodexTraySnapshots}
                   manualRefreshNonce={refreshNonces.codex}
                   autoRefreshIntervalMs={providerRefreshIntervalMs(windowVisible, trayEnabled.codex)}
                   showCostSummary={windowVisible && activeView === 'codex'}
