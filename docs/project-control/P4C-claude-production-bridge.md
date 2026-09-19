@@ -28,23 +28,19 @@ No code or executable configuration is defined by C2.
 
 ## Sanitize-before-crossing envelope
 
-The future ingress accepts a closed schema only. A valid envelope may contain only:
+The future validation ingress accepts exactly one decoded discriminated union named `ObservationEnvelopeV1`. Transport framing and authentication may be selected in C3-B, but before any state mutation the ingress rejects duplicate keys, unknown fields, missing required fields, extra variant fields, non-finite numbers, and out-of-range values. Common required fields are `schemaVersion = v1`; `status = available | unavailable`; `accountSlotId`, a canonical lowercase UUIDv4 issued by QuotaBar during foreground binding; `bindingEpoch` and `sequence`, canonical unsigned decimal strings in the inclusive range 1 through 18446744073709551615; and `observedAt`, an RFC 3339 UTC timestamp ending in `Z`.
 
-- schema version;
-- opaque app-owned `AccountSlotId`;
-- current `BindingEpoch`, or an internal opaque correlation field that never reaches display or logs;
-- `WindowKind`: `five_hour` or `weekly`;
-- finite `usedPercent` in the inclusive range 0--100;
-- optional trustworthy `resetAt`;
-- `observedAt`;
-- monotonic observation sequence; and
-- fixed sanitized source, status, and error enums.
+For `status = available`, `source` is exactly `completion_sse` and `windows` is a non-empty array of one or two exact window objects in deterministic `five_hour`, then `weekly` order. Each window contains `kind = five_hour | weekly`, finite `usedPercent` in the inclusive range 0 through 100, and optional `resetAt` as an RFC 3339 UTC timestamp ending in `Z`. Duplicate kinds are rejected and `errorCode` is forbidden.
+
+For `status = unavailable`, `errorCode` is exactly `unavailable | malformed_payload | unsupported_observation`; `source` and `windows` are forbidden. Missing values never default to zero. A rejected object, wrong epoch, replay, or skipped sequence consumes no sequence and mutates no store or safe metadata.
 
 It must reject raw response, SSE, or endpoint bodies; prompt or response text and arbitrary strings; URL, route, and request headers; tokens, cookies, sessions, authorization, or credential material; provider account, organization, email, or plan identity; filesystem paths; and raw debugging payloads. Raw acquisition material remains in the source boundary and is never persisted or logged.
 
 ## Binding, account change, and epoch ceremony
 
 W1-R1 governs the binding lifecycle. Reset and expiry never unbind a slot; Paid and Free are metadata, never identity. Initial binding is an explicit foreground action. Continuity-proven observations remain in the current epoch.
+
+The current `BindingEpoch` is required and is the sole v1 ingestion correlation field together with `AccountSlotId`. It uses the canonical unsigned decimal representation defined by `ObservationEnvelopeV1`. No opaque correlation field may substitute for `BindingEpoch`. A later transport may add a request-local nonce solely for acknowledgement correlation or identical retry handling, but that nonce never determines identity, epoch, storage, DTO, or display state.
 
 On logout, a proven different account, or continuity uncertainty, all old numeric windows are hidden before acknowledgement. Different-account and re-pair operations advance the epoch; uncertainty sets `bindingState = unverified`. Delayed or replayed observations from a prior epoch are rejected. Alias, tab position, plan class, or similar percentages never establish identity. If a candidate source cannot provide trustworthy continuity, it must require explicit foreground confirmation and rebind.
 
