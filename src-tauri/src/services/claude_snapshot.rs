@@ -44,6 +44,17 @@ static WRITE_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<WriteTestHoo
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static LOCK_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<
+        Option<(
+            PathBuf,
+            std::sync::Arc<std::sync::Barrier>,
+            std::sync::Arc<std::sync::Barrier>,
+        )>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
 fn pause_after_temp_fsync(root: &Path, name: &str) {
     let hook = WRITE_TEST_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -56,6 +67,22 @@ fn pause_after_temp_fsync(root: &Path, name: &str) {
         hook.resume.wait();
     }
 }
+
+#[cfg(test)]
+fn pause_after_lock_open(root: &Path) {
+    let hook = LOCK_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some((_hook_root, reached, resume)) = hook.filter(|hook| hook.0 == root) {
+        reached.wait();
+        resume.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_after_lock_open(_: &Path) {}
 
 #[cfg(not(test))]
 fn pause_after_temp_fsync(_: &Path, _: &str) {}
@@ -665,7 +692,7 @@ impl ClaudeSnapshotStore {
         self.verify_root()?;
         #[cfg(unix)]
         {
-            return LockGuard::acquire(&self.root_dir);
+            return LockGuard::acquire(&self.root_dir, &self.root);
         }
         #[cfg(not(unix))]
         Err(SnapshotError::Unsupported)
@@ -1106,7 +1133,7 @@ struct LockGuard {
 }
 impl LockGuard {
     #[cfg(unix)]
-    fn acquire(root: &File) -> Result<Self, SnapshotError> {
+    fn acquire(root: &File, root_path: &Path) -> Result<Self, SnapshotError> {
         let file = match openat(
             root,
             LOCK_FILE,
@@ -1120,6 +1147,7 @@ impl LockGuard {
             .map_err(|_| SnapshotError::Io)?;
         let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
         validate_open_regular_owned(&file_metadata, 0o600)?;
+        pause_after_lock_open(root_path);
         #[cfg(unix)]
         {
             if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) }
@@ -1933,5 +1961,103 @@ mod tests {
         resume.wait();
         assert!(writer.join().unwrap().is_err());
         *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn active_temp_is_preserved_while_concurrent_projection_waits_on_lock() {
+        let s = std::sync::Arc::new(store("active-temp"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174019");
+        register(&s, id, now());
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            reached: reached.clone(),
+            resume: resume.clone(),
+            temp_path: temp_path.clone(),
+        });
+        let writer = {
+            let s = s.clone();
+            std::thread::spawn(move || s.mutate(now(), |_| Ok(())))
+        };
+        reached.wait();
+        let active = temp_path.lock().unwrap().clone().unwrap();
+        assert!(active.exists());
+        let reader = {
+            let s = s.clone();
+            std::thread::spawn(move || s.project(now()))
+        };
+        assert!(active.exists());
+        resume.wait();
+        writer.join().unwrap().unwrap();
+        reader.join().unwrap().unwrap();
+        assert!(!active.exists());
+        *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn unpair_pre_rename_interruption_reopens_wholly_old_state() {
+        let s = std::sync::Arc::new(store("unpair-interrupt"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174020");
+        register(&s, id.clone(), now());
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            reached: reached.clone(),
+            resume: resume.clone(),
+            temp_path: temp_path.clone(),
+        });
+        let writer = {
+            let s = s.clone();
+            let id = id.clone();
+            std::thread::spawn(move || s.unpair(&id, now()))
+        };
+        reached.wait();
+        let temp = temp_path.lock().unwrap().clone().unwrap();
+        fs::rename(&temp, temp.with_extension("interrupted")).unwrap();
+        resume.wait();
+        assert!(writer.join().unwrap().is_err());
+        *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
+        let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
+        assert_eq!(
+            projection(&restarted, now()).binding_state,
+            BindingState::Bound
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_replacement_between_open_and_flock_fails_closed() {
+        let s = std::sync::Arc::new(store("lock-replacement"));
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *LOCK_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((s.root.clone(), reached.clone(), resume.clone()));
+        let worker = {
+            let s = s.clone();
+            std::thread::spawn(move || s.lock())
+        };
+        reached.wait();
+        let lock = s.root.join(LOCK_FILE);
+        let replaced = s.root.join("replaced-lock");
+        fs::rename(&lock, &replaced).unwrap();
+        open_private_new(&lock).unwrap();
+        resume.wait();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(SnapshotError::InvalidState)
+        ));
+        *LOCK_TEST_HOOK.get().unwrap().lock().unwrap() = None;
     }
 }
