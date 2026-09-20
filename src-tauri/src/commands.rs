@@ -7,8 +7,8 @@ use crate::{
         CursorData, GrokData, QuotaData,
     },
     services::{
-        antigravity, claude, claude_snapshot, codex, codex_profiles, codex_weekly, cost, cursor, grok, link, tray,
-        tray_icon, window,
+        antigravity, claude, claude_snapshot, codex, codex_profiles, codex_weekly, cost, cursor,
+        grok, link, tray, tray_icon, window,
     },
 };
 
@@ -19,8 +19,13 @@ pub async fn get_quota() -> Result<QuotaData, String> {
 
 /// Read-only Claude current-state projection. No frontend mutation command exists.
 #[tauri::command]
-pub fn get_claude_current_snapshots(app: AppHandle) -> Result<claude_snapshot::ClaudeCurrentSnapshotsDto, String> {
-    let config_dir = app.path().app_config_dir().map_err(|_| "Claude snapshot unavailable")?;
+pub fn get_claude_current_snapshots(
+    app: AppHandle,
+) -> Result<claude_snapshot::ClaudeCurrentSnapshotsDto, String> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "Claude snapshot unavailable")?;
     let store = claude_snapshot::ClaudeSnapshotStore::in_app_config(&config_dir)
         .map_err(|_| "Claude snapshot unavailable")?;
     store
