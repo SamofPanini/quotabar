@@ -17,7 +17,7 @@ use uuid::{Uuid, Variant};
 #[cfg(unix)]
 use std::{
     ffi::CString,
-    os::unix::io::{AsRawFd, FromRawFd},
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -32,10 +32,46 @@ const TEMP_PREFIX: &str = ".current-state.tmp-";
 
 #[cfg(test)]
 #[derive(Clone)]
+struct TestGate {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl TestGate {
+    fn wait(&self) {
+        self.reached.send(()).expect("test coordinator dropped");
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("test coordinator did not resume within 5 seconds");
+    }
+}
+
+#[cfg(test)]
+fn test_gate() -> (
+    TestGate,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    (
+        TestGate {
+            reached: reached_tx,
+            resume: std::sync::Arc::new(std::sync::Mutex::new(resume_rx)),
+        },
+        reached_rx,
+        resume_tx,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 struct WriteTestHook {
     root: PathBuf,
-    reached: std::sync::Arc<std::sync::Barrier>,
-    resume: std::sync::Arc<std::sync::Barrier>,
+    gate: TestGate,
     temp_path: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
@@ -44,15 +80,12 @@ static WRITE_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<WriteTestHoo
     std::sync::OnceLock::new();
 
 #[cfg(test)]
-static LOCK_TEST_HOOK: std::sync::OnceLock<
-    std::sync::Mutex<
-        Option<(
-            PathBuf,
-            std::sync::Arc<std::sync::Barrier>,
-            std::sync::Arc<std::sync::Barrier>,
-        )>,
-    >,
-> = std::sync::OnceLock::new();
+static LOCK_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, TestGate)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static POST_COMMIT_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, TestGate)>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn pause_after_temp_fsync(root: &Path, name: &str) {
@@ -63,8 +96,7 @@ fn pause_after_temp_fsync(root: &Path, name: &str) {
         .clone();
     if let Some(hook) = hook.filter(|hook| hook.root == root) {
         *hook.temp_path.lock().unwrap() = Some(root.join(name));
-        hook.reached.wait();
-        hook.resume.wait();
+        hook.gate.wait();
     }
 }
 
@@ -75,10 +107,23 @@ fn pause_after_lock_open(root: &Path) {
         .lock()
         .unwrap()
         .clone();
-    if let Some((_hook_root, reached, resume)) = hook.filter(|hook| hook.0 == root) {
-        reached.wait();
-        resume.wait();
+    if let Some((_hook_root, gate)) = hook.filter(|hook| hook.0 == root) {
+        gate.wait();
     }
+}
+
+#[cfg(test)]
+fn pause_after_commit(root: &Path) -> Result<(), SnapshotError> {
+    let hook = POST_COMMIT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some((_root, gate)) = hook.filter(|hook| hook.0 == root) {
+        gate.wait();
+        return Err(SnapshotError::Io);
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -86,6 +131,10 @@ fn pause_after_lock_open(_: &Path) {}
 
 #[cfg(not(test))]
 fn pause_after_temp_fsync(_: &Path, _: &str) {}
+#[cfg(not(test))]
+fn pause_after_commit(_: &Path) -> Result<(), SnapshotError> {
+    Ok(())
+}
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -571,7 +620,7 @@ impl ClaudeSnapshotStore {
         now: DateTime<Utc>,
     ) -> Result<ClaudeCurrentSnapshotsDto, SnapshotError> {
         let _lock = self.lock()?;
-        cleanup_orphan_temps(&self.root)?;
+        cleanup_orphan_temps(&self.root_dir)?;
         let mut aggregate = self.load(now)?;
         if impossible_clock(&aggregate, now) {
             if fail_closed_for_clock(&mut aggregate, now) {
@@ -602,7 +651,7 @@ impl ClaudeSnapshotStore {
         F: FnOnce(&mut Aggregate) -> Result<(), SnapshotError>,
     {
         let _lock = self.lock()?;
-        cleanup_orphan_temps(&self.root)?;
+        cleanup_orphan_temps(&self.root_dir)?;
         let mut aggregate = self.load(now)?;
         if impossible_clock(&aggregate, now) {
             let changed = fail_closed_for_clock(&mut aggregate, now);
@@ -685,6 +734,7 @@ impl ClaudeSnapshotStore {
         }
         rename_child(&self.root_dir, &temp, STATE_FILE)?;
         self.root_dir.sync_all().map_err(|_| SnapshotError::Io)?;
+        pause_after_commit(&self.root)?;
         Ok(())
     }
 
@@ -1107,15 +1157,65 @@ fn sync_directory(path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn cleanup_orphan_temps(root: &Path) -> Result<(), SnapshotError> {
-    for entry in fs::read_dir(root).map_err(|_| SnapshotError::Io)? {
-        let entry = entry.map_err(|_| SnapshotError::Io)?;
-        if is_inactive_temp_name(&entry.file_name().to_string_lossy()) {
-            validate_regular_owned(&entry.path(), 0o600)?;
-            fs::remove_file(entry.path()).map_err(|_| SnapshotError::Io)?;
+#[cfg(unix)]
+fn cleanup_orphan_temps(root: &File) -> Result<(), SnapshotError> {
+    use std::ffi::CStr;
+
+    // Open "." relative to the pinned descriptor. Unlike dup(2), this gives
+    // enumeration an independent directory-stream offset while preserving the
+    // store's retained root descriptor and its later state operations.
+    let duplicate = openat(
+        root,
+        ".",
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )?;
+    let duplicate = duplicate.into_raw_fd();
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(SnapshotError::Io);
+    }
+    loop {
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let Ok(name) = name.to_str() else { continue };
+        if name == "." || name == ".." || !is_inactive_temp_name(name) {
+            continue;
+        }
+        let path_metadata = child_metadata(root, name)?;
+        // Symlinks, directories, and malformed candidates are never cleanup
+        // targets. A substitution after this check fails closed below.
+        if path_metadata.is_symlink()
+            || path_metadata.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+        {
+            continue;
+        }
+        let file = open_child_existing(root, name)?;
+        let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        validate_open_regular_owned(&file_metadata, 0o600)?;
+        if !path_metadata.matches(&file_metadata) {
+            unsafe { libc::closedir(directory) };
+            return Err(SnapshotError::InvalidState);
+        }
+        let name = CString::new(name).map_err(|_| SnapshotError::InvalidInput)?;
+        if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            unsafe { libc::closedir(directory) };
+            return Err(SnapshotError::Io);
         }
     }
+    if unsafe { libc::closedir(directory) } != 0 {
+        return Err(SnapshotError::Io);
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn cleanup_orphan_temps(_: &File) -> Result<(), SnapshotError> {
+    Err(SnapshotError::Unsupported)
 }
 
 fn is_inactive_temp_name(name: &str) -> bool {
@@ -1794,7 +1894,7 @@ mod tests {
         let _file = open_private_new(&temp).unwrap();
         drop(_file);
         let _lock = s.lock().unwrap();
-        cleanup_orphan_temps(&s.root).unwrap();
+        cleanup_orphan_temps(&s.root_dir).unwrap();
         assert!(!temp.exists());
     }
 
@@ -1925,8 +2025,40 @@ mod tests {
         let displaced = path.with_extension("displaced");
         fs::rename(&path, &displaced).unwrap();
         fs::create_dir(&path).unwrap();
+        let decoy = path.join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        drop(open_private_new(&decoy).unwrap());
         assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
         assert!(!path.join(STATE_FILE).exists());
+        assert!(decoy.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_cleanup_removes_only_verified_orphans_and_keeps_root_usable() {
+        use std::os::unix::fs::symlink;
+        let s = store("descriptor-cleanup");
+        let orphan = s
+            .root
+            .join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        drop(open_private_new(&orphan).unwrap());
+        let unrelated = s.root.join("unrelated");
+        fs::write(&unrelated, b"keep").unwrap();
+        let malformed = s.root.join(format!("{TEMP_PREFIX}not-a-pid"));
+        fs::write(&malformed, b"keep").unwrap();
+        let directory = s
+            .root
+            .join(format!("{TEMP_PREFIX}99998-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let link = s
+            .root
+            .join(format!("{TEMP_PREFIX}99997-{}", Uuid::new_v4()));
+        symlink(&unrelated, &link).unwrap();
+        let _lock = s.lock().unwrap();
+        cleanup_orphan_temps(&s.root_dir).unwrap();
+        assert!(!orphan.exists());
+        assert!(unrelated.exists() && malformed.exists() && directory.exists() && link.exists());
+        drop(_lock);
+        s.project(now()).unwrap();
     }
 
     #[test]
@@ -1935,30 +2067,30 @@ mod tests {
         let id = slot("123e4567-e89b-42d3-a456-426614174018");
         register(&s, id, now());
         let aggregate = s.load(now()).unwrap();
-        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (gate, reached, resume) = test_gate();
         let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
         *WRITE_TEST_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap() = Some(WriteTestHook {
             root: s.root.clone(),
-            reached: reached.clone(),
-            resume: resume.clone(),
+            gate,
             temp_path: temp_path.clone(),
         });
         let writer = {
             let s = s.clone();
             std::thread::spawn(move || s.write_aggregate(&aggregate))
         };
-        reached.wait();
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let temp = temp_path.lock().unwrap().clone().unwrap();
         let substitute = temp.with_extension("substitute");
         fs::rename(&temp, &substitute).unwrap();
         fs::write(&temp, b"substituted").unwrap();
         #[cfg(unix)]
         fs::set_permissions(&temp, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-        resume.wait();
+        resume.send(()).unwrap();
         assert!(writer.join().unwrap().is_err());
         *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
     }
@@ -1968,23 +2100,27 @@ mod tests {
         let s = std::sync::Arc::new(store("active-temp"));
         let id = slot("123e4567-e89b-42d3-a456-426614174019");
         register(&s, id, now());
-        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (gate, reached, resume) = test_gate();
         let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let orphan = s
+            .root
+            .join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        drop(open_private_new(&orphan).unwrap());
         *WRITE_TEST_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap() = Some(WriteTestHook {
             root: s.root.clone(),
-            reached: reached.clone(),
-            resume: resume.clone(),
+            gate,
             temp_path: temp_path.clone(),
         });
         let writer = {
             let s = s.clone();
             std::thread::spawn(move || s.mutate(now(), |_| Ok(())))
         };
-        reached.wait();
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let active = temp_path.lock().unwrap().clone().unwrap();
         assert!(active.exists());
         let reader = {
@@ -1992,10 +2128,11 @@ mod tests {
             std::thread::spawn(move || s.project(now()))
         };
         assert!(active.exists());
-        resume.wait();
+        resume.send(()).unwrap();
         writer.join().unwrap().unwrap();
         reader.join().unwrap().unwrap();
         assert!(!active.exists());
+        assert!(!orphan.exists());
         *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
     }
 
@@ -2004,16 +2141,14 @@ mod tests {
         let s = std::sync::Arc::new(store("unpair-interrupt"));
         let id = slot("123e4567-e89b-42d3-a456-426614174020");
         register(&s, id.clone(), now());
-        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (gate, reached, resume) = test_gate();
         let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
         *WRITE_TEST_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap() = Some(WriteTestHook {
             root: s.root.clone(),
-            reached: reached.clone(),
-            resume: resume.clone(),
+            gate,
             temp_path: temp_path.clone(),
         });
         let writer = {
@@ -2021,10 +2156,12 @@ mod tests {
             let id = id.clone();
             std::thread::spawn(move || s.unpair(&id, now()))
         };
-        reached.wait();
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let temp = temp_path.lock().unwrap().clone().unwrap();
         fs::rename(&temp, temp.with_extension("interrupted")).unwrap();
-        resume.wait();
+        resume.send(()).unwrap();
         assert!(writer.join().unwrap().is_err());
         *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
         let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
@@ -2034,26 +2171,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unpair_post_commit_interruption_reopens_wholly_new_state() {
+        let s = std::sync::Arc::new(store("unpair-post-commit"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174021");
+        register(&s, id.clone(), now());
+        let (gate, reached, resume) = test_gate();
+        *POST_COMMIT_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((s.root.clone(), gate));
+        let writer = {
+            let s = s.clone();
+            let id = id.clone();
+            std::thread::spawn(move || s.unpair(&id, now()))
+        };
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        resume.send(()).unwrap();
+        assert!(matches!(writer.join().unwrap(), Err(SnapshotError::Io)));
+        *POST_COMMIT_TEST_HOOK.get().unwrap().lock().unwrap() = None;
+        let raw: Aggregate =
+            serde_json::from_slice(&fs::read(s.root.join(STATE_FILE)).unwrap()).unwrap();
+        let slot = &raw.slots[0];
+        assert_eq!(slot.binding_state, BindingState::Unbound);
+        assert!(slot.binding_id.is_none());
+        assert!(slot.windows.is_empty());
+        assert_eq!(slot.next_sequence, 1);
+        let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
+        assert_eq!(
+            projection(&restarted, now()).binding_state,
+            BindingState::Unbound
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn lock_replacement_between_open_and_flock_fails_closed() {
         let s = std::sync::Arc::new(store("lock-replacement"));
-        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (gate, reached, resume) = test_gate();
         *LOCK_TEST_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .unwrap() = Some((s.root.clone(), reached.clone(), resume.clone()));
+            .unwrap() = Some((s.root.clone(), gate));
         let worker = {
             let s = s.clone();
             std::thread::spawn(move || s.lock())
         };
-        reached.wait();
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let lock = s.root.join(LOCK_FILE);
         let replaced = s.root.join("replaced-lock");
         fs::rename(&lock, &replaced).unwrap();
         open_private_new(&lock).unwrap();
-        resume.wait();
+        resume.send(()).unwrap();
         assert!(matches!(
             worker.join().unwrap(),
             Err(SnapshotError::InvalidState)
