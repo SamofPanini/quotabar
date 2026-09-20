@@ -12,7 +12,13 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use uuid::Uuid;
+use uuid::{Uuid, Variant};
+
+#[cfg(unix)]
+use std::{
+    ffi::CString,
+    os::unix::io::{AsRawFd, FromRawFd},
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -23,6 +29,36 @@ const ROLLBACK_TOLERANCE: Duration = Duration::seconds(60);
 const STATE_FILE: &str = "current-state.json";
 const LOCK_FILE: &str = ".current-state.lock";
 const TEMP_PREFIX: &str = ".current-state.tmp-";
+
+#[cfg(test)]
+#[derive(Clone)]
+struct WriteTestHook {
+    root: PathBuf,
+    reached: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+    temp_path: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+}
+
+#[cfg(test)]
+static WRITE_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<WriteTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn pause_after_temp_fsync(root: &Path, name: &str) {
+    let hook = WRITE_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.root == root) {
+        *hook.temp_path.lock().unwrap() = Some(root.join(name));
+        hook.reached.wait();
+        hook.resume.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_after_temp_fsync(_: &Path, _: &str) {}
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -39,7 +75,11 @@ impl AccountSlotId {
         let value = value.into();
         Uuid::parse_str(&value)
             .ok()
-            .filter(|uuid| uuid.get_version_num() == 4 && uuid.hyphenated().to_string() == value)
+            .filter(|uuid| {
+                uuid.get_version_num() == 4
+                    && uuid.get_variant() == Variant::RFC4122
+                    && uuid.hyphenated().to_string() == value
+            })
             .map(|_| Self(value))
             .ok_or(SnapshotError::InvalidInput)
     }
@@ -223,7 +263,9 @@ impl BindingId {
 
     fn is_canonical(&self) -> bool {
         Uuid::parse_str(&self.0).ok().is_some_and(|value| {
-            value.get_version_num() == 4 && value.hyphenated().to_string() == self.0
+            value.get_version_num() == 4
+                && value.get_variant() == Variant::RFC4122
+                && value.hyphenated().to_string() == self.0
         })
     }
 }
@@ -320,6 +362,8 @@ impl Aggregate {
 
 pub(crate) struct ClaudeSnapshotStore {
     root: PathBuf,
+    #[cfg(unix)]
+    root_dir: File,
 }
 
 impl ClaudeSnapshotStore {
@@ -339,7 +383,13 @@ impl ClaudeSnapshotStore {
             .map_err(|_| SnapshotError::Io)?
             .join(name);
         ensure_root(&root)?;
-        Ok(Self { root })
+        #[cfg(unix)]
+        let root_dir = open_directory(&root)?;
+        Ok(Self {
+            root,
+            #[cfg(unix)]
+            root_dir,
+        })
     }
 
     pub(crate) fn register_slot(
@@ -493,9 +543,14 @@ impl ClaudeSnapshotStore {
         &self,
         now: DateTime<Utc>,
     ) -> Result<ClaudeCurrentSnapshotsDto, SnapshotError> {
-        let _lock = LockGuard::acquire(&self.root)?;
+        let _lock = self.lock()?;
         cleanup_orphan_temps(&self.root)?;
         let mut aggregate = self.load(now)?;
+        if impossible_clock(&aggregate, now) {
+            if fail_closed_for_clock(&mut aggregate, now) {
+                self.write_aggregate(&aggregate)?;
+            }
+        }
         let changed = project_expiry(&mut aggregate, now);
         if changed {
             self.write_aggregate(&aggregate)?;
@@ -519,11 +574,11 @@ impl ClaudeSnapshotStore {
     where
         F: FnOnce(&mut Aggregate) -> Result<(), SnapshotError>,
     {
-        let _lock = LockGuard::acquire(&self.root)?;
+        let _lock = self.lock()?;
         cleanup_orphan_temps(&self.root)?;
         let mut aggregate = self.load(now)?;
         if impossible_clock(&aggregate, now) {
-            let changed = fail_closed_for_clock(&mut aggregate);
+            let changed = fail_closed_for_clock(&mut aggregate, now);
             if changed {
                 self.write_aggregate(&aggregate)?;
             }
@@ -537,21 +592,27 @@ impl ClaudeSnapshotStore {
     }
 
     fn load(&self, now: DateTime<Utc>) -> Result<Aggregate, SnapshotError> {
-        let path = self.root.join(STATE_FILE);
-        let path_metadata = match fs::symlink_metadata(&path) {
+        self.verify_root()?;
+        #[cfg(unix)]
+        return self.load_from_pinned_root(now);
+        #[cfg(not(unix))]
+        return Err(SnapshotError::Unsupported);
+    }
+
+    #[cfg(unix)]
+    fn load_from_pinned_root(&self, now: DateTime<Utc>) -> Result<Aggregate, SnapshotError> {
+        let path_metadata = match child_metadata(&self.root_dir, STATE_FILE) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Aggregate::empty(now))
-            }
-            Err(_) => return Err(SnapshotError::Io),
+            Err(SnapshotError::NotFound) => return Ok(Aggregate::empty(now)),
+            Err(error) => return Err(error),
         };
-        if path_metadata.file_type().is_symlink() {
+        if path_metadata.is_symlink() {
             return Err(SnapshotError::InvalidState);
         }
-        let mut file = open_private_existing(&path)?;
+        let mut file = open_child_existing(&self.root_dir, STATE_FILE)?;
         let metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
         validate_open_regular_owned(&metadata, 0o600)?;
-        if !same_file_identity(&path_metadata, &metadata) {
+        if !path_metadata.matches(&metadata) {
             return Err(SnapshotError::InvalidState);
         }
         if metadata.len() > MAX_FILE_BYTES {
@@ -572,21 +633,56 @@ impl ClaudeSnapshotStore {
     }
 
     fn write_aggregate(&self, aggregate: &Aggregate) -> Result<(), SnapshotError> {
+        self.verify_root()?;
+        #[cfg(unix)]
+        return self.write_to_pinned_root(aggregate);
+        #[cfg(not(unix))]
+        return Err(SnapshotError::Unsupported);
+    }
+
+    #[cfg(unix)]
+    fn write_to_pinned_root(&self, aggregate: &Aggregate) -> Result<(), SnapshotError> {
         let bytes = serde_json::to_vec(aggregate).map_err(|_| SnapshotError::InvalidState)?;
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err(SnapshotError::InvalidState);
         }
-        let temp = self.root.join(format!(
-            "{TEMP_PREFIX}{}-{}",
-            std::process::id(),
-            Uuid::new_v4()
-        ));
-        let mut file = open_private_new(&temp)?;
+        let temp = format!("{TEMP_PREFIX}{}-{}", std::process::id(), Uuid::new_v4());
+        let mut file = open_child_new(&self.root_dir, &temp)?;
         file.write_all(&bytes).map_err(|_| SnapshotError::Io)?;
         file.sync_all().map_err(|_| SnapshotError::Io)?;
-        drop(file);
-        fs::rename(&temp, self.root.join(STATE_FILE)).map_err(|_| SnapshotError::Io)?;
-        sync_directory(&self.root)?;
+        pause_after_temp_fsync(&self.root, &temp);
+        let path_metadata = child_metadata(&self.root_dir, &temp)?;
+        let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        if !path_metadata.matches(&file_metadata) {
+            return Err(SnapshotError::InvalidState);
+        }
+        rename_child(&self.root_dir, &temp, STATE_FILE)?;
+        self.root_dir.sync_all().map_err(|_| SnapshotError::Io)?;
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<LockGuard, SnapshotError> {
+        self.verify_root()?;
+        #[cfg(unix)]
+        {
+            return LockGuard::acquire(&self.root_dir);
+        }
+        #[cfg(not(unix))]
+        Err(SnapshotError::Unsupported)
+    }
+
+    fn verify_root(&self) -> Result<(), SnapshotError> {
+        #[cfg(unix)]
+        {
+            let path_metadata = fs::symlink_metadata(&self.root).map_err(|_| SnapshotError::Io)?;
+            let descriptor_metadata = self.root_dir.metadata().map_err(|_| SnapshotError::Io)?;
+            validate_open_directory_owned(&descriptor_metadata)?;
+            if path_metadata.file_type().is_symlink()
+                || !same_file_identity(&path_metadata, &descriptor_metadata)
+            {
+                return Err(SnapshotError::InvalidState);
+            }
+        }
         Ok(())
     }
 }
@@ -598,6 +694,7 @@ pub(crate) enum SnapshotError {
     Rejected,
     Io,
     Unsupported,
+    NotFound,
 }
 
 fn safe_alias(alias: &str) -> bool {
@@ -665,11 +762,17 @@ fn impossible_clock(aggregate: &Aggregate, now: DateTime<Utc>) -> bool {
             })
 }
 
-fn fail_closed_for_clock(aggregate: &mut Aggregate) -> bool {
+fn fail_closed_for_clock(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
+    let aggregate_rollback = now + ROLLBACK_TOLERANCE < aggregate.last_evaluated_wall_time;
     let mut changed = false;
     for slot in &mut aggregate.slots {
         for window in &mut slot.windows {
-            if window.used_percent.take().is_some() || !window.terminal_expired {
+            let window_rollback = window
+                .received_at
+                .is_some_and(|received| now + ROLLBACK_TOLERANCE < received);
+            if (aggregate_rollback || window_rollback)
+                && (window.used_percent.take().is_some() || !window.terminal_expired)
+            {
                 window.terminal_expired = true;
                 window.last_error_code = Some(SafeErrorCode::ClockRollback);
                 changed = true;
@@ -787,6 +890,119 @@ fn validate_directory_owned(path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
+fn validate_open_directory_owned(metadata: &fs::Metadata) -> Result<(), SnapshotError> {
+    if !metadata.file_type().is_dir() {
+        return Err(SnapshotError::InvalidState);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(SnapshotError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> Result<File, SnapshotError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| SnapshotError::Io)?;
+    validate_open_directory_owned(&file.metadata().map_err(|_| SnapshotError::Io)?)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+struct ChildMetadata {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl ChildMetadata {
+    fn is_symlink(&self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32
+    }
+
+    fn matches(&self, metadata: &fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.dev == metadata.dev() && self.ino == metadata.ino()
+    }
+}
+
+#[cfg(unix)]
+fn child_metadata(root: &File, name: &str) -> Result<ChildMetadata, SnapshotError> {
+    let name = CString::new(name).map_err(|_| SnapshotError::InvalidInput)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Err(SnapshotError::NotFound)
+        } else {
+            Err(SnapshotError::Io)
+        };
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(ChildMetadata {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+        mode: stat.st_mode as u32,
+    })
+}
+
+#[cfg(unix)]
+fn open_child_existing(root: &File, name: &str) -> Result<File, SnapshotError> {
+    openat(root, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
+}
+
+#[cfg(unix)]
+fn open_child_new(root: &File, name: &str) -> Result<File, SnapshotError> {
+    openat(
+        root,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        0o600,
+    )
+}
+
+#[cfg(unix)]
+fn openat(root: &File, name: &str, flags: i32, mode: u32) -> Result<File, SnapshotError> {
+    let name = CString::new(name).map_err(|_| SnapshotError::InvalidInput)?;
+    let fd = unsafe { libc::openat(root.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(SnapshotError::Io);
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn rename_child(root: &File, from: &str, to: &str) -> Result<(), SnapshotError> {
+    let from = CString::new(from).map_err(|_| SnapshotError::InvalidInput)?;
+    let to = CString::new(to).map_err(|_| SnapshotError::InvalidInput)?;
+    if unsafe {
+        libc::renameat(
+            root.as_raw_fd(),
+            from.as_ptr(),
+            root.as_raw_fd(),
+            to.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(SnapshotError::Io);
+    }
+    Ok(())
+}
+
 fn validate_regular_owned(path: &Path, expected_mode: u32) -> Result<(), SnapshotError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| SnapshotError::Io)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -889,27 +1105,21 @@ struct LockGuard {
     file: File,
 }
 impl LockGuard {
-    fn acquire(root: &Path) -> Result<Self, SnapshotError> {
-        let path = root.join(LOCK_FILE);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options.open(&path).map_err(|_| SnapshotError::Io)?;
-        #[cfg(unix)]
+    #[cfg(unix)]
+    fn acquire(root: &File) -> Result<Self, SnapshotError> {
+        let file = match openat(
+            root,
+            LOCK_FILE,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+            0o600,
+        ) {
+            Ok(file) => file,
+            Err(_) => return Err(SnapshotError::Io),
+        };
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .map_err(|_| SnapshotError::Io)?;
-        let path_metadata = fs::symlink_metadata(&path).map_err(|_| SnapshotError::Io)?;
         let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
         validate_open_regular_owned(&file_metadata, 0o600)?;
-        if path_metadata.file_type().is_symlink()
-            || !same_file_identity(&path_metadata, &file_metadata)
-        {
-            return Err(SnapshotError::InvalidState);
-        }
         #[cfg(unix)]
         {
             if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) }
@@ -917,6 +1127,10 @@ impl LockGuard {
             {
                 return Err(SnapshotError::Io);
             }
+        }
+        let path_metadata = child_metadata(root, LOCK_FILE)?;
+        if path_metadata.is_symlink() || !path_metadata.matches(&file_metadata) {
+            return Err(SnapshotError::InvalidState);
         }
         Ok(Self { file })
     }
@@ -1551,7 +1765,7 @@ mod tests {
             .join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
         let _file = open_private_new(&temp).unwrap();
         drop(_file);
-        let _lock = LockGuard::acquire(&s.root).unwrap();
+        let _lock = s.lock().unwrap();
         cleanup_orphan_temps(&s.root).unwrap();
         assert!(!temp.exists());
     }
@@ -1590,5 +1804,134 @@ mod tests {
         assert!(!debug.contains("77") && !debug.contains("88") && !debug.contains("123e"));
         let binding_debug = format!("{:?}", BindingId::generate());
         assert!(!binding_debug.contains('-'));
+    }
+
+    #[test]
+    fn read_side_received_at_rollback_persists_terminal_until_newer_observation() {
+        let path = root("read-rollback");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174016");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    42.0,
+                    Some(now() + Duration::hours(2)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.slots[0].windows[0].received_at = Some(now() + Duration::seconds(50));
+        overwrite_aggregate(&s, &aggregate);
+
+        let read_time = now() - Duration::seconds(20);
+        let projected = projection(&s, read_time);
+        assert_eq!(projected.five_hour.used_percent, None);
+        let terminal = s.load(now()).unwrap();
+        assert!(terminal.slots[0].windows[0].terminal_expired);
+        assert_eq!(terminal.last_evaluated_wall_time, now());
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        assert_eq!(projection(&restarted, now()).five_hour.used_percent, None);
+        assert!(restarted
+            .apply_observation(
+                available(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(WindowKind::FiveHour, 1.0, None)]
+                ),
+                read_time
+            )
+            .is_err());
+        restarted
+            .apply_observation(
+                available(
+                    id,
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        7.0,
+                        Some(now() + Duration::hours(3)),
+                    )],
+                ),
+                now() + Duration::minutes(2),
+            )
+            .unwrap();
+        assert_eq!(
+            projection(&restarted, now() + Duration::minutes(2))
+                .five_hour
+                .used_percent,
+            Some(7.0)
+        );
+    }
+
+    #[test]
+    fn uuid_variant_is_required_for_slot_and_binding_ids() {
+        for invalid in [
+            "123e4567-e89b-42d3-0456-426614174000",
+            "123e4567-e89b-42d3-c456-426614174000",
+            "123e4567-e89b-42d3-e456-426614174000",
+        ] {
+            assert!(AccountSlotId::parse(invalid).is_err());
+            assert!(!BindingId(invalid.into()).is_canonical());
+        }
+        let generated = Uuid::new_v4().hyphenated().to_string();
+        assert!(AccountSlotId::parse(generated.clone()).is_ok());
+        assert!(BindingId(generated).is_canonical());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_root_replacement_fails_closed_without_writing_replacement() {
+        let path = root("pinned-root");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174017");
+        register(&s, id, now());
+        let displaced = path.with_extension("displaced");
+        fs::rename(&path, &displaced).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+        assert!(!path.join(STATE_FILE).exists());
+    }
+
+    #[test]
+    fn temp_path_substitution_after_fsync_fails_closed() {
+        let s = std::sync::Arc::new(store("temp-substitution"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174018");
+        register(&s, id, now());
+        let aggregate = s.load(now()).unwrap();
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            reached: reached.clone(),
+            resume: resume.clone(),
+            temp_path: temp_path.clone(),
+        });
+        let writer = {
+            let s = s.clone();
+            std::thread::spawn(move || s.write_aggregate(&aggregate))
+        };
+        reached.wait();
+        let temp = temp_path.lock().unwrap().clone().unwrap();
+        let substitute = temp.with_extension("substitute");
+        fs::rename(&temp, &substitute).unwrap();
+        fs::write(&temp, b"substituted").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&temp, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        resume.wait();
+        assert!(writer.join().unwrap().is_err());
+        *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
     }
 }
