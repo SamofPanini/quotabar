@@ -1,5 +1,6 @@
 pub mod antigravity;
 pub mod claude;
+pub(crate) mod claude_snapshot;
 #[cfg(test)]
 mod claude_bridge;
 pub mod codex;
