@@ -620,7 +620,7 @@ impl ClaudeSnapshotStore {
         now: DateTime<Utc>,
     ) -> Result<ClaudeCurrentSnapshotsDto, SnapshotError> {
         let _lock = self.lock()?;
-        cleanup_orphan_temps(&self.root_dir)?;
+        self.cleanup_orphan_temps()?;
         let mut aggregate = self.load(now)?;
         if impossible_clock(&aggregate, now) {
             if fail_closed_for_clock(&mut aggregate, now) {
@@ -651,7 +651,7 @@ impl ClaudeSnapshotStore {
         F: FnOnce(&mut Aggregate) -> Result<(), SnapshotError>,
     {
         let _lock = self.lock()?;
-        cleanup_orphan_temps(&self.root_dir)?;
+        self.cleanup_orphan_temps()?;
         let mut aggregate = self.load(now)?;
         if impossible_clock(&aggregate, now) {
             let changed = fail_closed_for_clock(&mut aggregate, now);
@@ -744,6 +744,13 @@ impl ClaudeSnapshotStore {
         {
             return LockGuard::acquire(&self.root_dir, &self.root);
         }
+        #[cfg(not(unix))]
+        Err(SnapshotError::Unsupported)
+    }
+
+    fn cleanup_orphan_temps(&self) -> Result<(), SnapshotError> {
+        #[cfg(unix)]
+        return cleanup_orphan_temps(&self.root_dir);
         #[cfg(not(unix))]
         Err(SnapshotError::Unsupported)
     }
