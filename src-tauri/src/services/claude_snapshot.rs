@@ -407,12 +407,16 @@ impl Aggregate {
             }
             let mut kinds = std::collections::HashSet::new();
             for window in &slot.windows {
+                let numeric = window.used_percent.is_some();
                 if !kinds.insert(window.kind as u8)
                     || window
                         .used_percent
                         .is_some_and(|v| !v.is_finite() || !(0.0..=100.0).contains(&v))
                     || window.observed_at.is_some() != window.received_at.is_some()
-                    || (window.used_percent.is_some() && window.source.is_none())
+                    || (numeric
+                        && (!window.observed_at.is_some()
+                            || !window.received_at.is_some()
+                            || window.source.is_none()))
                     || (window.terminal_expired && window.used_percent.is_some())
                     || (!window.terminal_expired && window.used_percent.is_none())
                     || window.received_at.is_some_and(|received| {
@@ -421,11 +425,11 @@ impl Aggregate {
                 {
                     return Err(SnapshotError::InvalidState);
                 }
-                if let (Some(observed), Some(received), Some(reset)) =
-                    (window.observed_at, window.received_at, window.reset_at)
-                {
+                if let (Some(observed), Some(received)) = (window.observed_at, window.received_at) {
                     if observed > received + Duration::minutes(1)
-                        || reset < observed - Duration::minutes(1)
+                        || window
+                            .reset_at
+                            .is_some_and(|reset| reset < received - Duration::minutes(1))
                     {
                         return Err(SnapshotError::InvalidState);
                     }
@@ -505,6 +509,7 @@ impl ClaudeSnapshotStore {
     ) -> Result<(), SnapshotError> {
         observation.validate(received_at)?;
         self.mutate(received_at, |aggregate| {
+            let recovery_high_water = aggregate.last_evaluated_wall_time;
             let slot = aggregate
                 .slots
                 .iter_mut()
@@ -518,6 +523,19 @@ impl ClaudeSnapshotStore {
             }
             match observation.status {
                 ObservationStatus::Available => {
+                    if observation.windows.iter().any(|incoming| {
+                        slot.windows
+                            .iter()
+                            .find(|existing| existing.kind == incoming.kind)
+                            .is_some_and(|existing| {
+                                existing.terminal_expired
+                                    && existing.last_error_code
+                                        == Some(SafeErrorCode::ClockRollback)
+                                    && received_at <= recovery_floor(recovery_high_water, existing)
+                            })
+                    }) {
+                        return Err(SnapshotError::Rejected);
+                    }
                     for incoming in observation.windows {
                         let record = WindowRecord {
                             kind: incoming.kind,
@@ -660,9 +678,8 @@ impl ClaudeSnapshotStore {
             }
             return Err(SnapshotError::Rejected);
         }
-        project_expiry(&mut aggregate, now);
         change(&mut aggregate)?;
-        aggregate.last_evaluated_wall_time = aggregate.last_evaluated_wall_time.max(now);
+        project_expiry(&mut aggregate, now);
         aggregate.validate()?;
         self.write_aggregate(&aggregate)
     }
@@ -802,6 +819,12 @@ fn replace_window(windows: &mut Vec<WindowRecord>, record: WindowRecord) {
             WindowKind::Weekly => 1,
         });
     }
+}
+
+fn recovery_floor(high_water: DateTime<Utc>, window: &WindowRecord) -> DateTime<Utc> {
+    window
+        .received_at
+        .map_or(high_water, |received| high_water.max(received))
 }
 
 fn project_expiry(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
@@ -1326,6 +1349,17 @@ mod tests {
             windows,
             error_code: None,
         }
+    }
+    fn available_at(
+        id: AccountSlotId,
+        epoch: u64,
+        sequence: u64,
+        windows: Vec<ObservationWindow>,
+        observed_at: DateTime<Utc>,
+    ) -> ObservationEnvelopeV1 {
+        let mut observation = available(id, epoch, sequence, windows);
+        observation.observed_at = observed_at;
+        observation
     }
     fn window(kind: WindowKind, percent: f64, reset: Option<DateTime<Utc>>) -> ObservationWindow {
         ObservationWindow {
@@ -2004,6 +2038,232 @@ mod tests {
                 .five_hour
                 .used_percent,
             Some(7.0)
+        );
+    }
+
+    #[test]
+    fn clock_terminal_recovery_requires_strictly_later_aggregate_high_water() {
+        let path = root("clock-terminal-aggregate-floor");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174030");
+        let high_water = now() + Duration::minutes(10);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available_at(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    42.0,
+                    Some(high_water + Duration::hours(1)),
+                )],
+                high_water,
+            ),
+            high_water,
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, high_water - Duration::seconds(61))
+                .five_hour
+                .used_percent,
+            None
+        );
+
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        let before = fs::read(restarted.root.join(STATE_FILE)).unwrap();
+        let inside_floor = high_water - Duration::seconds(30);
+        assert_eq!(
+            restarted.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    inside_floor,
+                ),
+                inside_floor,
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(fs::read(restarted.root.join(STATE_FILE)).unwrap(), before);
+        assert_eq!(
+            projection(&restarted, high_water).five_hour.used_percent,
+            None
+        );
+
+        let recovered_at = high_water + Duration::minutes(2);
+        let terminal = restarted.load(recovered_at).unwrap();
+        assert_eq!(terminal.slots[0].next_sequence, 2);
+        assert_eq!(
+            recovery_floor(
+                terminal.last_evaluated_wall_time,
+                &terminal.slots[0].windows[0]
+            ),
+            high_water
+        );
+        assert!(!impossible_clock(&terminal, recovered_at));
+        assert!(
+            recovered_at
+                > recovery_floor(
+                    terminal.last_evaluated_wall_time,
+                    &terminal.slots[0].windows[0]
+                )
+        );
+        let recovery = available_at(
+            id,
+            1,
+            2,
+            vec![window(
+                WindowKind::FiveHour,
+                7.0,
+                Some(high_water + Duration::hours(2)),
+            )],
+            recovered_at,
+        );
+        assert!(recovery.validate(recovered_at).is_ok());
+        restarted.apply_observation(recovery, recovered_at).unwrap();
+        let recovered = restarted.load(recovered_at).unwrap();
+        assert_eq!(recovered.last_evaluated_wall_time, recovered_at);
+        assert_eq!(recovered.slots[0].next_sequence, 3);
+        assert_eq!(
+            projection(&restarted, recovered_at).five_hour.used_percent,
+            Some(7.0)
+        );
+    }
+
+    #[test]
+    fn clock_terminal_recovery_uses_later_persisted_receipt_floor() {
+        let s = store("clock-terminal-window-floor");
+        let id = slot("123e4567-e89b-42d3-a456-426614174031");
+        let high_water = now() + Duration::minutes(10);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available_at(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::Weekly,
+                    42.0,
+                    Some(high_water + Duration::hours(1)),
+                )],
+                high_water,
+            ),
+            high_water,
+        )
+        .unwrap();
+        let later_receipt = high_water + Duration::seconds(50);
+        let mut aggregate = s.load(high_water).unwrap();
+        aggregate.slots[0].windows[0].received_at = Some(later_receipt);
+        overwrite_aggregate(&s, &aggregate);
+        assert_eq!(
+            projection(&s, high_water - Duration::seconds(20))
+                .weekly
+                .used_percent,
+            None
+        );
+
+        let inside_window_floor = high_water + Duration::seconds(20);
+        assert_eq!(
+            s.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    inside_window_floor,
+                ),
+                inside_window_floor,
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        let recovered_at = later_receipt + Duration::seconds(1);
+        s.apply_observation(
+            available_at(
+                id,
+                1,
+                2,
+                vec![window(
+                    WindowKind::Weekly,
+                    7.0,
+                    Some(high_water + Duration::hours(2)),
+                )],
+                recovered_at,
+            ),
+            recovered_at,
+        )
+        .unwrap();
+        assert_eq!(projection(&s, recovered_at).weekly.used_percent, Some(7.0));
+    }
+
+    #[test]
+    fn timeless_or_inconsistent_numeric_state_fails_closed_without_rewrite() {
+        let s = store("timeless-numeric");
+        let id = slot("123e4567-e89b-42d3-a456-426614174032");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(id, 1, 1, vec![window(WindowKind::FiveHour, 42.0, None)]),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(14))
+                .five_hour
+                .used_percent,
+            Some(42.0)
+        );
+
+        let valid = s.load(now()).unwrap();
+        for invalid in [
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].observed_at = None;
+                aggregate.slots[0].windows[0].received_at = None;
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].observed_at = None;
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].received_at = None;
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].observed_at = Some(now() + Duration::minutes(2));
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].reset_at = Some(now() - Duration::minutes(2));
+                aggregate
+            },
+        ] {
+            overwrite_aggregate(&s, &invalid);
+            let bytes = fs::read(s.root.join(STATE_FILE)).unwrap();
+            assert_eq!(invalid.validate(), Err(SnapshotError::InvalidState));
+            assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+            assert_eq!(fs::read(s.root.join(STATE_FILE)).unwrap(), bytes);
+        }
+
+        overwrite_aggregate(&s, &valid);
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(16))
+                .five_hour
+                .used_percent,
+            None
         );
     }
 
