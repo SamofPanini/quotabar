@@ -3433,6 +3433,7 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
+ "uuid",
 ]
 
 [[package]]

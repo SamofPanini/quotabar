@@ -12,6 +12,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
+use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -36,19 +37,10 @@ impl fmt::Debug for AccountSlotId {
 impl AccountSlotId {
     pub(crate) fn parse(value: impl Into<String>) -> Result<Self, SnapshotError> {
         let value = value.into();
-        let bytes = value.as_bytes();
-        let valid = bytes.len() == 36
-            && [8, 13, 18, 23]
-                .into_iter()
-                .all(|index| bytes[index] == b'-')
-            && bytes.iter().enumerate().all(|(index, byte)| {
-                [8, 13, 18, 23].contains(&index)
-                    || byte.is_ascii_digit()
-                    || (b'a'..=b'f').contains(byte)
-            })
-            && bytes[14] == b'4';
-        valid
-            .then_some(Self(value))
+        Uuid::parse_str(&value)
+            .ok()
+            .filter(|uuid| uuid.get_version_num() == 4 && uuid.hyphenated().to_string() == value)
+            .map(|_| Self(value))
             .ok_or(SnapshotError::InvalidInput)
     }
 }
@@ -98,7 +90,7 @@ pub(crate) enum SafeErrorCode {
     ClockRollback,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ObservationEnvelopeV1 {
     pub(crate) slot_id: AccountSlotId,
     pub(crate) binding_epoch: u64,
@@ -108,6 +100,12 @@ pub(crate) struct ObservationEnvelopeV1 {
     pub(crate) source: Option<SourceClass>,
     pub(crate) windows: Vec<ObservationWindow>,
     pub(crate) error_code: Option<SafeErrorCode>,
+}
+
+impl fmt::Debug for ObservationEnvelopeV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ObservationEnvelopeV1(<redacted>)")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,11 +205,33 @@ struct SlotState {
     slot_id: AccountSlotId,
     alias: String,
     plan: Option<PlanMetadata>,
-    binding_id: String,
+    binding_id: Option<BindingId>,
     binding_state: BindingState,
     binding_epoch: u64,
     next_sequence: u64,
     windows: Vec<WindowRecord>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct BindingId(String);
+
+impl BindingId {
+    fn generate() -> Self {
+        Self(Uuid::new_v4().hyphenated().to_string())
+    }
+
+    fn is_canonical(&self) -> bool {
+        Uuid::parse_str(&self.0).ok().is_some_and(|value| {
+            value.get_version_num() == 4 && value.hyphenated().to_string() == self.0
+        })
+    }
+}
+
+impl fmt::Debug for BindingId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BindingId(<opaque>)")
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -240,20 +260,58 @@ impl Aggregate {
         if self.schema_version != SCHEMA_VERSION || self.slots.len() > MAX_SLOTS {
             return Err(SnapshotError::InvalidState);
         }
+        let mut ids = std::collections::HashSet::new();
         for slot in &self.slots {
-            if !safe_alias(&slot.alias)
+            if AccountSlotId::parse(slot.slot_id.0.clone()).is_err()
+                || !ids.insert(slot.slot_id.0.clone())
+                || !safe_alias(&slot.alias)
                 || slot.binding_epoch == 0
                 || slot.next_sequence == 0
                 || slot.windows.len() > 2
-                || slot.windows.iter().enumerate().any(|(index, window)| {
-                    (index == 1 && slot.windows[0].kind != WindowKind::FiveHour)
-                        || (index == 1 && window.kind != WindowKind::Weekly)
-                        || window.used_percent.is_some_and(|value| {
-                            !value.is_finite() || !(0.0..=100.0).contains(&value)
-                        })
-                })
             {
                 return Err(SnapshotError::InvalidState);
+            }
+            match slot.binding_state {
+                BindingState::Bound => {
+                    if !slot
+                        .binding_id
+                        .as_ref()
+                        .is_some_and(BindingId::is_canonical)
+                    {
+                        return Err(SnapshotError::InvalidState);
+                    }
+                }
+                BindingState::Unbound | BindingState::Unverified | BindingState::Error => {
+                    if slot.binding_id.is_some() || !slot.windows.is_empty() {
+                        return Err(SnapshotError::InvalidState);
+                    }
+                }
+            }
+            let mut kinds = std::collections::HashSet::new();
+            for window in &slot.windows {
+                if !kinds.insert(window.kind as u8)
+                    || window
+                        .used_percent
+                        .is_some_and(|v| !v.is_finite() || !(0.0..=100.0).contains(&v))
+                    || window.observed_at.is_some() != window.received_at.is_some()
+                    || (window.used_percent.is_some() && window.source.is_none())
+                    || (window.terminal_expired && window.used_percent.is_some())
+                    || (!window.terminal_expired && window.used_percent.is_none())
+                    || window.received_at.is_some_and(|received| {
+                        received > self.last_evaluated_wall_time + Duration::minutes(1)
+                    })
+                {
+                    return Err(SnapshotError::InvalidState);
+                }
+                if let (Some(observed), Some(received), Some(reset)) =
+                    (window.observed_at, window.received_at, window.reset_at)
+                {
+                    if observed > received + Duration::minutes(1)
+                        || reset < observed - Duration::minutes(1)
+                    {
+                        return Err(SnapshotError::InvalidState);
+                    }
+                }
             }
         }
         Ok(())
@@ -266,13 +324,21 @@ pub(crate) struct ClaudeSnapshotStore {
 
 impl ClaudeSnapshotStore {
     pub(crate) fn in_app_config(config_dir: &Path) -> Result<Self, SnapshotError> {
+        validate_no_symlink_ancestors(config_dir)?;
+        let config_dir = config_dir.canonicalize().map_err(|_| SnapshotError::Io)?;
         let root = config_dir.join("claude-current-state");
         Self::at_root(root)
     }
 
     pub(crate) fn at_root(root: PathBuf) -> Result<Self, SnapshotError> {
+        platform_supported()?;
+        let parent = root.parent().ok_or(SnapshotError::InvalidInput)?;
+        let name = root.file_name().ok_or(SnapshotError::InvalidInput)?;
+        let root = parent
+            .canonicalize()
+            .map_err(|_| SnapshotError::Io)?
+            .join(name);
         ensure_root(&root)?;
-        cleanup_orphan_temps(&root)?;
         Ok(Self { root })
     }
 
@@ -281,10 +347,9 @@ impl ClaudeSnapshotStore {
         slot_id: AccountSlotId,
         alias: String,
         plan: Option<PlanMetadata>,
-        binding_id: String,
         now: DateTime<Utc>,
     ) -> Result<(), SnapshotError> {
-        if !safe_alias(&alias) || binding_id.is_empty() || binding_id.len() > 128 {
+        if !safe_alias(&alias) {
             return Err(SnapshotError::InvalidInput);
         }
         self.mutate(now, |aggregate| {
@@ -297,7 +362,7 @@ impl ClaudeSnapshotStore {
                 slot_id,
                 alias,
                 plan,
-                binding_id,
+                binding_id: Some(BindingId::generate()),
                 binding_state: BindingState::Bound,
                 binding_epoch: 1,
                 next_sequence: 1,
@@ -366,17 +431,60 @@ impl ClaudeSnapshotStore {
                 .iter_mut()
                 .find(|slot| &slot.slot_id == slot_id)
                 .ok_or(SnapshotError::InvalidInput)?;
-            slot.binding_epoch = slot
-                .binding_epoch
-                .checked_add(1)
-                .ok_or(SnapshotError::Rejected)?;
+            if slot.binding_state != BindingState::Unverified {
+                slot.binding_epoch = slot
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or(SnapshotError::Rejected)?;
+            }
             slot.next_sequence = 1;
             slot.binding_state = BindingState::Unverified;
-            for window in &mut slot.windows {
-                window.used_percent = None;
-                window.terminal_expired = true;
-                window.last_error_code = Some(SafeErrorCode::Unavailable);
+            slot.binding_id = None;
+            slot.windows.clear();
+            Ok(())
+        })
+    }
+
+    pub(crate) fn rebind(
+        &self,
+        slot_id: &AccountSlotId,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            if slot.binding_state != BindingState::Unverified {
+                slot.binding_epoch = slot
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or(SnapshotError::Rejected)?;
             }
+            slot.binding_id = Some(BindingId::generate());
+            slot.binding_state = BindingState::Bound;
+            slot.next_sequence = 1;
+            slot.windows.clear();
+            Ok(())
+        })
+    }
+
+    pub(crate) fn unpair(
+        &self,
+        slot_id: &AccountSlotId,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            slot.binding_id = None;
+            slot.binding_state = BindingState::Unbound;
+            slot.next_sequence = 1;
+            slot.windows.clear();
             Ok(())
         })
     }
@@ -386,6 +494,7 @@ impl ClaudeSnapshotStore {
         now: DateTime<Utc>,
     ) -> Result<ClaudeCurrentSnapshotsDto, SnapshotError> {
         let _lock = LockGuard::acquire(&self.root)?;
+        cleanup_orphan_temps(&self.root)?;
         let mut aggregate = self.load(now)?;
         let changed = project_expiry(&mut aggregate, now);
         if changed {
@@ -411,30 +520,53 @@ impl ClaudeSnapshotStore {
         F: FnOnce(&mut Aggregate) -> Result<(), SnapshotError>,
     {
         let _lock = LockGuard::acquire(&self.root)?;
+        cleanup_orphan_temps(&self.root)?;
         let mut aggregate = self.load(now)?;
+        if impossible_clock(&aggregate, now) {
+            let changed = fail_closed_for_clock(&mut aggregate);
+            if changed {
+                self.write_aggregate(&aggregate)?;
+            }
+            return Err(SnapshotError::Rejected);
+        }
         project_expiry(&mut aggregate, now);
         change(&mut aggregate)?;
-        aggregate.last_evaluated_wall_time = now;
+        aggregate.last_evaluated_wall_time = aggregate.last_evaluated_wall_time.max(now);
         aggregate.validate()?;
         self.write_aggregate(&aggregate)
     }
 
     fn load(&self, now: DateTime<Utc>) -> Result<Aggregate, SnapshotError> {
         let path = self.root.join(STATE_FILE);
-        if fs::symlink_metadata(&path).is_err() {
-            return Ok(Aggregate::empty(now));
+        let path_metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Aggregate::empty(now))
+            }
+            Err(_) => return Err(SnapshotError::Io),
+        };
+        if path_metadata.file_type().is_symlink() {
+            return Err(SnapshotError::InvalidState);
         }
-        validate_regular_owned(&path, 0o600)?;
-        let metadata = fs::metadata(&path).map_err(|_| SnapshotError::Io)?;
+        let mut file = open_private_existing(&path)?;
+        let metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        validate_open_regular_owned(&metadata, 0o600)?;
+        if !same_file_identity(&path_metadata, &metadata) {
+            return Err(SnapshotError::InvalidState);
+        }
         if metadata.len() > MAX_FILE_BYTES {
             return Err(SnapshotError::InvalidState);
         }
-        let mut content = String::with_capacity(metadata.len() as usize);
-        open_private_existing(&path)?
-            .read_to_string(&mut content)
+        let mut content = Vec::with_capacity(metadata.len() as usize + 1);
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut content)
             .map_err(|_| SnapshotError::Io)?;
+        if content.len() as u64 > MAX_FILE_BYTES {
+            return Err(SnapshotError::InvalidState);
+        }
         let aggregate: Aggregate =
-            serde_json::from_str(&content).map_err(|_| SnapshotError::InvalidState)?;
+            serde_json::from_slice(&content).map_err(|_| SnapshotError::InvalidState)?;
         aggregate.validate()?;
         Ok(aggregate)
     }
@@ -444,9 +576,11 @@ impl ClaudeSnapshotStore {
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err(SnapshotError::InvalidState);
         }
-        let temp = self
-            .root
-            .join(format!("{TEMP_PREFIX}{}", std::process::id()));
+        let temp = self.root.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         let mut file = open_private_new(&temp)?;
         file.write_all(&bytes).map_err(|_| SnapshotError::Io)?;
         file.sync_all().map_err(|_| SnapshotError::Io)?;
@@ -463,6 +597,7 @@ pub(crate) enum SnapshotError {
     InvalidState,
     Rejected,
     Io,
+    Unsupported,
 }
 
 fn safe_alias(alias: &str) -> bool {
@@ -517,6 +652,33 @@ fn project_expiry(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
     changed
 }
 
+fn impossible_clock(aggregate: &Aggregate, now: DateTime<Utc>) -> bool {
+    now + ROLLBACK_TOLERANCE < aggregate.last_evaluated_wall_time
+        || aggregate
+            .slots
+            .iter()
+            .flat_map(|slot| &slot.windows)
+            .any(|window| {
+                window
+                    .received_at
+                    .is_some_and(|received| now + ROLLBACK_TOLERANCE < received)
+            })
+}
+
+fn fail_closed_for_clock(aggregate: &mut Aggregate) -> bool {
+    let mut changed = false;
+    for slot in &mut aggregate.slots {
+        for window in &mut slot.windows {
+            if window.used_percent.take().is_some() || !window.terminal_expired {
+                window.terminal_expired = true;
+                window.last_error_code = Some(SafeErrorCode::ClockRollback);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 fn projection_for(slot: &SlotState, kind: WindowKind, now: DateTime<Utc>) -> WindowProjectionDto {
     if slot.binding_state != BindingState::Bound {
         return WindowProjectionDto {
@@ -567,6 +729,7 @@ fn projection_for(slot: &SlotState, kind: WindowKind, now: DateTime<Utc>) -> Win
 }
 
 fn ensure_root(root: &Path) -> Result<(), SnapshotError> {
+    validate_no_symlink_ancestors(root)?;
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => return Err(SnapshotError::InvalidState),
@@ -581,6 +744,32 @@ fn ensure_root(root: &Path) -> Result<(), SnapshotError> {
             .map_err(|_| SnapshotError::Io)?;
     }
     validate_directory_owned(root)
+}
+
+#[cfg(unix)]
+fn platform_supported() -> Result<(), SnapshotError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn platform_supported() -> Result<(), SnapshotError> {
+    // Current crash-safety depends on no-follow opens, descriptor checks, and
+    // advisory locking. Refuse persistence where those guarantees are absent.
+    Err(SnapshotError::Unsupported)
+}
+
+fn validate_no_symlink_ancestors(path: &Path) -> Result<(), SnapshotError> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(SnapshotError::InvalidState)
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(SnapshotError::Io),
+        }
+    }
+    Ok(())
 }
 
 fn validate_directory_owned(path: &Path) -> Result<(), SnapshotError> {
@@ -612,6 +801,35 @@ fn validate_regular_owned(path: &Path, expected_mode: u32) -> Result<(), Snapsho
         }
     }
     Ok(())
+}
+
+fn validate_open_regular_owned(
+    metadata: &fs::Metadata,
+    expected_mode: u32,
+) -> Result<(), SnapshotError> {
+    if !metadata.file_type().is_file() {
+        return Err(SnapshotError::InvalidState);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != expected_mode
+        {
+            return Err(SnapshotError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    false
 }
 
 fn open_private_new(path: &Path) -> Result<File, SnapshotError> {
@@ -649,12 +867,22 @@ fn sync_directory(path: &Path) -> Result<(), SnapshotError> {
 fn cleanup_orphan_temps(root: &Path) -> Result<(), SnapshotError> {
     for entry in fs::read_dir(root).map_err(|_| SnapshotError::Io)? {
         let entry = entry.map_err(|_| SnapshotError::Io)?;
-        if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+        if is_inactive_temp_name(&entry.file_name().to_string_lossy()) {
             validate_regular_owned(&entry.path(), 0o600)?;
             fs::remove_file(entry.path()).map_err(|_| SnapshotError::Io)?;
         }
     }
     Ok(())
+}
+
+fn is_inactive_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let Some((pid, nonce)) = rest.split_once('-') else {
+        return false;
+    };
+    pid.parse::<u32>().is_ok() && Uuid::parse_str(nonce).is_ok()
 }
 
 struct LockGuard {
@@ -674,7 +902,14 @@ impl LockGuard {
         #[cfg(unix)]
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .map_err(|_| SnapshotError::Io)?;
-        validate_regular_owned(&path, 0o600)?;
+        let path_metadata = fs::symlink_metadata(&path).map_err(|_| SnapshotError::Io)?;
+        let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        validate_open_regular_owned(&file_metadata, 0o600)?;
+        if path_metadata.file_type().is_symlink()
+            || !same_file_identity(&path_metadata, &file_metadata)
+        {
+            return Err(SnapshotError::InvalidState);
+        }
         #[cfg(unix)]
         {
             if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) }
@@ -723,13 +958,7 @@ mod tests {
     }
     fn register(store: &ClaudeSnapshotStore, id: AccountSlotId, now: DateTime<Utc>) {
         store
-            .register_slot(
-                id,
-                "safe".into(),
-                Some(PlanMetadata::Paid),
-                "internal-binding".into(),
-                now,
-            )
+            .register_slot(id, "safe".into(), Some(PlanMetadata::Paid), now)
             .unwrap();
     }
     fn available(
@@ -758,6 +987,21 @@ mod tests {
     }
     fn projection(store: &ClaudeSnapshotStore, now: DateTime<Utc>) -> ClaudeSlotProjectionDto {
         store.project(now).unwrap().slots.remove(0)
+    }
+
+    fn overwrite_aggregate(store: &ClaudeSnapshotStore, aggregate: &Aggregate) {
+        let path = store.root.join(STATE_FILE);
+        let bytes = serde_json::to_vec(aggregate).unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
     }
 
     #[test]
@@ -964,6 +1208,105 @@ mod tests {
         assert_eq!(p.binding_state, BindingState::Unverified);
         assert_eq!(p.five_hour.used_percent, None);
     }
+
+    #[test]
+    fn uncertainty_rebind_rejects_prior_epoch_and_accepts_new_epoch() {
+        let s = store("rebind");
+        let id = slot("123e4567-e89b-42d3-a456-42661417400e");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.mark_unverified(&id, now()).unwrap();
+        s.rebind(&id, now()).unwrap();
+        assert!(s
+            .apply_observation(
+                available(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        90.0,
+                        Some(now() + Duration::hours(1))
+                    )]
+                ),
+                now()
+            )
+            .is_err());
+        s.apply_observation(
+            available(
+                id,
+                2,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    30.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(projection(&s, now()).five_hour.used_percent, Some(30.0));
+    }
+
+    #[test]
+    fn rollback_next_sequence_is_rejected_and_terminal_state_survives_restart() {
+        let path = root("rollback-next");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-42661417400f");
+        register(&s, id.clone(), now());
+        let future = now() + Duration::hours(1);
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(future + Duration::hours(1)),
+                )],
+            ),
+            future,
+        )
+        .unwrap();
+        assert_eq!(
+            s.apply_observation(
+                available(
+                    id,
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        30.0,
+                        Some(future + Duration::hours(2))
+                    )]
+                ),
+                now()
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        let restarted = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        assert_eq!(projection(&restarted, future).five_hour.used_percent, None);
+        let restarted_again = ClaudeSnapshotStore::at_root(path).unwrap();
+        assert_eq!(
+            projection(&restarted_again, future).five_hour.used_percent,
+            None
+        );
+    }
     #[test]
     fn rollback_cannot_resurrect_after_reload() {
         let s = store("rollback");
@@ -1053,7 +1396,7 @@ mod tests {
             !json.contains("bindingId")
                 && !json.contains("bindingEpoch")
                 && !json.contains("sequence")
-                && !json.contains("internal-binding")
+                && !json.contains("BindingId")
         );
     }
     #[test]
@@ -1111,5 +1454,141 @@ mod tests {
         let restarted = ClaudeSnapshotStore::at_root(root).unwrap();
         let after = serde_json::to_string(&restarted.project(now()).unwrap()).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn repeated_sub_tolerance_calls_never_lower_high_water() {
+        let s = store("high-water");
+        let id = slot("123e4567-e89b-42d3-a456-426614174010");
+        let later = now() + Duration::minutes(5);
+        register(&s, id, later);
+        let high_water = s.load(later).unwrap().last_evaluated_wall_time;
+        for offset in [
+            Duration::seconds(1),
+            Duration::seconds(30),
+            Duration::seconds(59),
+        ] {
+            s.project(later - offset).unwrap();
+            assert_eq!(s.load(later).unwrap().last_evaluated_wall_time, high_water);
+        }
+    }
+
+    #[test]
+    fn unpair_is_atomic_and_retains_only_slot_metadata() {
+        let s = store("unpair");
+        let id = slot("123e4567-e89b-42d3-a456-426614174011");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::Weekly,
+                    20.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.unpair(&id, now()).unwrap();
+        let aggregate = s.load(now()).unwrap();
+        assert_eq!(aggregate.slots.len(), 1);
+        assert_eq!(aggregate.slots[0].binding_state, BindingState::Unbound);
+        assert!(aggregate.slots[0].binding_id.is_none());
+        assert!(aggregate.slots[0].windows.is_empty());
+    }
+
+    #[test]
+    fn invalid_structure_and_binding_id_fail_closed_without_overwrite() {
+        let s = store("invalid-state");
+        let id = slot("123e4567-e89b-42d3-a456-426614174012");
+        register(&s, id, now());
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.slots[0].binding_id = Some(BindingId("not-a-uuid".into()));
+        overwrite_aggregate(&s, &aggregate);
+        let before = fs::read(s.root.join(STATE_FILE)).unwrap();
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+        assert_eq!(fs::read(s.root.join(STATE_FILE)).unwrap(), before);
+    }
+
+    #[test]
+    fn duplicate_slot_and_terminal_value_conflict_are_rejected() {
+        let s = store("invalid-records");
+        let id = slot("123e4567-e89b-42d3-a456-426614174013");
+        register(&s, id, now());
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.slots.push(aggregate.slots[0].clone());
+        assert_eq!(aggregate.validate(), Err(SnapshotError::InvalidState));
+        aggregate.slots.pop();
+        aggregate.slots[0].windows.push(WindowRecord {
+            kind: WindowKind::Weekly,
+            used_percent: Some(1.0),
+            observed_at: Some(now()),
+            received_at: Some(now()),
+            reset_at: Some(now() + Duration::hours(1)),
+            source: Some(SourceClass::CompletionSse),
+            terminal_expired: true,
+            last_error_code: None,
+        });
+        assert_eq!(aggregate.validate(), Err(SnapshotError::InvalidState));
+    }
+
+    #[test]
+    fn malformed_json_and_precisely_named_orphan_fail_closed_or_cleanup_under_lock() {
+        let s = store("malformed-and-orphan");
+        let id = slot("123e4567-e89b-42d3-a456-426614174014");
+        register(&s, id, now());
+        let state = s.root.join(STATE_FILE);
+        fs::write(&state, b"{").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+
+        let temp = s
+            .root
+            .join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        let _file = open_private_new(&temp).unwrap();
+        drop(_file);
+        let _lock = LockGuard::acquire(&s.root).unwrap();
+        cleanup_orphan_temps(&s.root).unwrap();
+        assert!(!temp.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_app_config_and_final_state_component_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let parent = root("symlinks");
+        fs::create_dir_all(&parent).unwrap();
+        let config = parent.join("config");
+        fs::create_dir(&config).unwrap();
+        let linked = parent.join("linked-config");
+        symlink(&config, &linked).unwrap();
+        assert!(matches!(
+            ClaudeSnapshotStore::in_app_config(&linked),
+            Err(SnapshotError::InvalidState)
+        ));
+
+        let s = ClaudeSnapshotStore::at_root(parent.join("state")).unwrap();
+        let state = s.root.join(STATE_FILE);
+        symlink("missing-target", &state).unwrap();
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+    }
+
+    #[test]
+    fn debug_rendering_redacts_forbidden_internal_values() {
+        let envelope = available(
+            slot("123e4567-e89b-42d3-a456-426614174015"),
+            77,
+            88,
+            vec![window(WindowKind::Weekly, 9.0, None)],
+        );
+        let debug = format!("{envelope:?}");
+        assert!(!debug.contains("77") && !debug.contains("88") && !debug.contains("123e"));
+        let binding_debug = format!("{:?}", BindingId::generate());
+        assert!(!binding_debug.contains('-'));
     }
 }
