@@ -1511,6 +1511,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     static HOOK_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WORKER_PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static WORKER_JOINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
     }
@@ -1586,10 +1588,20 @@ mod tests {
             .unwrap();
     }
 
+    enum WorkerOutcome<T> {
+        Returned(T),
+        Panicked,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum WorkerFailure {
+        Panicked,
+    }
+
     struct GateWorker<T: Send + 'static> {
         resume: Option<std::sync::mpsc::Sender<()>>,
         completed: std::sync::mpsc::Receiver<()>,
-        handle: Option<std::thread::JoinHandle<T>>,
+        handle: Option<std::thread::JoinHandle<WorkerOutcome<T>>>,
     }
 
     impl<T: Send + 'static> GateWorker<T> {
@@ -1602,8 +1614,8 @@ mod tests {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
                 let _ = completed_tx.send(());
                 match result {
-                    Ok(value) => value,
-                    Err(payload) => std::panic::resume_unwind(payload),
+                    Ok(value) => WorkerOutcome::Returned(value),
+                    Err(_) => WorkerOutcome::Panicked,
                 }
             });
             Self {
@@ -1613,38 +1625,83 @@ mod tests {
             }
         }
 
+        fn release(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+
         fn wait_for_completion(&self) {
             self.completed
                 .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("worker did not complete within 5 seconds");
+                // Every test worker blocks only at a cancellable gate or behind
+                // a writer whose gate is released before this wait. A timeout
+                // cannot safely be joined in-process; abort avoids detaching it.
+                .unwrap_or_else(|_| std::process::abort());
         }
 
-        fn finish(mut self) -> std::thread::Result<T> {
-            if let Some(resume) = self.resume.take() {
-                resume.send(()).unwrap();
-            }
+        fn finish_after_release(mut self) -> Result<T, WorkerFailure> {
             self.wait_for_completion();
-            self.handle.take().unwrap().join()
+            WORKER_JOINS.fetch_add(1, Ordering::SeqCst);
+            match self.handle.take().unwrap().join().unwrap() {
+                WorkerOutcome::Returned(value) => Ok(value),
+                WorkerOutcome::Panicked => Err(WorkerFailure::Panicked),
+            }
+        }
+
+        fn finish(mut self) -> Result<T, WorkerFailure> {
+            self.release();
+            self.finish_after_release()
         }
     }
 
     impl<T: Send + 'static> Drop for GateWorker<T> {
         fn drop(&mut self) {
-            if let Some(resume) = self.resume.take() {
-                let _ = resume.send(());
+            if self.handle.is_none() {
+                return;
             }
-            let completed = self
-                .completed
-                .recv_timeout(std::time::Duration::from_secs(5));
+            self.release();
+            self.wait_for_completion();
             if let Some(handle) = self.handle.take() {
-                let result = handle.join();
-                if completed.is_err() && !std::thread::panicking() {
-                    panic!("worker did not complete within 5 seconds");
-                }
-                if result.is_err() && !std::thread::panicking() {
-                    panic!("worker panicked during test cleanup");
+                WORKER_JOINS.fetch_add(1, Ordering::SeqCst);
+                if matches!(handle.join().unwrap(), WorkerOutcome::Panicked) {
+                    WORKER_PANICS.fetch_add(1, Ordering::SeqCst);
                 }
             }
+        }
+    }
+
+    struct WorkerPair<W: Send + 'static, R: Send + 'static> {
+        writer: Option<GateWorker<W>>,
+        reader: Option<GateWorker<R>>,
+    }
+
+    impl<W: Send + 'static, R: Send + 'static> WorkerPair<W, R> {
+        fn new(writer: GateWorker<W>, reader: GateWorker<R>) -> Self {
+            Self {
+                writer: Some(writer),
+                reader: Some(reader),
+            }
+        }
+
+        fn finish(mut self) -> (Result<W, WorkerFailure>, Result<R, WorkerFailure>) {
+            self.writer.as_mut().unwrap().release();
+            self.reader.as_mut().unwrap().release();
+            let writer = self.writer.take().unwrap().finish_after_release();
+            let reader = self.reader.take().unwrap().finish_after_release();
+            (writer, reader)
+        }
+    }
+
+    impl<W: Send + 'static, R: Send + 'static> Drop for WorkerPair<W, R> {
+        fn drop(&mut self) {
+            if let Some(writer) = &mut self.writer {
+                writer.release();
+            }
+            if let Some(reader) = &mut self.reader {
+                reader.release();
+            }
+            // Dropping each owned worker acknowledges completion before joining.
         }
     }
 
@@ -1691,7 +1748,7 @@ mod tests {
     #[test]
     fn gate_worker_finish_surfaces_worker_panic_after_bounded_completion() {
         let worker = GateWorker::spawn(None, || -> () { panic!("controlled worker panic") });
-        assert!(worker.finish().is_err());
+        assert_eq!(worker.finish(), Err(WorkerFailure::Panicked));
     }
 
     fn seed_full_bound_state(s: &ClaudeSnapshotStore, id: AccountSlotId) -> Aggregate {
@@ -2506,41 +2563,82 @@ mod tests {
             None
         );
 
-        let inside_window_floor = high_water + Duration::seconds(20);
+        // The window receipt (H+50s), not aggregate high-water (H), is the
+        // distinct limiting floor for every later recovery attempt.
+        s.apply_observation(
+            ObservationEnvelopeV1 {
+                slot_id: id.clone(),
+                binding_epoch: 1,
+                sequence: 2,
+                observed_at: high_water - Duration::seconds(10),
+                status: ObservationStatus::Unavailable,
+                source: None,
+                windows: vec![],
+                error_code: Some(SafeErrorCode::Unavailable),
+            },
+            high_water - Duration::seconds(10),
+        )
+        .unwrap();
+        let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
+        restarted
+            .apply_observation(
+                ObservationEnvelopeV1 {
+                    slot_id: id.clone(),
+                    binding_epoch: 1,
+                    sequence: 3,
+                    observed_at: high_water,
+                    status: ObservationStatus::Unavailable,
+                    source: None,
+                    windows: vec![],
+                    error_code: Some(SafeErrorCode::Unavailable),
+                },
+                high_water,
+            )
+            .unwrap();
+        let before = fs::read(restarted.root.join(STATE_FILE)).unwrap();
         assert_eq!(
-            s.apply_observation(
+            restarted.apply_observation(
                 available_at(
                     id.clone(),
                     1,
-                    2,
+                    4,
                     vec![window(
                         WindowKind::Weekly,
                         7.0,
                         Some(high_water + Duration::hours(2)),
                     )],
-                    inside_window_floor,
+                    later_receipt,
                 ),
-                inside_window_floor,
+                later_receipt,
             ),
             Err(SnapshotError::Rejected)
         );
+        assert_eq!(fs::read(restarted.root.join(STATE_FILE)).unwrap(), before);
+        assert!(projection(&restarted, high_water)
+            .weekly
+            .used_percent
+            .is_none());
         let recovered_at = later_receipt + Duration::seconds(1);
-        s.apply_observation(
-            available_at(
-                id,
-                1,
-                2,
-                vec![window(
-                    WindowKind::Weekly,
-                    7.0,
-                    Some(high_water + Duration::hours(2)),
-                )],
+        restarted
+            .apply_observation(
+                available_at(
+                    id,
+                    1,
+                    4,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    recovered_at,
+                ),
                 recovered_at,
-            ),
-            recovered_at,
-        )
-        .unwrap();
-        assert_eq!(projection(&s, recovered_at).weekly.used_percent, Some(7.0));
+            )
+            .unwrap();
+        assert_eq!(
+            projection(&restarted, recovered_at).weekly.used_percent,
+            Some(7.0)
+        );
     }
 
     #[test]
@@ -2565,6 +2663,11 @@ mod tests {
             high_water,
         )
         .unwrap();
+        // Here aggregate high-water H is deliberately later than the window's
+        // persisted receipt, so H is the distinct limiting recovery floor.
+        let mut aggregate = s.load(high_water).unwrap();
+        aggregate.slots[0].windows[0].received_at = Some(high_water - Duration::seconds(30));
+        overwrite_aggregate(&s, &aggregate);
         s.project(high_water - Duration::seconds(61)).unwrap();
         s.apply_observation(
             ObservationEnvelopeV1 {
@@ -2982,6 +3085,7 @@ mod tests {
             let s = s.clone();
             move || s.project(now())
         });
+        let workers = WorkerPair::new(writer, reader);
         attempting_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2990,13 +3094,159 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         assert!(active.exists());
-        writer.finish().unwrap().unwrap();
+        let (writer, reader) = workers.finish();
+        writer.unwrap().unwrap();
         acquired_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        reader.finish().unwrap().unwrap();
+        reader.unwrap().unwrap();
         assert!(!active.exists());
         assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn active_temp_pair_releases_both_workers_on_early_return_and_coordinator_panic() {
+        for coordinator_panics in [false, true] {
+            let serial = HOOK_TEST_MUTEX.lock().unwrap();
+            let joins_before = WORKER_JOINS.load(Ordering::SeqCst);
+            let panics_before = WORKER_PANICS.load(Ordering::SeqCst);
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = TestHookScope;
+                let s = std::sync::Arc::new(store("active-temp-coordinator"));
+                let id = slot("123e4567-e89b-42d3-a456-426614174035");
+                register(&s, id, now());
+                let (gate, reached, resume) = test_gate();
+                let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+                *WRITE_TEST_HOOK
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .unwrap() = Some(WriteTestHook {
+                    root: s.root.clone(),
+                    gate,
+                    temp_path,
+                });
+                let writer = GateWorker::spawn(Some(resume), {
+                    let s = s.clone();
+                    move || {
+                        let result = s.mutate(now(), |_| Ok(()));
+                        if coordinator_panics {
+                            result.unwrap();
+                            panic!("controlled worker panic during coordinator unwind");
+                        }
+                        result
+                    }
+                });
+                reached
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+                let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+                *LOCK_ATTEMPT_TEST_HOOK
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .unwrap() = Some(LockAttemptTestHook {
+                    root: s.root.clone(),
+                    attempting: attempting_tx,
+                    acquired: acquired_tx,
+                });
+                let reader = GateWorker::spawn(None, {
+                    let s = s.clone();
+                    move || s.project(now())
+                });
+                let _pair = WorkerPair::new(writer, reader);
+                attempting_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                assert!(matches!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+                if coordinator_panics {
+                    panic!("controlled coordinator panic after reader pre-lock");
+                }
+            }));
+            if coordinator_panics {
+                assert!(unwind.is_err());
+            } else {
+                assert!(unwind.is_ok());
+            }
+            assert_eq!(WORKER_JOINS.load(Ordering::SeqCst), joins_before + 2);
+            let panics_after = WORKER_PANICS.load(Ordering::SeqCst);
+            if coordinator_panics {
+                assert!(panics_after > panics_before);
+            } else {
+                assert_eq!(panics_after, panics_before);
+            }
+            assert!(WRITE_TEST_HOOK.get().unwrap().lock().unwrap().is_none());
+            assert!(LOCK_ATTEMPT_TEST_HOOK
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_none());
+            drop(serial);
+            let _next_scope = HOOK_TEST_MUTEX.lock().unwrap();
+        }
+    }
+
+    #[test]
+    fn active_temp_pair_returns_writer_and_reader_panics_explicitly() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _scope = TestHookScope;
+        let s = std::sync::Arc::new(store("active-temp-worker-panics"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174036");
+        register(&s, id, now());
+        let (gate, reached, resume) = test_gate();
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            gate,
+            temp_path,
+        });
+        let writer = GateWorker::spawn(Some(resume), {
+            let s = s.clone();
+            move || {
+                s.mutate(now(), |_| Ok(())).unwrap();
+                panic!("controlled writer panic")
+            }
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        *LOCK_ATTEMPT_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(LockAttemptTestHook {
+            root: s.root.clone(),
+            attempting: attempting_tx,
+            acquired: acquired_tx,
+        });
+        let reader = GateWorker::spawn(None, {
+            let s = s.clone();
+            move || {
+                s.project(now()).unwrap();
+                panic!("controlled reader panic")
+            }
+        });
+        let workers = WorkerPair::new(writer, reader);
+        attempting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let (writer, reader) = workers.finish();
+        assert_eq!(writer, Err(WorkerFailure::Panicked));
+        assert_eq!(reader, Err(WorkerFailure::Panicked));
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
     }
 
     #[test]
