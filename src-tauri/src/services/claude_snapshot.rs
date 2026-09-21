@@ -16,7 +16,7 @@ use uuid::{Uuid, Variant};
 
 #[cfg(unix)]
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
 };
 
@@ -84,8 +84,52 @@ static LOCK_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, Tes
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+#[derive(Clone)]
+struct LockAttemptTestHook {
+    root: PathBuf,
+    attempting: std::sync::mpsc::Sender<()>,
+    acquired: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+static LOCK_ATTEMPT_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LockAttemptTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
 static POST_COMMIT_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, TestGate)>>> =
     std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupFault {
+    ReaddirErrorAfterDirectoryOpen,
+}
+
+#[cfg(test)]
+static CLEANUP_TEST_FAULT: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, CleanupFault)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static ACTIVE_DIRECTORY_STREAMS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn cleanup_test_fault(root: &Path, stage: CleanupFault) -> Result<(), SnapshotError> {
+    let fault = CLEANUP_TEST_FAULT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take();
+    if fault.is_some_and(|(fault_root, fault_stage)| fault_root == root && fault_stage == stage) {
+        return Err(SnapshotError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn active_directory_streams() -> usize {
+    ACTIVE_DIRECTORY_STREAMS.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 #[cfg(test)]
 fn pause_after_temp_fsync(root: &Path, name: &str) {
@@ -113,6 +157,30 @@ fn pause_after_lock_open(root: &Path) {
 }
 
 #[cfg(test)]
+fn signal_lock_attempt(root: &Path) {
+    let hook = LOCK_ATTEMPT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.root == root) {
+        hook.attempting.send(()).expect("test coordinator dropped");
+    }
+}
+
+#[cfg(test)]
+fn signal_lock_acquired(root: &Path) {
+    let hook = LOCK_ATTEMPT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.root == root) {
+        hook.acquired.send(()).expect("test coordinator dropped");
+    }
+}
+
+#[cfg(test)]
 fn pause_after_commit(root: &Path) -> Result<(), SnapshotError> {
     let hook = POST_COMMIT_TEST_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -128,6 +196,10 @@ fn pause_after_commit(root: &Path) -> Result<(), SnapshotError> {
 
 #[cfg(not(test))]
 fn pause_after_lock_open(_: &Path) {}
+#[cfg(not(test))]
+fn signal_lock_attempt(_: &Path) {}
+#[cfg(not(test))]
+fn signal_lock_acquired(_: &Path) {}
 
 #[cfg(not(test))]
 fn pause_after_temp_fsync(_: &Path, _: &str) {}
@@ -759,7 +831,10 @@ impl ClaudeSnapshotStore {
         self.verify_root()?;
         #[cfg(unix)]
         {
-            return LockGuard::acquire(&self.root_dir, &self.root);
+            signal_lock_attempt(&self.root);
+            let guard = LockGuard::acquire(&self.root_dir, &self.root)?;
+            signal_lock_acquired(&self.root);
+            return Ok(guard);
         }
         #[cfg(not(unix))]
         Err(SnapshotError::Unsupported)
@@ -767,7 +842,7 @@ impl ClaudeSnapshotStore {
 
     fn cleanup_orphan_temps(&self) -> Result<(), SnapshotError> {
         #[cfg(unix)]
-        return cleanup_orphan_temps(&self.root_dir);
+        return cleanup_orphan_temps(&self.root_dir, &self.root);
         #[cfg(not(unix))]
         Err(SnapshotError::Unsupported)
     }
@@ -1188,8 +1263,79 @@ fn sync_directory(path: &Path) -> Result<(), SnapshotError> {
 }
 
 #[cfg(unix)]
-fn cleanup_orphan_temps(root: &File) -> Result<(), SnapshotError> {
-    use std::ffi::CStr;
+struct DirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl DirectoryStream {
+    fn from_fd(fd: std::os::unix::io::RawFd) -> Result<Self, SnapshotError> {
+        let directory = unsafe { libc::fdopendir(fd) };
+        if directory.is_null() {
+            unsafe { libc::close(fd) };
+            return Err(SnapshotError::Io);
+        }
+        #[cfg(test)]
+        ACTIVE_DIRECTORY_STREAMS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Self(directory))
+    }
+
+    fn next_name(&mut self) -> Result<Option<&CStr>, SnapshotError> {
+        clear_readdir_errno()?;
+        let entry = unsafe { libc::readdir(self.0) };
+        if entry.is_null() {
+            return if readdir_errno()? == 0 {
+                Ok(None)
+            } else {
+                Err(SnapshotError::Io)
+            };
+        }
+        Ok(Some(unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::closedir(self.0) };
+        #[cfg(test)]
+        ACTIVE_DIRECTORY_STREAMS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn readdir_errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn readdir_errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn clear_readdir_errno() -> Result<(), SnapshotError> {
+    unsafe { *readdir_errno_pointer() = 0 };
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn readdir_errno() -> Result<libc::c_int, SnapshotError> {
+    Ok(unsafe { *readdir_errno_pointer() })
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn clear_readdir_errno() -> Result<(), SnapshotError> {
+    Err(SnapshotError::Unsupported)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn readdir_errno() -> Result<libc::c_int, SnapshotError> {
+    Err(SnapshotError::Unsupported)
+}
+
+#[cfg(unix)]
+fn cleanup_orphan_temps(root: &File, root_path: &Path) -> Result<(), SnapshotError> {
+    #[cfg(not(test))]
+    let _ = root_path;
 
     // Open "." relative to the pinned descriptor. Unlike dup(2), this gives
     // enumeration an independent directory-stream offset while preserving the
@@ -1200,18 +1346,13 @@ fn cleanup_orphan_temps(root: &File) -> Result<(), SnapshotError> {
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
         0,
     )?;
-    let duplicate = duplicate.into_raw_fd();
-    let directory = unsafe { libc::fdopendir(duplicate) };
-    if directory.is_null() {
-        unsafe { libc::close(duplicate) };
-        return Err(SnapshotError::Io);
-    }
+    let mut directory = DirectoryStream::from_fd(duplicate.into_raw_fd())?;
+    #[cfg(test)]
+    cleanup_test_fault(root_path, CleanupFault::ReaddirErrorAfterDirectoryOpen)?;
     loop {
-        let entry = unsafe { libc::readdir(directory) };
-        if entry.is_null() {
+        let Some(name) = directory.next_name()? else {
             break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        };
         let Ok(name) = name.to_str() else { continue };
         if name == "." || name == ".." || !is_inactive_temp_name(name) {
             continue;
@@ -1228,23 +1369,18 @@ fn cleanup_orphan_temps(root: &File) -> Result<(), SnapshotError> {
         let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
         validate_open_regular_owned(&file_metadata, 0o600)?;
         if !path_metadata.matches(&file_metadata) {
-            unsafe { libc::closedir(directory) };
             return Err(SnapshotError::InvalidState);
         }
         let name = CString::new(name).map_err(|_| SnapshotError::InvalidInput)?;
         if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-            unsafe { libc::closedir(directory) };
             return Err(SnapshotError::Io);
         }
-    }
-    if unsafe { libc::closedir(directory) } != 0 {
-        return Err(SnapshotError::Io);
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn cleanup_orphan_temps(_: &File) -> Result<(), SnapshotError> {
+fn cleanup_orphan_temps(_: &File, _: &Path) -> Result<(), SnapshotError> {
     Err(SnapshotError::Unsupported)
 }
 
@@ -1255,7 +1391,23 @@ fn is_inactive_temp_name(name: &str) -> bool {
     let Some((pid, nonce)) = rest.split_once('-') else {
         return false;
     };
-    pid.parse::<u32>().is_ok() && Uuid::parse_str(nonce).is_ok()
+    if pid.is_empty()
+        || (pid.len() > 1 && pid.starts_with('0'))
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    if pid == 0 || pid.to_string() != rest.split_once('-').expect("checked above").0 {
+        return false;
+    }
+    Uuid::parse_str(nonce).ok().is_some_and(|uuid| {
+        uuid.get_version_num() == 4
+            && uuid.get_variant() == Variant::RFC4122
+            && uuid.hyphenated().to_string() == nonce
+    })
 }
 
 struct LockGuard {
@@ -1312,6 +1464,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    static HOOK_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
     }
@@ -1385,6 +1538,87 @@ mod tests {
         #[cfg(unix)]
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
+    }
+
+    struct GateWorker<T> {
+        resume: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<std::thread::JoinHandle<T>>,
+    }
+
+    impl<T> GateWorker<T> {
+        fn new(resume: std::sync::mpsc::Sender<()>, handle: std::thread::JoinHandle<T>) -> Self {
+            Self {
+                resume: Some(resume),
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> std::thread::Result<T> {
+            self.resume.take().unwrap().send(()).unwrap();
+            self.handle.take().unwrap().join()
+        }
+    }
+
+    impl<T> Drop for GateWorker<T> {
+        fn drop(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    struct TestHookScope;
+
+    impl Drop for TestHookScope {
+        fn drop(&mut self) {
+            if let Some(hook) = WRITE_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(hook) = LOCK_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(hook) = LOCK_ATTEMPT_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(hook) = POST_COMMIT_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(fault) = CLEANUP_TEST_FAULT.get() {
+                *fault.lock().unwrap() = None;
+            }
+        }
+    }
+
+    fn seed_full_bound_state(s: &ClaudeSnapshotStore, id: AccountSlotId) -> Aggregate {
+        register(s, id.clone(), now());
+        s.mark_unverified(&id, now()).unwrap();
+        s.rebind(&id, now()).unwrap();
+        s.apply_observation(
+            available(
+                id,
+                2,
+                1,
+                vec![
+                    window(WindowKind::FiveHour, 21.0, Some(now() + Duration::hours(2))),
+                    window(WindowKind::Weekly, 63.0, Some(now() + Duration::days(2))),
+                ],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.load(now()).unwrap()
+    }
+
+    fn expected_unpaired(mut aggregate: Aggregate) -> Aggregate {
+        let slot = aggregate.slots.first_mut().unwrap();
+        slot.binding_id = None;
+        slot.binding_state = BindingState::Unbound;
+        slot.next_sequence = 1;
+        slot.windows.clear();
+        aggregate
     }
 
     #[test]
@@ -1935,7 +2169,7 @@ mod tests {
         let _file = open_private_new(&temp).unwrap();
         drop(_file);
         let _lock = s.lock().unwrap();
-        cleanup_orphan_temps(&s.root_dir).unwrap();
+        cleanup_orphan_temps(&s.root_dir, &s.root).unwrap();
         assert!(!temp.exists());
     }
 
@@ -2321,7 +2555,7 @@ mod tests {
             .join(format!("{TEMP_PREFIX}99997-{}", Uuid::new_v4()));
         symlink(&unrelated, &link).unwrap();
         let _lock = s.lock().unwrap();
-        cleanup_orphan_temps(&s.root_dir).unwrap();
+        cleanup_orphan_temps(&s.root_dir, &s.root).unwrap();
         assert!(!orphan.exists());
         assert!(unrelated.exists() && malformed.exists() && directory.exists() && link.exists());
         drop(_lock);
@@ -2329,7 +2563,96 @@ mod tests {
     }
 
     #[test]
+    fn orphan_temp_name_requires_exact_producer_grammar() {
+        let canonical = format!("{TEMP_PREFIX}{}-{}", std::process::id(), Uuid::new_v4());
+        assert!(is_inactive_temp_name(&canonical));
+        for rejected in [
+            format!("{TEMP_PREFIX}0-{}", Uuid::new_v4()),
+            format!("{TEMP_PREFIX}00{}-{}", std::process::id(), Uuid::new_v4()),
+            format!("{TEMP_PREFIX}+{}-{}", std::process::id(), Uuid::new_v4()),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-12d3-a456-426614174000"
+            ),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-42d3-0456-426614174000"
+            ),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-42d3-c456-426614174000"
+            ),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-42d3-e456-426614174000"
+            ),
+            canonical.to_uppercase(),
+            format!("{canonical}-suffix"),
+            format!(
+                "{TEMP_PREFIX}{}-{}-extra",
+                std::process::id(),
+                Uuid::new_v4()
+            ),
+        ] {
+            assert!(!is_inactive_temp_name(&rejected), "accepted {rejected}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_failures_close_directory_stream_and_preserve_candidates() {
+        let s = store("cleanup-failures");
+        let id = slot("123e4567-e89b-42d3-a456-426614174022");
+        register(&s, id, now());
+        let candidate = s.root.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::set_permissions(
+            &candidate,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            *CLEANUP_TEST_FAULT
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap() = Some((s.root.clone(), CleanupFault::ReaddirErrorAfterDirectoryOpen));
+            let _lock = s.lock().unwrap();
+            assert!(matches!(
+                cleanup_orphan_temps(&s.root_dir, &s.root),
+                Err(SnapshotError::Io)
+            ));
+            drop(_lock);
+            assert!(candidate.exists());
+            assert_eq!(active_directory_streams(), 0);
+            s.load(now()).unwrap();
+        }
+
+        for _ in 0..3 {
+            let _lock = s.lock().unwrap();
+            assert!(matches!(
+                cleanup_orphan_temps(&s.root_dir, &s.root),
+                Err(SnapshotError::InvalidState)
+            ));
+            drop(_lock);
+            assert!(candidate.exists());
+            assert_eq!(active_directory_streams(), 0);
+            s.load(now()).unwrap();
+        }
+    }
+
+    #[test]
     fn temp_path_substitution_after_fsync_fails_closed() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("temp-substitution"));
         let id = slot("123e4567-e89b-42d3-a456-426614174018");
         register(&s, id, now());
@@ -2348,6 +2671,7 @@ mod tests {
             let s = s.clone();
             std::thread::spawn(move || s.write_aggregate(&aggregate))
         };
+        let writer = GateWorker::new(resume, writer);
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2357,13 +2681,13 @@ mod tests {
         fs::write(&temp, b"substituted").unwrap();
         #[cfg(unix)]
         fs::set_permissions(&temp, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-        resume.send(()).unwrap();
-        assert!(writer.join().unwrap().is_err());
-        *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
+        assert!(writer.finish().unwrap().is_err());
     }
 
     #[test]
     fn active_temp_is_preserved_while_concurrent_projection_waits_on_lock() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("active-temp"));
         let id = slot("123e4567-e89b-42d3-a456-426614174019");
         register(&s, id, now());
@@ -2385,29 +2709,51 @@ mod tests {
             let s = s.clone();
             std::thread::spawn(move || s.mutate(now(), |_| Ok(())))
         };
+        let writer = GateWorker::new(resume, writer);
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let active = temp_path.lock().unwrap().clone().unwrap();
         assert!(active.exists());
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        *LOCK_ATTEMPT_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(LockAttemptTestHook {
+            root: s.root.clone(),
+            attempting: attempting_tx,
+            acquired: acquired_tx,
+        });
         let reader = {
             let s = s.clone();
             std::thread::spawn(move || s.project(now()))
         };
+        attempting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
         assert!(active.exists());
-        resume.send(()).unwrap();
-        writer.join().unwrap().unwrap();
+        writer.finish().unwrap().unwrap();
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         reader.join().unwrap().unwrap();
         assert!(!active.exists());
         assert!(!orphan.exists());
-        *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
     }
 
     #[test]
     fn unpair_pre_rename_interruption_reopens_wholly_old_state() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("unpair-interrupt"));
         let id = slot("123e4567-e89b-42d3-a456-426614174020");
-        register(&s, id.clone(), now());
+        let old = seed_full_bound_state(&s, id.clone());
+        let old_bytes = serde_json::to_vec(&old).unwrap();
         let (gate, reached, resume) = test_gate();
         let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
         *WRITE_TEST_HOOK
@@ -2423,26 +2769,31 @@ mod tests {
             let id = id.clone();
             std::thread::spawn(move || s.unpair(&id, now()))
         };
+        let writer = GateWorker::new(resume, writer);
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let temp = temp_path.lock().unwrap().clone().unwrap();
         fs::rename(&temp, temp.with_extension("interrupted")).unwrap();
-        resume.send(()).unwrap();
-        assert!(writer.join().unwrap().is_err());
-        *WRITE_TEST_HOOK.get().unwrap().lock().unwrap() = None;
+        assert!(writer.finish().unwrap().is_err());
         let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
-        assert_eq!(
-            projection(&restarted, now()).binding_state,
-            BindingState::Bound
-        );
+        let raw = fs::read(s.root.join(STATE_FILE)).unwrap();
+        assert_eq!(raw, old_bytes);
+        let projected = projection(&restarted, now());
+        assert_eq!(projected.binding_state, BindingState::Bound);
+        assert_eq!(projected.five_hour.used_percent, Some(21.0));
+        assert_eq!(projected.weekly.used_percent, Some(63.0));
     }
 
     #[test]
     fn unpair_post_commit_interruption_reopens_wholly_new_state() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("unpair-post-commit"));
         let id = slot("123e4567-e89b-42d3-a456-426614174021");
-        register(&s, id.clone(), now());
+        let old = seed_full_bound_state(&s, id.clone());
+        let expected = expected_unpaired(old);
+        let expected_bytes = serde_json::to_vec(&expected).unwrap();
         let (gate, reached, resume) = test_gate();
         *POST_COMMIT_TEST_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -2453,29 +2804,25 @@ mod tests {
             let id = id.clone();
             std::thread::spawn(move || s.unpair(&id, now()))
         };
+        let writer = GateWorker::new(resume, writer);
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        resume.send(()).unwrap();
-        assert!(matches!(writer.join().unwrap(), Err(SnapshotError::Io)));
-        *POST_COMMIT_TEST_HOOK.get().unwrap().lock().unwrap() = None;
-        let raw: Aggregate =
-            serde_json::from_slice(&fs::read(s.root.join(STATE_FILE)).unwrap()).unwrap();
-        let slot = &raw.slots[0];
-        assert_eq!(slot.binding_state, BindingState::Unbound);
-        assert!(slot.binding_id.is_none());
-        assert!(slot.windows.is_empty());
-        assert_eq!(slot.next_sequence, 1);
+        assert!(matches!(writer.finish().unwrap(), Err(SnapshotError::Io)));
+        let raw = fs::read(s.root.join(STATE_FILE)).unwrap();
+        assert_eq!(raw, expected_bytes);
         let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
-        assert_eq!(
-            projection(&restarted, now()).binding_state,
-            BindingState::Unbound
-        );
+        let projected = projection(&restarted, now());
+        assert_eq!(projected.binding_state, BindingState::Unbound);
+        assert!(projected.five_hour.used_percent.is_none());
+        assert!(projected.weekly.used_percent.is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn lock_replacement_between_open_and_flock_fails_closed() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("lock-replacement"));
         let (gate, reached, resume) = test_gate();
         *LOCK_TEST_HOOK
@@ -2486,6 +2833,7 @@ mod tests {
             let s = s.clone();
             std::thread::spawn(move || s.lock())
         };
+        let worker = GateWorker::new(resume, worker);
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2493,11 +2841,9 @@ mod tests {
         let replaced = s.root.join("replaced-lock");
         fs::rename(&lock, &replaced).unwrap();
         open_private_new(&lock).unwrap();
-        resume.send(()).unwrap();
         assert!(matches!(
-            worker.join().unwrap(),
+            worker.finish().unwrap(),
             Err(SnapshotError::InvalidState)
         ));
-        *LOCK_TEST_HOOK.get().unwrap().lock().unwrap() = None;
     }
 }
