@@ -20,7 +20,10 @@ use std::{
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+// Version 2 adds `clock_terminal`. Version 1 cannot distinguish a normal
+// unavailable event from one that overwrote rollback-terminal provenance, so
+// it is rejected rather than silently reinterpreted.
+const SCHEMA_VERSION: u32 = 2;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_SLOTS: usize = 4;
 const MAX_ALIAS_BYTES: usize = 48;
@@ -110,25 +113,35 @@ static CLEANUP_TEST_FAULT: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf,
     std::sync::OnceLock::new();
 
 #[cfg(test)]
-static ACTIVE_DIRECTORY_STREAMS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static ACTIVE_DIRECTORY_STREAMS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn cleanup_test_fault(root: &Path, stage: CleanupFault) -> Result<(), SnapshotError> {
-    let fault = CLEANUP_TEST_FAULT
+    let mut fault = CLEANUP_TEST_FAULT
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .unwrap()
-        .take();
-    if fault.is_some_and(|(fault_root, fault_stage)| fault_root == root && fault_stage == stage) {
+        .unwrap();
+    if fault
+        .as_ref()
+        .is_some_and(|(fault_root, fault_stage)| fault_root == root && *fault_stage == stage)
+    {
+        fault.take();
         return Err(SnapshotError::Io);
     }
     Ok(())
 }
 
 #[cfg(test)]
-fn active_directory_streams() -> usize {
-    ACTIVE_DIRECTORY_STREAMS.load(std::sync::atomic::Ordering::SeqCst)
+fn active_directory_streams(root: &Path) -> usize {
+    ACTIVE_DIRECTORY_STREAMS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(root)
+        .copied()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -434,6 +447,8 @@ struct WindowRecord {
     reset_at: Option<DateTime<Utc>>,
     source: Option<SourceClass>,
     terminal_expired: bool,
+    #[serde(default)]
+    clock_terminal: bool,
     last_error_code: Option<SafeErrorCode>,
 }
 
@@ -491,6 +506,7 @@ impl Aggregate {
                             || window.source.is_none()))
                     || (window.terminal_expired && window.used_percent.is_some())
                     || (!window.terminal_expired && window.used_percent.is_none())
+                    || (window.clock_terminal && !window.terminal_expired)
                     || window.received_at.is_some_and(|received| {
                         received > self.last_evaluated_wall_time + Duration::minutes(1)
                     })
@@ -601,8 +617,7 @@ impl ClaudeSnapshotStore {
                             .find(|existing| existing.kind == incoming.kind)
                             .is_some_and(|existing| {
                                 existing.terminal_expired
-                                    && existing.last_error_code
-                                        == Some(SafeErrorCode::ClockRollback)
+                                    && existing.clock_terminal
                                     && received_at <= recovery_floor(recovery_high_water, existing)
                             })
                     }) {
@@ -617,6 +632,7 @@ impl ClaudeSnapshotStore {
                             reset_at: incoming.reset_at,
                             source: observation.source,
                             terminal_expired: false,
+                            clock_terminal: false,
                             last_error_code: None,
                         };
                         replace_window(&mut slot.windows, record);
@@ -916,6 +932,7 @@ fn project_expiry(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
                         .is_some_and(|received| now > received + FRESH_FOR);
             if expired && (!window.terminal_expired || window.used_percent.is_some()) {
                 window.terminal_expired = true;
+                window.clock_terminal = rollback;
                 window.used_percent = None;
                 if rollback {
                     window.last_error_code = Some(SafeErrorCode::ClockRollback);
@@ -956,6 +973,7 @@ fn fail_closed_for_clock(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool 
                 && (window.used_percent.take().is_some() || !window.terminal_expired)
             {
                 window.terminal_expired = true;
+                window.clock_terminal = true;
                 window.last_error_code = Some(SafeErrorCode::ClockRollback);
                 changed = true;
             }
@@ -1263,24 +1281,40 @@ fn sync_directory(path: &Path) -> Result<(), SnapshotError> {
 }
 
 #[cfg(unix)]
-struct DirectoryStream(*mut libc::DIR);
+struct DirectoryStream {
+    directory: *mut libc::DIR,
+    #[cfg(test)]
+    root_path: PathBuf,
+}
 
 #[cfg(unix)]
 impl DirectoryStream {
-    fn from_fd(fd: std::os::unix::io::RawFd) -> Result<Self, SnapshotError> {
+    fn from_fd(fd: std::os::unix::io::RawFd, root_path: &Path) -> Result<Self, SnapshotError> {
+        #[cfg(not(test))]
+        let _ = root_path;
         let directory = unsafe { libc::fdopendir(fd) };
         if directory.is_null() {
             unsafe { libc::close(fd) };
             return Err(SnapshotError::Io);
         }
         #[cfg(test)]
-        ACTIVE_DIRECTORY_STREAMS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(Self(directory))
+        {
+            let mut active = ACTIVE_DIRECTORY_STREAMS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap();
+            *active.entry(root_path.to_path_buf()).or_default() += 1;
+        }
+        Ok(Self {
+            directory,
+            #[cfg(test)]
+            root_path: root_path.to_path_buf(),
+        })
     }
 
     fn next_name(&mut self) -> Result<Option<&CStr>, SnapshotError> {
         clear_readdir_errno()?;
-        let entry = unsafe { libc::readdir(self.0) };
+        let entry = unsafe { libc::readdir(self.directory) };
         if entry.is_null() {
             return if readdir_errno()? == 0 {
                 Ok(None)
@@ -1295,9 +1329,21 @@ impl DirectoryStream {
 #[cfg(unix)]
 impl Drop for DirectoryStream {
     fn drop(&mut self) {
-        let _ = unsafe { libc::closedir(self.0) };
+        let _ = unsafe { libc::closedir(self.directory) };
         #[cfg(test)]
-        ACTIVE_DIRECTORY_STREAMS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut active = ACTIVE_DIRECTORY_STREAMS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap();
+            let count = active
+                .get_mut(&self.root_path)
+                .expect("directory stream root must be tracked");
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.root_path);
+            }
+        }
     }
 }
 
@@ -1346,7 +1392,7 @@ fn cleanup_orphan_temps(root: &File, root_path: &Path) -> Result<(), SnapshotErr
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
         0,
     )?;
-    let mut directory = DirectoryStream::from_fd(duplicate.into_raw_fd())?;
+    let mut directory = DirectoryStream::from_fd(duplicate.into_raw_fd(), root_path)?;
     #[cfg(test)]
     cleanup_test_fault(root_path, CleanupFault::ReaddirErrorAfterDirectoryOpen)?;
     loop {
@@ -1540,32 +1586,64 @@ mod tests {
             .unwrap();
     }
 
-    struct GateWorker<T> {
+    struct GateWorker<T: Send + 'static> {
         resume: Option<std::sync::mpsc::Sender<()>>,
+        completed: std::sync::mpsc::Receiver<()>,
         handle: Option<std::thread::JoinHandle<T>>,
     }
 
-    impl<T> GateWorker<T> {
-        fn new(resume: std::sync::mpsc::Sender<()>, handle: std::thread::JoinHandle<T>) -> Self {
+    impl<T: Send + 'static> GateWorker<T> {
+        fn spawn<F>(resume: Option<std::sync::mpsc::Sender<()>>, operation: F) -> Self
+        where
+            F: FnOnce() -> T + Send + 'static,
+        {
+            let (completed_tx, completed) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+                let _ = completed_tx.send(());
+                match result {
+                    Ok(value) => value,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            });
             Self {
-                resume: Some(resume),
+                resume,
+                completed,
                 handle: Some(handle),
             }
         }
 
+        fn wait_for_completion(&self) {
+            self.completed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("worker did not complete within 5 seconds");
+        }
+
         fn finish(mut self) -> std::thread::Result<T> {
-            self.resume.take().unwrap().send(()).unwrap();
+            if let Some(resume) = self.resume.take() {
+                resume.send(()).unwrap();
+            }
+            self.wait_for_completion();
             self.handle.take().unwrap().join()
         }
     }
 
-    impl<T> Drop for GateWorker<T> {
+    impl<T: Send + 'static> Drop for GateWorker<T> {
         fn drop(&mut self) {
             if let Some(resume) = self.resume.take() {
                 let _ = resume.send(());
             }
+            let completed = self
+                .completed
+                .recv_timeout(std::time::Duration::from_secs(5));
             if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
+                let result = handle.join();
+                if completed.is_err() && !std::thread::panicking() {
+                    panic!("worker did not complete within 5 seconds");
+                }
+                if result.is_err() && !std::thread::panicking() {
+                    panic!("worker panicked during test cleanup");
+                }
             }
         }
     }
@@ -1590,6 +1668,30 @@ mod tests {
                 *fault.lock().unwrap() = None;
             }
         }
+    }
+
+    #[test]
+    fn gate_worker_drop_releases_gate_and_joins_before_returning() {
+        let (gate, reached, resume) = test_gate();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = GateWorker::spawn(Some(resume), {
+            let finished = finished.clone();
+            move || {
+                gate.wait();
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(worker);
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn gate_worker_finish_surfaces_worker_panic_after_bounded_completion() {
+        let worker = GateWorker::spawn(None, || -> () { panic!("controlled worker panic") });
+        assert!(worker.finish().is_err());
     }
 
     fn seed_full_bound_state(s: &ClaudeSnapshotStore, id: AccountSlotId) -> Aggregate {
@@ -2147,6 +2249,7 @@ mod tests {
             reset_at: Some(now() + Duration::hours(1)),
             source: Some(SourceClass::CompletionSse),
             terminal_expired: true,
+            clock_terminal: false,
             last_error_code: None,
         });
         assert_eq!(aggregate.validate(), Err(SnapshotError::InvalidState));
@@ -2154,6 +2257,7 @@ mod tests {
 
     #[test]
     fn malformed_json_and_precisely_named_orphan_fail_closed_or_cleanup_under_lock() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
         let s = store("malformed-and-orphan");
         let id = slot("123e4567-e89b-42d3-a456-426614174014");
         register(&s, id, now());
@@ -2440,6 +2544,112 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_observation_preserves_clock_terminal_recovery_floor() {
+        let path = root("rollback-unavailable");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174033");
+        let high_water = now() + Duration::minutes(10);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available_at(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    42.0,
+                    Some(high_water + Duration::hours(1)),
+                )],
+                high_water,
+            ),
+            high_water,
+        )
+        .unwrap();
+        s.project(high_water - Duration::seconds(61)).unwrap();
+        s.apply_observation(
+            ObservationEnvelopeV1 {
+                slot_id: id.clone(),
+                binding_epoch: 1,
+                sequence: 2,
+                observed_at: high_water - Duration::seconds(45),
+                status: ObservationStatus::Unavailable,
+                source: None,
+                windows: vec![],
+                error_code: Some(SafeErrorCode::Unavailable),
+            },
+            high_water - Duration::seconds(45),
+        )
+        .unwrap();
+        assert!(s.load(high_water).unwrap().slots[0].windows[0].clock_terminal);
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        restarted
+            .apply_observation(
+                ObservationEnvelopeV1 {
+                    slot_id: id.clone(),
+                    binding_epoch: 1,
+                    sequence: 3,
+                    observed_at: high_water - Duration::seconds(30),
+                    status: ObservationStatus::Unavailable,
+                    source: None,
+                    windows: vec![],
+                    error_code: Some(SafeErrorCode::Unavailable),
+                },
+                high_water - Duration::seconds(30),
+            )
+            .unwrap();
+        assert!(restarted.load(high_water).unwrap().slots[0].windows[0].clock_terminal);
+        let before = fs::read(restarted.root.join(STATE_FILE)).unwrap();
+        assert_eq!(
+            restarted.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    4,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        5.0,
+                        Some(high_water + Duration::hours(1))
+                    )],
+                    high_water - Duration::seconds(20)
+                ),
+                high_water - Duration::seconds(20),
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(fs::read(restarted.root.join(STATE_FILE)).unwrap(), before);
+        restarted
+            .apply_observation(
+                available_at(
+                    id,
+                    1,
+                    4,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        5.0,
+                        Some(high_water + Duration::hours(1)),
+                    )],
+                    high_water + Duration::seconds(1),
+                ),
+                high_water + Duration::seconds(1),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn ambiguous_pre_provenance_schema_fails_closed_without_rewrite() {
+        let s = store("pre-provenance-schema");
+        let id = slot("123e4567-e89b-42d3-a456-426614174034");
+        register(&s, id, now());
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.schema_version = 1;
+        overwrite_aggregate(&s, &aggregate);
+        let before = fs::read(s.root.join(STATE_FILE)).unwrap();
+
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+        assert_eq!(fs::read(s.root.join(STATE_FILE)).unwrap(), before);
+    }
+
+    #[test]
     fn timeless_or_inconsistent_numeric_state_fails_closed_without_rewrite() {
         let s = store("timeless-numeric");
         let id = slot("123e4567-e89b-42d3-a456-426614174032");
@@ -2536,6 +2746,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn descriptor_cleanup_removes_only_verified_orphans_and_keeps_root_usable() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
         use std::os::unix::fs::symlink;
         let s = store("descriptor-cleanup");
         let orphan = s
@@ -2605,6 +2816,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleanup_failures_close_directory_stream_and_preserve_candidates() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
         let s = store("cleanup-failures");
         let id = slot("123e4567-e89b-42d3-a456-426614174022");
         register(&s, id, now());
@@ -2632,7 +2844,7 @@ mod tests {
             ));
             drop(_lock);
             assert!(candidate.exists());
-            assert_eq!(active_directory_streams(), 0);
+            assert_eq!(active_directory_streams(&s.root), 0);
             s.load(now()).unwrap();
         }
 
@@ -2644,9 +2856,52 @@ mod tests {
             ));
             drop(_lock);
             assert!(candidate.exists());
-            assert_eq!(active_directory_streams(), 0);
+            assert_eq!(active_directory_streams(&s.root), 0);
             s.load(now()).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_fault_is_scoped_to_its_intended_root() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _scope = TestHookScope;
+        let affected = store("cleanup-fault-affected");
+        let competing = store("cleanup-fault-competing");
+        let affected_temp = affected.root.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let competing_temp = competing.root.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        drop(open_private_new(&affected_temp).unwrap());
+        drop(open_private_new(&competing_temp).unwrap());
+        *CLEANUP_TEST_FAULT
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((
+            affected.root.clone(),
+            CleanupFault::ReaddirErrorAfterDirectoryOpen,
+        ));
+
+        let competing_lock = competing.lock().unwrap();
+        cleanup_orphan_temps(&competing.root_dir, &competing.root).unwrap();
+        drop(competing_lock);
+        assert!(!competing_temp.exists());
+
+        let affected_lock = affected.lock().unwrap();
+        assert_eq!(
+            cleanup_orphan_temps(&affected.root_dir, &affected.root),
+            Err(SnapshotError::Io)
+        );
+        drop(affected_lock);
+        assert!(affected_temp.exists());
+        assert_eq!(active_directory_streams(&affected.root), 0);
+        assert_eq!(active_directory_streams(&competing.root), 0);
     }
 
     #[test]
@@ -2667,11 +2922,10 @@ mod tests {
             gate,
             temp_path: temp_path.clone(),
         });
-        let writer = {
+        let writer = GateWorker::spawn(Some(resume), {
             let s = s.clone();
-            std::thread::spawn(move || s.write_aggregate(&aggregate))
-        };
-        let writer = GateWorker::new(resume, writer);
+            move || s.write_aggregate(&aggregate)
+        });
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2705,11 +2959,10 @@ mod tests {
             gate,
             temp_path: temp_path.clone(),
         });
-        let writer = {
+        let writer = GateWorker::spawn(Some(resume), {
             let s = s.clone();
-            std::thread::spawn(move || s.mutate(now(), |_| Ok(())))
-        };
-        let writer = GateWorker::new(resume, writer);
+            move || s.mutate(now(), |_| Ok(()))
+        });
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2725,10 +2978,10 @@ mod tests {
             attempting: attempting_tx,
             acquired: acquired_tx,
         });
-        let reader = {
+        let reader = GateWorker::spawn(None, {
             let s = s.clone();
-            std::thread::spawn(move || s.project(now()))
-        };
+            move || s.project(now())
+        });
         attempting_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2741,7 +2994,7 @@ mod tests {
         acquired_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        reader.join().unwrap().unwrap();
+        reader.finish().unwrap().unwrap();
         assert!(!active.exists());
         assert!(!orphan.exists());
     }
@@ -2764,12 +3017,11 @@ mod tests {
             gate,
             temp_path: temp_path.clone(),
         });
-        let writer = {
+        let writer = GateWorker::spawn(Some(resume), {
             let s = s.clone();
             let id = id.clone();
-            std::thread::spawn(move || s.unpair(&id, now()))
-        };
-        let writer = GateWorker::new(resume, writer);
+            move || s.unpair(&id, now())
+        });
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2799,12 +3051,11 @@ mod tests {
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap() = Some((s.root.clone(), gate));
-        let writer = {
+        let writer = GateWorker::spawn(Some(resume), {
             let s = s.clone();
             let id = id.clone();
-            std::thread::spawn(move || s.unpair(&id, now()))
-        };
-        let writer = GateWorker::new(resume, writer);
+            move || s.unpair(&id, now())
+        });
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -2829,11 +3080,10 @@ mod tests {
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap() = Some((s.root.clone(), gate));
-        let worker = {
+        let worker = GateWorker::spawn(Some(resume), {
             let s = s.clone();
-            std::thread::spawn(move || s.lock())
-        };
-        let worker = GateWorker::new(resume, worker);
+            move || s.lock()
+        });
         reached
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
