@@ -932,9 +932,9 @@ fn project_expiry(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
                         .is_some_and(|received| now > received + FRESH_FOR);
             if expired && (!window.terminal_expired || window.used_percent.is_some()) {
                 window.terminal_expired = true;
-                window.clock_terminal = rollback;
                 window.used_percent = None;
                 if rollback {
+                    window.clock_terminal = true;
                     window.last_error_code = Some(SafeErrorCode::ClockRollback);
                 }
                 changed = true;
@@ -969,13 +969,18 @@ fn fail_closed_for_clock(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool 
             let window_rollback = window
                 .received_at
                 .is_some_and(|received| now + ROLLBACK_TOLERANCE < received);
-            if (aggregate_rollback || window_rollback)
-                && (window.used_percent.take().is_some() || !window.terminal_expired)
-            {
+            if aggregate_rollback || window_rollback {
+                let numeric_was_present = window.used_percent.take().is_some();
+                let needs_upgrade = numeric_was_present
+                    || !window.terminal_expired
+                    || !window.clock_terminal
+                    || window.last_error_code != Some(SafeErrorCode::ClockRollback);
                 window.terminal_expired = true;
                 window.clock_terminal = true;
                 window.last_error_code = Some(SafeErrorCode::ClockRollback);
-                changed = true;
+                if needs_upgrade {
+                    changed = true;
+                }
             }
         }
     }
@@ -1511,8 +1516,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     static HOOK_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static WORKER_PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static WORKER_JOINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
     }
@@ -1593,6 +1601,23 @@ mod tests {
         Panicked,
     }
 
+    #[derive(Default)]
+    struct WorkerAudit {
+        completed: std::sync::atomic::AtomicUsize,
+        joins: std::sync::atomic::AtomicUsize,
+        panics: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WorkerAudit {
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.completed.load(Ordering::SeqCst),
+                self.joins.load(Ordering::SeqCst),
+                self.panics.load(Ordering::SeqCst),
+            )
+        }
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     enum WorkerFailure {
         Panicked,
@@ -1602,6 +1627,7 @@ mod tests {
         resume: Option<std::sync::mpsc::Sender<()>>,
         completed: std::sync::mpsc::Receiver<()>,
         handle: Option<std::thread::JoinHandle<WorkerOutcome<T>>>,
+        audit: std::sync::Arc<WorkerAudit>,
     }
 
     impl<T: Send + 'static> GateWorker<T> {
@@ -1609,9 +1635,26 @@ mod tests {
         where
             F: FnOnce() -> T + Send + 'static,
         {
+            Self::spawn_with_audit(
+                std::sync::Arc::new(WorkerAudit::default()),
+                resume,
+                operation,
+            )
+        }
+
+        fn spawn_with_audit<F>(
+            audit: std::sync::Arc<WorkerAudit>,
+            resume: Option<std::sync::mpsc::Sender<()>>,
+            operation: F,
+        ) -> Self
+        where
+            F: FnOnce() -> T + Send + 'static,
+        {
             let (completed_tx, completed) = std::sync::mpsc::channel();
+            let worker_audit = audit.clone();
             let handle = std::thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+                worker_audit.completed.fetch_add(1, Ordering::SeqCst);
                 let _ = completed_tx.send(());
                 match result {
                     Ok(value) => WorkerOutcome::Returned(value),
@@ -1622,6 +1665,7 @@ mod tests {
                 resume,
                 completed,
                 handle: Some(handle),
+                audit,
             }
         }
 
@@ -1642,10 +1686,14 @@ mod tests {
 
         fn finish_after_release(mut self) -> Result<T, WorkerFailure> {
             self.wait_for_completion();
-            WORKER_JOINS.fetch_add(1, Ordering::SeqCst);
-            match self.handle.take().unwrap().join().unwrap() {
+            let outcome = self.handle.take().unwrap().join().unwrap();
+            self.audit.joins.fetch_add(1, Ordering::SeqCst);
+            match outcome {
                 WorkerOutcome::Returned(value) => Ok(value),
-                WorkerOutcome::Panicked => Err(WorkerFailure::Panicked),
+                WorkerOutcome::Panicked => {
+                    self.audit.panics.fetch_add(1, Ordering::SeqCst);
+                    Err(WorkerFailure::Panicked)
+                }
             }
         }
 
@@ -1663,9 +1711,9 @@ mod tests {
             self.release();
             self.wait_for_completion();
             if let Some(handle) = self.handle.take() {
-                WORKER_JOINS.fetch_add(1, Ordering::SeqCst);
+                self.audit.joins.fetch_add(1, Ordering::SeqCst);
                 if matches!(handle.join().unwrap(), WorkerOutcome::Panicked) {
-                    WORKER_PANICS.fetch_add(1, Ordering::SeqCst);
+                    self.audit.panics.fetch_add(1, Ordering::SeqCst);
                 }
             }
         }
@@ -2314,7 +2362,7 @@ mod tests {
 
     #[test]
     fn malformed_json_and_precisely_named_orphan_fail_closed_or_cleanup_under_lock() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let s = store("malformed-and-orphan");
         let id = slot("123e4567-e89b-42d3-a456-426614174014");
         register(&s, id, now());
@@ -2739,6 +2787,190 @@ mod tests {
     }
 
     #[test]
+    fn already_terminal_windows_upgrade_to_rollback_provenance_before_recovery() {
+        // Aggregate high-water can limit recovery after either ordinary terminal
+        // form. A later persisted receipt cannot coexist with an earlier reset
+        // terminal under structural timestamp validation, so the distinct
+        // receipt-floor fixture below necessarily uses the no-reset form.
+        for (name, reset_at) in [
+            ("terminal-upgrade-reset", Some(now() + Duration::seconds(1))),
+            ("terminal-upgrade-no-reset", None),
+        ] {
+            let path = root(name);
+            let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+            let id = slot("123e4567-e89b-42d3-a456-426614174037");
+            let high_water = if reset_at.is_some() {
+                now() + Duration::minutes(10)
+            } else {
+                now() + Duration::minutes(30)
+            };
+            register(&s, id.clone(), now());
+            s.apply_observation(
+                available(
+                    id.clone(),
+                    1,
+                    1,
+                    vec![window(WindowKind::FiveHour, 42.0, reset_at)],
+                ),
+                now(),
+            )
+            .unwrap();
+            let ordinary_expiry = reset_at.unwrap_or(now() + FRESH_FOR + Duration::seconds(1));
+            assert_eq!(projection(&s, ordinary_expiry).five_hour.used_percent, None);
+            s.project(high_water).unwrap();
+            let terminal = s.load(high_water).unwrap();
+            assert!(terminal.slots[0].windows[0].terminal_expired);
+            assert!(!terminal.slots[0].windows[0].clock_terminal);
+
+            let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+            restarted
+                .project(high_water - Duration::seconds(61))
+                .unwrap();
+            let upgraded = restarted.load(high_water).unwrap();
+            let upgraded_window = &upgraded.slots[0].windows[0];
+            assert!(upgraded_window.clock_terminal);
+            assert_eq!(
+                upgraded_window.last_error_code,
+                Some(SafeErrorCode::ClockRollback)
+            );
+            restarted
+                .apply_observation(
+                    ObservationEnvelopeV1 {
+                        slot_id: id.clone(),
+                        binding_epoch: 1,
+                        sequence: 2,
+                        observed_at: high_water,
+                        status: ObservationStatus::Unavailable,
+                        source: None,
+                        windows: vec![],
+                        error_code: Some(SafeErrorCode::Unavailable),
+                    },
+                    high_water,
+                )
+                .unwrap();
+            let restarted_again = ClaudeSnapshotStore::at_root(restarted.root.clone()).unwrap();
+            let before = fs::read(restarted_again.root.join(STATE_FILE)).unwrap();
+            assert_eq!(
+                restarted_again.apply_observation(
+                    available_at(
+                        id.clone(),
+                        1,
+                        3,
+                        vec![window(
+                            WindowKind::FiveHour,
+                            7.0,
+                            Some(high_water + Duration::hours(2))
+                        )],
+                        high_water,
+                    ),
+                    high_water,
+                ),
+                Err(SnapshotError::Rejected)
+            );
+            assert_eq!(
+                fs::read(restarted_again.root.join(STATE_FILE)).unwrap(),
+                before
+            );
+            restarted_again
+                .apply_observation(
+                    available_at(
+                        id,
+                        1,
+                        3,
+                        vec![window(
+                            WindowKind::FiveHour,
+                            7.0,
+                            Some(high_water + Duration::hours(2)),
+                        )],
+                        high_water + Duration::seconds(1),
+                    ),
+                    high_water + Duration::seconds(1),
+                )
+                .unwrap();
+            assert_eq!(
+                projection(&restarted_again, high_water + Duration::seconds(1))
+                    .five_hour
+                    .used_percent,
+                Some(7.0)
+            );
+        }
+
+        let path = root("terminal-upgrade-window-floor");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174038");
+        let high_water = now() + Duration::minutes(30);
+        let later_receipt = high_water + Duration::seconds(50);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(WindowKind::Weekly, 42.0, None)],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.project(now() + FRESH_FOR + Duration::seconds(1)).unwrap();
+        s.project(high_water).unwrap();
+        let mut terminal = s.load(high_water).unwrap();
+        terminal.slots[0].windows[0].received_at = Some(later_receipt);
+        overwrite_aggregate(&s, &terminal);
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        restarted
+            .project(high_water - Duration::seconds(20))
+            .unwrap();
+        let upgraded = restarted.load(high_water).unwrap();
+        assert!(upgraded.slots[0].windows[0].clock_terminal);
+        assert_eq!(
+            upgraded.slots[0].windows[0].last_error_code,
+            Some(SafeErrorCode::ClockRollback)
+        );
+        let restarted_after_upgrade = ClaudeSnapshotStore::at_root(restarted.root.clone()).unwrap();
+        assert!(
+            restarted_after_upgrade.load(high_water).unwrap().slots[0].windows[0].clock_terminal
+        );
+        let before = fs::read(restarted_after_upgrade.root.join(STATE_FILE)).unwrap();
+        assert_eq!(
+            restarted_after_upgrade.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2))
+                    )],
+                    later_receipt,
+                ),
+                later_receipt,
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(
+            fs::read(restarted_after_upgrade.root.join(STATE_FILE)).unwrap(),
+            before
+        );
+        restarted_after_upgrade
+            .apply_observation(
+                available_at(
+                    id,
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    later_receipt + Duration::seconds(11),
+                ),
+                later_receipt + Duration::seconds(11),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn ambiguous_pre_provenance_schema_fails_closed_without_rewrite() {
         let s = store("pre-provenance-schema");
         let id = slot("123e4567-e89b-42d3-a456-426614174034");
@@ -2849,7 +3081,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn descriptor_cleanup_removes_only_verified_orphans_and_keeps_root_usable() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         use std::os::unix::fs::symlink;
         let s = store("descriptor-cleanup");
         let orphan = s
@@ -2919,7 +3151,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleanup_failures_close_directory_stream_and_preserve_candidates() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let s = store("cleanup-failures");
         let id = slot("123e4567-e89b-42d3-a456-426614174022");
         register(&s, id, now());
@@ -2967,7 +3199,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleanup_fault_is_scoped_to_its_intended_root() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let _scope = TestHookScope;
         let affected = store("cleanup-fault-affected");
         let competing = store("cleanup-fault-competing");
@@ -3009,7 +3241,7 @@ mod tests {
 
     #[test]
     fn temp_path_substitution_after_fsync_fails_closed() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("temp-substitution"));
         let id = slot("123e4567-e89b-42d3-a456-426614174018");
@@ -3043,7 +3275,7 @@ mod tests {
 
     #[test]
     fn active_temp_is_preserved_while_concurrent_projection_waits_on_lock() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("active-temp"));
         let id = slot("123e4567-e89b-42d3-a456-426614174019");
@@ -3104,96 +3336,20 @@ mod tests {
         assert!(!orphan.exists());
     }
 
-    #[test]
-    fn active_temp_pair_releases_both_workers_on_early_return_and_coordinator_panic() {
-        for coordinator_panics in [false, true] {
-            let serial = HOOK_TEST_MUTEX.lock().unwrap();
-            let joins_before = WORKER_JOINS.load(Ordering::SeqCst);
-            let panics_before = WORKER_PANICS.load(Ordering::SeqCst);
-            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _scope = TestHookScope;
-                let s = std::sync::Arc::new(store("active-temp-coordinator"));
-                let id = slot("123e4567-e89b-42d3-a456-426614174035");
-                register(&s, id, now());
-                let (gate, reached, resume) = test_gate();
-                let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
-                *WRITE_TEST_HOOK
-                    .get_or_init(|| std::sync::Mutex::new(None))
-                    .lock()
-                    .unwrap() = Some(WriteTestHook {
-                    root: s.root.clone(),
-                    gate,
-                    temp_path,
-                });
-                let writer = GateWorker::spawn(Some(resume), {
-                    let s = s.clone();
-                    move || {
-                        let result = s.mutate(now(), |_| Ok(()));
-                        if coordinator_panics {
-                            result.unwrap();
-                            panic!("controlled worker panic during coordinator unwind");
-                        }
-                        result
-                    }
-                });
-                reached
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
-                let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
-                let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-                *LOCK_ATTEMPT_TEST_HOOK
-                    .get_or_init(|| std::sync::Mutex::new(None))
-                    .lock()
-                    .unwrap() = Some(LockAttemptTestHook {
-                    root: s.root.clone(),
-                    attempting: attempting_tx,
-                    acquired: acquired_tx,
-                });
-                let reader = GateWorker::spawn(None, {
-                    let s = s.clone();
-                    move || s.project(now())
-                });
-                let _pair = WorkerPair::new(writer, reader);
-                attempting_rx
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
-                assert!(matches!(
-                    acquired_rx.try_recv(),
-                    Err(std::sync::mpsc::TryRecvError::Empty)
-                ));
-                if coordinator_panics {
-                    panic!("controlled coordinator panic after reader pre-lock");
-                }
-            }));
-            if coordinator_panics {
-                assert!(unwind.is_err());
-            } else {
-                assert!(unwind.is_ok());
-            }
-            assert_eq!(WORKER_JOINS.load(Ordering::SeqCst), joins_before + 2);
-            let panics_after = WORKER_PANICS.load(Ordering::SeqCst);
-            if coordinator_panics {
-                assert!(panics_after > panics_before);
-            } else {
-                assert_eq!(panics_after, panics_before);
-            }
-            assert!(WRITE_TEST_HOOK.get().unwrap().lock().unwrap().is_none());
-            assert!(LOCK_ATTEMPT_TEST_HOOK
-                .get()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_none());
-            drop(serial);
-            let _next_scope = HOOK_TEST_MUTEX.lock().unwrap();
-        }
+    #[derive(Clone, Copy)]
+    struct ActiveTempFailureCase {
+        name: &'static str,
+        coordinator_panics: bool,
+        writer_panics: bool,
+        reader_panics: bool,
+        early_return: bool,
     }
 
-    #[test]
-    fn active_temp_pair_returns_writer_and_reader_panics_explicitly() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
-        let _scope = TestHookScope;
-        let s = std::sync::Arc::new(store("active-temp-worker-panics"));
+    fn run_active_temp_failure_case(case: ActiveTempFailureCase) {
+        let serial = hook_test_lock();
+        let audit = std::sync::Arc::new(WorkerAudit::default());
+        let mut scope = Some(TestHookScope);
+        let s = std::sync::Arc::new(store(case.name));
         let id = slot("123e4567-e89b-42d3-a456-426614174036");
         register(&s, id, now());
         let (gate, reached, resume) = test_gate();
@@ -3206,11 +3362,13 @@ mod tests {
             gate,
             temp_path,
         });
-        let writer = GateWorker::spawn(Some(resume), {
+        let writer = GateWorker::spawn_with_audit(audit.clone(), Some(resume), {
             let s = s.clone();
             move || {
                 s.mutate(now(), |_| Ok(())).unwrap();
-                panic!("controlled writer panic")
+                if case.writer_panics {
+                    panic!("controlled writer panic");
+                }
             }
         });
         reached
@@ -3226,32 +3384,117 @@ mod tests {
             attempting: attempting_tx,
             acquired: acquired_tx,
         });
-        let reader = GateWorker::spawn(None, {
+        let reader = GateWorker::spawn_with_audit(audit.clone(), None, {
             let s = s.clone();
             move || {
                 s.project(now()).unwrap();
-                panic!("controlled reader panic")
+                if case.reader_panics {
+                    panic!("controlled reader panic");
+                }
             }
         });
-        let workers = WorkerPair::new(writer, reader);
-        attempting_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        assert!(matches!(
-            acquired_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        let (writer, reader) = workers.finish();
-        assert_eq!(writer, Err(WorkerFailure::Panicked));
-        assert_eq!(reader, Err(WorkerFailure::Panicked));
-        acquired_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let workers = WorkerPair::new(writer, reader);
+            attempting_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(matches!(
+                acquired_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            if case.coordinator_panics {
+                panic!("controlled coordinator panic after reader pre-lock");
+            }
+            if case.early_return {
+                return None;
+            }
+            Some(workers.finish())
+        }));
+        assert_eq!(outcome.is_err(), case.coordinator_panics);
+        if let Ok(Some((writer, reader))) = outcome {
+            assert_eq!(writer.is_err(), case.writer_panics);
+            assert_eq!(reader.is_err(), case.reader_panics);
+        }
+        assert_eq!(
+            audit.counts(),
+            (
+                2,
+                2,
+                usize::from(case.writer_panics) + usize::from(case.reader_panics)
+            )
+        );
+        drop(scope.take());
+        assert!(WRITE_TEST_HOOK.get().unwrap().lock().unwrap().is_none());
+        assert!(LOCK_ATTEMPT_TEST_HOOK
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_none());
+        drop(serial);
+        let _reusable_scope = hook_test_lock();
+    }
+
+    #[test]
+    fn active_temp_failure_matrix_has_isolated_bounded_worker_evidence() {
+        for case in [
+            ActiveTempFailureCase {
+                name: "active-temp-normal",
+                coordinator_panics: false,
+                writer_panics: false,
+                reader_panics: false,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-early",
+                coordinator_panics: false,
+                writer_panics: false,
+                reader_panics: false,
+                early_return: true,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-coordinator",
+                coordinator_panics: true,
+                writer_panics: false,
+                reader_panics: false,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-writer",
+                coordinator_panics: false,
+                writer_panics: true,
+                reader_panics: false,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-reader",
+                coordinator_panics: false,
+                writer_panics: false,
+                reader_panics: true,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-both",
+                coordinator_panics: false,
+                writer_panics: true,
+                reader_panics: true,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-combined",
+                coordinator_panics: true,
+                writer_panics: true,
+                reader_panics: false,
+                early_return: false,
+            },
+        ] {
+            run_active_temp_failure_case(case);
+        }
     }
 
     #[test]
     fn unpair_pre_rename_interruption_reopens_wholly_old_state() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("unpair-interrupt"));
         let id = slot("123e4567-e89b-42d3-a456-426614174020");
@@ -3289,7 +3532,7 @@ mod tests {
 
     #[test]
     fn unpair_post_commit_interruption_reopens_wholly_new_state() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("unpair-post-commit"));
         let id = slot("123e4567-e89b-42d3-a456-426614174021");
@@ -3322,7 +3565,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lock_replacement_between_open_and_flock_fails_closed() {
-        let _serial = HOOK_TEST_MUTEX.lock().unwrap();
+        let _serial = hook_test_lock();
         let _scope = TestHookScope;
         let s = std::sync::Arc::new(store("lock-replacement"));
         let (gate, reached, resume) = test_gate();
