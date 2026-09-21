@@ -16,6 +16,31 @@ export interface QuotaData {
   error?: string;
 }
 
+/** Read-only C3-A projection. It intentionally omits binding, sequence, source, and path data. */
+export type ClaudeBindingState = 'unbound' | 'bound' | 'unverified' | 'error';
+export type ClaudeWindowStatus = 'fresh' | 'stale' | 'expired' | 'unavailable';
+export type ClaudeSafeErrorCode = 'unavailable' | 'malformed_payload' | 'unsupported_observation' | 'clock_rollback';
+
+export interface ClaudeWindowProjection {
+  status: ClaudeWindowStatus;
+  usedPercent?: number;
+  resetAt?: string;
+  observedAt?: string;
+  lastErrorCode?: ClaudeSafeErrorCode;
+}
+
+export interface ClaudeCurrentSlot {
+  alias: string;
+  bindingState: ClaudeBindingState;
+  plan?: 'paid' | 'free';
+  fiveHour: ClaudeWindowProjection;
+  weekly: ClaudeWindowProjection;
+}
+
+export interface ClaudeCurrentSnapshots {
+  slots: ClaudeCurrentSlot[];
+}
+
 export interface CodexData {
   connected: boolean;
   planType?: string;

@@ -1,0 +1,3592 @@
+//! Acquisition-neutral, current-only Claude quota state.
+//!
+//! This module deliberately has no provider, credential, browser, or IPC-write
+//! dependency. Future trusted adapters can use the crate-private mutation API;
+//! the webview can only obtain `ClaudeCurrentSnapshotsDto` projections.
+
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+use uuid::{Uuid, Variant};
+
+#[cfg(unix)]
+use std::{
+    ffi::{CStr, CString},
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
+};
+
+// Version 2 adds `clock_terminal`. Version 1 cannot distinguish a normal
+// unavailable event from one that overwrote rollback-terminal provenance, so
+// it is rejected rather than silently reinterpreted.
+const SCHEMA_VERSION: u32 = 2;
+const MAX_FILE_BYTES: u64 = 64 * 1024;
+const MAX_SLOTS: usize = 4;
+const MAX_ALIAS_BYTES: usize = 48;
+const FRESH_FOR: Duration = Duration::minutes(15);
+const ROLLBACK_TOLERANCE: Duration = Duration::seconds(60);
+const STATE_FILE: &str = "current-state.json";
+const LOCK_FILE: &str = ".current-state.lock";
+const TEMP_PREFIX: &str = ".current-state.tmp-";
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestGate {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl TestGate {
+    fn wait(&self) {
+        self.reached.send(()).expect("test coordinator dropped");
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("test coordinator did not resume within 5 seconds");
+    }
+}
+
+#[cfg(test)]
+fn test_gate() -> (
+    TestGate,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    (
+        TestGate {
+            reached: reached_tx,
+            resume: std::sync::Arc::new(std::sync::Mutex::new(resume_rx)),
+        },
+        reached_rx,
+        resume_tx,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct WriteTestHook {
+    root: PathBuf,
+    gate: TestGate,
+    temp_path: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+}
+
+#[cfg(test)]
+static WRITE_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<WriteTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static LOCK_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, TestGate)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LockAttemptTestHook {
+    root: PathBuf,
+    attempting: std::sync::mpsc::Sender<()>,
+    acquired: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+static LOCK_ATTEMPT_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LockAttemptTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static POST_COMMIT_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, TestGate)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupFault {
+    ReaddirErrorAfterDirectoryOpen,
+}
+
+#[cfg(test)]
+static CLEANUP_TEST_FAULT: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, CleanupFault)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static ACTIVE_DIRECTORY_STREAMS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn cleanup_test_fault(root: &Path, stage: CleanupFault) -> Result<(), SnapshotError> {
+    let mut fault = CLEANUP_TEST_FAULT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    if fault
+        .as_ref()
+        .is_some_and(|(fault_root, fault_stage)| fault_root == root && *fault_stage == stage)
+    {
+        fault.take();
+        return Err(SnapshotError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn active_directory_streams(root: &Path) -> usize {
+    ACTIVE_DIRECTORY_STREAMS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(root)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn pause_after_temp_fsync(root: &Path, name: &str) {
+    let hook = WRITE_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.root == root) {
+        *hook.temp_path.lock().unwrap() = Some(root.join(name));
+        hook.gate.wait();
+    }
+}
+
+#[cfg(test)]
+fn pause_after_lock_open(root: &Path) {
+    let hook = LOCK_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some((_hook_root, gate)) = hook.filter(|hook| hook.0 == root) {
+        gate.wait();
+    }
+}
+
+#[cfg(test)]
+fn signal_lock_attempt(root: &Path) {
+    let hook = LOCK_ATTEMPT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.root == root) {
+        hook.attempting.send(()).expect("test coordinator dropped");
+    }
+}
+
+#[cfg(test)]
+fn signal_lock_acquired(root: &Path) {
+    let hook = LOCK_ATTEMPT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(hook) = hook.filter(|hook| hook.root == root) {
+        hook.acquired.send(()).expect("test coordinator dropped");
+    }
+}
+
+#[cfg(test)]
+fn pause_after_commit(root: &Path) -> Result<(), SnapshotError> {
+    let hook = POST_COMMIT_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some((_root, gate)) = hook.filter(|hook| hook.0 == root) {
+        gate.wait();
+        return Err(SnapshotError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn pause_after_lock_open(_: &Path) {}
+#[cfg(not(test))]
+fn signal_lock_attempt(_: &Path) {}
+#[cfg(not(test))]
+fn signal_lock_acquired(_: &Path) {}
+
+#[cfg(not(test))]
+fn pause_after_temp_fsync(_: &Path, _: &str) {}
+#[cfg(not(test))]
+fn pause_after_commit(_: &Path) -> Result<(), SnapshotError> {
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct AccountSlotId(String);
+
+impl fmt::Debug for AccountSlotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccountSlotId(<opaque>)")
+    }
+}
+
+impl AccountSlotId {
+    pub(crate) fn parse(value: impl Into<String>) -> Result<Self, SnapshotError> {
+        let value = value.into();
+        Uuid::parse_str(&value)
+            .ok()
+            .filter(|uuid| {
+                uuid.get_version_num() == 4
+                    && uuid.get_variant() == Variant::RFC4122
+                    && uuid.hyphenated().to_string() == value
+            })
+            .map(|_| Self(value))
+            .ok_or(SnapshotError::InvalidInput)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WindowKind {
+    FiveHour,
+    Weekly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BindingState {
+    Unbound,
+    Bound,
+    Unverified,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlanMetadata {
+    Paid,
+    Free,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservationStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceClass {
+    CompletionSse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SafeErrorCode {
+    Unavailable,
+    MalformedPayload,
+    UnsupportedObservation,
+    ClockRollback,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObservationEnvelopeV1 {
+    pub(crate) slot_id: AccountSlotId,
+    pub(crate) binding_epoch: u64,
+    pub(crate) sequence: u64,
+    pub(crate) observed_at: DateTime<Utc>,
+    pub(crate) status: ObservationStatus,
+    pub(crate) source: Option<SourceClass>,
+    pub(crate) windows: Vec<ObservationWindow>,
+    pub(crate) error_code: Option<SafeErrorCode>,
+}
+
+impl fmt::Debug for ObservationEnvelopeV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ObservationEnvelopeV1(<redacted>)")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ObservationWindow {
+    pub(crate) kind: WindowKind,
+    pub(crate) used_percent: f64,
+    pub(crate) reset_at: Option<DateTime<Utc>>,
+}
+
+impl ObservationEnvelopeV1 {
+    pub(crate) fn validate(&self, received_at: DateTime<Utc>) -> Result<(), SnapshotError> {
+        if self.binding_epoch == 0
+            || self.sequence == 0
+            || self.observed_at > received_at + Duration::minutes(1)
+        {
+            return Err(SnapshotError::InvalidInput);
+        }
+        match self.status {
+            ObservationStatus::Available => {
+                if self.source != Some(SourceClass::CompletionSse)
+                    || self.error_code.is_some()
+                    || self.windows.is_empty()
+                    || self.windows.len() > 2
+                {
+                    return Err(SnapshotError::InvalidInput);
+                }
+                if self.windows.iter().enumerate().any(|(index, window)| {
+                    !window.used_percent.is_finite()
+                        || !(0.0..=100.0).contains(&window.used_percent)
+                        || window
+                            .reset_at
+                            .is_some_and(|reset| reset < received_at - Duration::minutes(1))
+                        || (index == 1 && self.windows[0].kind != WindowKind::FiveHour)
+                        || (index == 1 && window.kind != WindowKind::Weekly)
+                }) {
+                    return Err(SnapshotError::InvalidInput);
+                }
+            }
+            ObservationStatus::Unavailable => {
+                if self.source.is_some() || !self.windows.is_empty() || self.error_code.is_none() {
+                    return Err(SnapshotError::InvalidInput);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeCurrentSnapshotsDto {
+    pub(crate) slots: Vec<ClaudeSlotProjectionDto>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeSlotProjectionDto {
+    pub(crate) alias: String,
+    pub(crate) binding_state: BindingState,
+    pub(crate) plan: Option<PlanMetadata>,
+    pub(crate) five_hour: WindowProjectionDto,
+    pub(crate) weekly: WindowProjectionDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WindowProjectionStatus {
+    Fresh,
+    Stale,
+    Expired,
+    Unavailable,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowProjectionDto {
+    pub(crate) status: WindowProjectionStatus,
+    pub(crate) used_percent: Option<f64>,
+    pub(crate) reset_at: Option<DateTime<Utc>>,
+    pub(crate) observed_at: Option<DateTime<Utc>>,
+    pub(crate) last_error_code: Option<SafeErrorCode>,
+}
+
+// Deliberately no Debug implementation for the persisted aggregate. Its private
+// binding ID, epoch, and sequence must not accidentally reach logs or diagnostics.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Aggregate {
+    schema_version: u32,
+    last_evaluated_wall_time: DateTime<Utc>,
+    slots: Vec<SlotState>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SlotState {
+    slot_id: AccountSlotId,
+    alias: String,
+    plan: Option<PlanMetadata>,
+    binding_id: Option<BindingId>,
+    binding_state: BindingState,
+    binding_epoch: u64,
+    next_sequence: u64,
+    windows: Vec<WindowRecord>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct BindingId(String);
+
+impl BindingId {
+    fn generate() -> Self {
+        Self(Uuid::new_v4().hyphenated().to_string())
+    }
+
+    fn is_canonical(&self) -> bool {
+        Uuid::parse_str(&self.0).ok().is_some_and(|value| {
+            value.get_version_num() == 4
+                && value.get_variant() == Variant::RFC4122
+                && value.hyphenated().to_string() == self.0
+        })
+    }
+}
+
+impl fmt::Debug for BindingId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BindingId(<opaque>)")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowRecord {
+    kind: WindowKind,
+    used_percent: Option<f64>,
+    observed_at: Option<DateTime<Utc>>,
+    received_at: Option<DateTime<Utc>>,
+    reset_at: Option<DateTime<Utc>>,
+    source: Option<SourceClass>,
+    terminal_expired: bool,
+    #[serde(default)]
+    clock_terminal: bool,
+    last_error_code: Option<SafeErrorCode>,
+}
+
+impl Aggregate {
+    fn empty(now: DateTime<Utc>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            last_evaluated_wall_time: now,
+            slots: vec![],
+        }
+    }
+
+    fn validate(&self) -> Result<(), SnapshotError> {
+        if self.schema_version != SCHEMA_VERSION || self.slots.len() > MAX_SLOTS {
+            return Err(SnapshotError::InvalidState);
+        }
+        let mut ids = std::collections::HashSet::new();
+        for slot in &self.slots {
+            if AccountSlotId::parse(slot.slot_id.0.clone()).is_err()
+                || !ids.insert(slot.slot_id.0.clone())
+                || !safe_alias(&slot.alias)
+                || slot.binding_epoch == 0
+                || slot.next_sequence == 0
+                || slot.windows.len() > 2
+            {
+                return Err(SnapshotError::InvalidState);
+            }
+            match slot.binding_state {
+                BindingState::Bound => {
+                    if !slot
+                        .binding_id
+                        .as_ref()
+                        .is_some_and(BindingId::is_canonical)
+                    {
+                        return Err(SnapshotError::InvalidState);
+                    }
+                }
+                BindingState::Unbound | BindingState::Unverified | BindingState::Error => {
+                    if slot.binding_id.is_some() || !slot.windows.is_empty() {
+                        return Err(SnapshotError::InvalidState);
+                    }
+                }
+            }
+            let mut kinds = std::collections::HashSet::new();
+            for window in &slot.windows {
+                let numeric = window.used_percent.is_some();
+                if !kinds.insert(window.kind as u8)
+                    || window
+                        .used_percent
+                        .is_some_and(|v| !v.is_finite() || !(0.0..=100.0).contains(&v))
+                    || window.observed_at.is_some() != window.received_at.is_some()
+                    || (numeric
+                        && (!window.observed_at.is_some()
+                            || !window.received_at.is_some()
+                            || window.source.is_none()))
+                    || (window.terminal_expired && window.used_percent.is_some())
+                    || (!window.terminal_expired && window.used_percent.is_none())
+                    || (window.clock_terminal && !window.terminal_expired)
+                    || window.received_at.is_some_and(|received| {
+                        received > self.last_evaluated_wall_time + Duration::minutes(1)
+                    })
+                {
+                    return Err(SnapshotError::InvalidState);
+                }
+                if let (Some(observed), Some(received)) = (window.observed_at, window.received_at) {
+                    if observed > received + Duration::minutes(1)
+                        || window
+                            .reset_at
+                            .is_some_and(|reset| reset < received - Duration::minutes(1))
+                    {
+                        return Err(SnapshotError::InvalidState);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct ClaudeSnapshotStore {
+    root: PathBuf,
+    #[cfg(unix)]
+    root_dir: File,
+}
+
+impl ClaudeSnapshotStore {
+    pub(crate) fn in_app_config(config_dir: &Path) -> Result<Self, SnapshotError> {
+        validate_no_symlink_ancestors(config_dir)?;
+        let config_dir = config_dir.canonicalize().map_err(|_| SnapshotError::Io)?;
+        let root = config_dir.join("claude-current-state");
+        Self::at_root(root)
+    }
+
+    pub(crate) fn at_root(root: PathBuf) -> Result<Self, SnapshotError> {
+        platform_supported()?;
+        let parent = root.parent().ok_or(SnapshotError::InvalidInput)?;
+        let name = root.file_name().ok_or(SnapshotError::InvalidInput)?;
+        let root = parent
+            .canonicalize()
+            .map_err(|_| SnapshotError::Io)?
+            .join(name);
+        ensure_root(&root)?;
+        #[cfg(unix)]
+        let root_dir = open_directory(&root)?;
+        Ok(Self {
+            root,
+            #[cfg(unix)]
+            root_dir,
+        })
+    }
+
+    pub(crate) fn register_slot(
+        &self,
+        slot_id: AccountSlotId,
+        alias: String,
+        plan: Option<PlanMetadata>,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        if !safe_alias(&alias) {
+            return Err(SnapshotError::InvalidInput);
+        }
+        self.mutate(now, |aggregate| {
+            if aggregate.slots.iter().any(|slot| slot.slot_id == slot_id)
+                || aggregate.slots.len() == MAX_SLOTS
+            {
+                return Err(SnapshotError::InvalidInput);
+            }
+            aggregate.slots.push(SlotState {
+                slot_id,
+                alias,
+                plan,
+                binding_id: Some(BindingId::generate()),
+                binding_state: BindingState::Bound,
+                binding_epoch: 1,
+                next_sequence: 1,
+                windows: vec![],
+            });
+            Ok(())
+        })
+    }
+
+    pub(crate) fn apply_observation(
+        &self,
+        observation: ObservationEnvelopeV1,
+        received_at: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        observation.validate(received_at)?;
+        self.mutate(received_at, |aggregate| {
+            let recovery_high_water = aggregate.last_evaluated_wall_time;
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| slot.slot_id == observation.slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            if slot.binding_state != BindingState::Bound
+                || observation.binding_epoch != slot.binding_epoch
+                || observation.sequence != slot.next_sequence
+            {
+                return Err(SnapshotError::Rejected);
+            }
+            match observation.status {
+                ObservationStatus::Available => {
+                    if observation.windows.iter().any(|incoming| {
+                        slot.windows
+                            .iter()
+                            .find(|existing| existing.kind == incoming.kind)
+                            .is_some_and(|existing| {
+                                existing.terminal_expired
+                                    && existing.clock_terminal
+                                    && received_at <= recovery_floor(recovery_high_water, existing)
+                            })
+                    }) {
+                        return Err(SnapshotError::Rejected);
+                    }
+                    for incoming in observation.windows {
+                        let record = WindowRecord {
+                            kind: incoming.kind,
+                            used_percent: Some(incoming.used_percent),
+                            observed_at: Some(observation.observed_at),
+                            received_at: Some(received_at),
+                            reset_at: incoming.reset_at,
+                            source: observation.source,
+                            terminal_expired: false,
+                            clock_terminal: false,
+                            last_error_code: None,
+                        };
+                        replace_window(&mut slot.windows, record);
+                    }
+                }
+                ObservationStatus::Unavailable => {
+                    for window in &mut slot.windows {
+                        window.last_error_code = observation.error_code;
+                    }
+                }
+            }
+            slot.next_sequence = slot
+                .next_sequence
+                .checked_add(1)
+                .ok_or(SnapshotError::Rejected)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn mark_unverified(
+        &self,
+        slot_id: &AccountSlotId,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            if slot.binding_state != BindingState::Unverified {
+                slot.binding_epoch = slot
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or(SnapshotError::Rejected)?;
+            }
+            slot.next_sequence = 1;
+            slot.binding_state = BindingState::Unverified;
+            slot.binding_id = None;
+            slot.windows.clear();
+            Ok(())
+        })
+    }
+
+    pub(crate) fn rebind(
+        &self,
+        slot_id: &AccountSlotId,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            if slot.binding_state != BindingState::Unverified {
+                slot.binding_epoch = slot
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or(SnapshotError::Rejected)?;
+            }
+            slot.binding_id = Some(BindingId::generate());
+            slot.binding_state = BindingState::Bound;
+            slot.next_sequence = 1;
+            slot.windows.clear();
+            Ok(())
+        })
+    }
+
+    pub(crate) fn unpair(
+        &self,
+        slot_id: &AccountSlotId,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            slot.binding_id = None;
+            slot.binding_state = BindingState::Unbound;
+            slot.next_sequence = 1;
+            slot.windows.clear();
+            Ok(())
+        })
+    }
+
+    pub(crate) fn project(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<ClaudeCurrentSnapshotsDto, SnapshotError> {
+        let _lock = self.lock()?;
+        self.cleanup_orphan_temps()?;
+        let mut aggregate = self.load(now)?;
+        if impossible_clock(&aggregate, now) {
+            if fail_closed_for_clock(&mut aggregate, now) {
+                self.write_aggregate(&aggregate)?;
+            }
+        }
+        let changed = project_expiry(&mut aggregate, now);
+        if changed {
+            self.write_aggregate(&aggregate)?;
+        }
+        Ok(ClaudeCurrentSnapshotsDto {
+            slots: aggregate
+                .slots
+                .iter()
+                .map(|slot| ClaudeSlotProjectionDto {
+                    alias: slot.alias.clone(),
+                    binding_state: slot.binding_state,
+                    plan: slot.plan,
+                    five_hour: projection_for(slot, WindowKind::FiveHour, now),
+                    weekly: projection_for(slot, WindowKind::Weekly, now),
+                })
+                .collect(),
+        })
+    }
+
+    fn mutate<F>(&self, now: DateTime<Utc>, change: F) -> Result<(), SnapshotError>
+    where
+        F: FnOnce(&mut Aggregate) -> Result<(), SnapshotError>,
+    {
+        let _lock = self.lock()?;
+        self.cleanup_orphan_temps()?;
+        let mut aggregate = self.load(now)?;
+        if impossible_clock(&aggregate, now) {
+            let changed = fail_closed_for_clock(&mut aggregate, now);
+            if changed {
+                self.write_aggregate(&aggregate)?;
+            }
+            return Err(SnapshotError::Rejected);
+        }
+        change(&mut aggregate)?;
+        project_expiry(&mut aggregate, now);
+        aggregate.validate()?;
+        self.write_aggregate(&aggregate)
+    }
+
+    fn load(&self, now: DateTime<Utc>) -> Result<Aggregate, SnapshotError> {
+        self.verify_root()?;
+        #[cfg(unix)]
+        return self.load_from_pinned_root(now);
+        #[cfg(not(unix))]
+        return Err(SnapshotError::Unsupported);
+    }
+
+    #[cfg(unix)]
+    fn load_from_pinned_root(&self, now: DateTime<Utc>) -> Result<Aggregate, SnapshotError> {
+        let path_metadata = match child_metadata(&self.root_dir, STATE_FILE) {
+            Ok(metadata) => metadata,
+            Err(SnapshotError::NotFound) => return Ok(Aggregate::empty(now)),
+            Err(error) => return Err(error),
+        };
+        if path_metadata.is_symlink() {
+            return Err(SnapshotError::InvalidState);
+        }
+        let mut file = open_child_existing(&self.root_dir, STATE_FILE)?;
+        let metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        validate_open_regular_owned(&metadata, 0o600)?;
+        if !path_metadata.matches(&metadata) {
+            return Err(SnapshotError::InvalidState);
+        }
+        if metadata.len() > MAX_FILE_BYTES {
+            return Err(SnapshotError::InvalidState);
+        }
+        let mut content = Vec::with_capacity(metadata.len() as usize + 1);
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut content)
+            .map_err(|_| SnapshotError::Io)?;
+        if content.len() as u64 > MAX_FILE_BYTES {
+            return Err(SnapshotError::InvalidState);
+        }
+        let aggregate: Aggregate =
+            serde_json::from_slice(&content).map_err(|_| SnapshotError::InvalidState)?;
+        aggregate.validate()?;
+        Ok(aggregate)
+    }
+
+    fn write_aggregate(&self, aggregate: &Aggregate) -> Result<(), SnapshotError> {
+        self.verify_root()?;
+        #[cfg(unix)]
+        return self.write_to_pinned_root(aggregate);
+        #[cfg(not(unix))]
+        return Err(SnapshotError::Unsupported);
+    }
+
+    #[cfg(unix)]
+    fn write_to_pinned_root(&self, aggregate: &Aggregate) -> Result<(), SnapshotError> {
+        let bytes = serde_json::to_vec(aggregate).map_err(|_| SnapshotError::InvalidState)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(SnapshotError::InvalidState);
+        }
+        let temp = format!("{TEMP_PREFIX}{}-{}", std::process::id(), Uuid::new_v4());
+        let mut file = open_child_new(&self.root_dir, &temp)?;
+        file.write_all(&bytes).map_err(|_| SnapshotError::Io)?;
+        file.sync_all().map_err(|_| SnapshotError::Io)?;
+        pause_after_temp_fsync(&self.root, &temp);
+        let path_metadata = child_metadata(&self.root_dir, &temp)?;
+        let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        if !path_metadata.matches(&file_metadata) {
+            return Err(SnapshotError::InvalidState);
+        }
+        rename_child(&self.root_dir, &temp, STATE_FILE)?;
+        self.root_dir.sync_all().map_err(|_| SnapshotError::Io)?;
+        pause_after_commit(&self.root)?;
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<LockGuard, SnapshotError> {
+        self.verify_root()?;
+        #[cfg(unix)]
+        {
+            signal_lock_attempt(&self.root);
+            let guard = LockGuard::acquire(&self.root_dir, &self.root)?;
+            signal_lock_acquired(&self.root);
+            return Ok(guard);
+        }
+        #[cfg(not(unix))]
+        Err(SnapshotError::Unsupported)
+    }
+
+    fn cleanup_orphan_temps(&self) -> Result<(), SnapshotError> {
+        #[cfg(unix)]
+        return cleanup_orphan_temps(&self.root_dir, &self.root);
+        #[cfg(not(unix))]
+        Err(SnapshotError::Unsupported)
+    }
+
+    fn verify_root(&self) -> Result<(), SnapshotError> {
+        #[cfg(unix)]
+        {
+            let path_metadata = fs::symlink_metadata(&self.root).map_err(|_| SnapshotError::Io)?;
+            let descriptor_metadata = self.root_dir.metadata().map_err(|_| SnapshotError::Io)?;
+            validate_open_directory_owned(&descriptor_metadata)?;
+            if path_metadata.file_type().is_symlink()
+                || !same_file_identity(&path_metadata, &descriptor_metadata)
+            {
+                return Err(SnapshotError::InvalidState);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotError {
+    InvalidInput,
+    InvalidState,
+    Rejected,
+    Io,
+    Unsupported,
+    NotFound,
+}
+
+fn safe_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= MAX_ALIAS_BYTES
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_graphic() && c != '/' && c != '\\')
+}
+
+fn replace_window(windows: &mut Vec<WindowRecord>, record: WindowRecord) {
+    if let Some(existing) = windows
+        .iter_mut()
+        .find(|existing| existing.kind == record.kind)
+    {
+        *existing = record;
+    } else {
+        windows.push(record);
+        windows.sort_by_key(|window| match window.kind {
+            WindowKind::FiveHour => 0,
+            WindowKind::Weekly => 1,
+        });
+    }
+}
+
+fn recovery_floor(high_water: DateTime<Utc>, window: &WindowRecord) -> DateTime<Utc> {
+    window
+        .received_at
+        .map_or(high_water, |received| high_water.max(received))
+}
+
+fn project_expiry(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
+    let rollback = now + ROLLBACK_TOLERANCE < aggregate.last_evaluated_wall_time;
+    let mut changed = rollback;
+    for slot in &mut aggregate.slots {
+        for window in &mut slot.windows {
+            let expired = rollback
+                || window.terminal_expired
+                || window.reset_at.is_some_and(|reset| now >= reset)
+                || window.reset_at.is_none()
+                    && window
+                        .received_at
+                        .is_some_and(|received| now > received + FRESH_FOR);
+            if expired && (!window.terminal_expired || window.used_percent.is_some()) {
+                window.terminal_expired = true;
+                window.used_percent = None;
+                if rollback {
+                    window.clock_terminal = true;
+                    window.last_error_code = Some(SafeErrorCode::ClockRollback);
+                }
+                changed = true;
+            }
+        }
+    }
+    if now > aggregate.last_evaluated_wall_time {
+        aggregate.last_evaluated_wall_time = now;
+        changed = true;
+    }
+    changed
+}
+
+fn impossible_clock(aggregate: &Aggregate, now: DateTime<Utc>) -> bool {
+    now + ROLLBACK_TOLERANCE < aggregate.last_evaluated_wall_time
+        || aggregate
+            .slots
+            .iter()
+            .flat_map(|slot| &slot.windows)
+            .any(|window| {
+                window
+                    .received_at
+                    .is_some_and(|received| now + ROLLBACK_TOLERANCE < received)
+            })
+}
+
+fn fail_closed_for_clock(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
+    let aggregate_rollback = now + ROLLBACK_TOLERANCE < aggregate.last_evaluated_wall_time;
+    let mut changed = false;
+    for slot in &mut aggregate.slots {
+        for window in &mut slot.windows {
+            let window_rollback = window
+                .received_at
+                .is_some_and(|received| now + ROLLBACK_TOLERANCE < received);
+            if aggregate_rollback || window_rollback {
+                let numeric_was_present = window.used_percent.take().is_some();
+                let needs_upgrade = numeric_was_present
+                    || !window.terminal_expired
+                    || !window.clock_terminal
+                    || window.last_error_code != Some(SafeErrorCode::ClockRollback);
+                window.terminal_expired = true;
+                window.clock_terminal = true;
+                window.last_error_code = Some(SafeErrorCode::ClockRollback);
+                if needs_upgrade {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn projection_for(slot: &SlotState, kind: WindowKind, now: DateTime<Utc>) -> WindowProjectionDto {
+    if slot.binding_state != BindingState::Bound {
+        return WindowProjectionDto {
+            status: WindowProjectionStatus::Unavailable,
+            used_percent: None,
+            reset_at: None,
+            observed_at: None,
+            last_error_code: Some(SafeErrorCode::Unavailable),
+        };
+    }
+    let Some(window) = slot.windows.iter().find(|window| window.kind == kind) else {
+        return WindowProjectionDto {
+            status: WindowProjectionStatus::Unavailable,
+            used_percent: None,
+            reset_at: None,
+            observed_at: None,
+            last_error_code: None,
+        };
+    };
+    if window.terminal_expired || window.used_percent.is_none() {
+        return WindowProjectionDto {
+            status: if window.reset_at.is_some() {
+                WindowProjectionStatus::Expired
+            } else {
+                WindowProjectionStatus::Unavailable
+            },
+            used_percent: None,
+            reset_at: window.reset_at,
+            observed_at: window.observed_at,
+            last_error_code: window.last_error_code,
+        };
+    }
+    let status = if window
+        .received_at
+        .is_some_and(|received| now <= received + FRESH_FOR)
+    {
+        WindowProjectionStatus::Fresh
+    } else {
+        WindowProjectionStatus::Stale
+    };
+    WindowProjectionDto {
+        status,
+        used_percent: window.used_percent,
+        reset_at: window.reset_at,
+        observed_at: window.observed_at,
+        last_error_code: window.last_error_code,
+    }
+}
+
+fn ensure_root(root: &Path) -> Result<(), SnapshotError> {
+    validate_no_symlink_ancestors(root)?;
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(SnapshotError::InvalidState),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(root).map_err(|_| SnapshotError::Io)?
+        }
+        Err(_) => return Err(SnapshotError::Io),
+    }
+    #[cfg(unix)]
+    {
+        fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(|_| SnapshotError::Io)?;
+    }
+    validate_directory_owned(root)
+}
+
+#[cfg(unix)]
+fn platform_supported() -> Result<(), SnapshotError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn platform_supported() -> Result<(), SnapshotError> {
+    // Current crash-safety depends on no-follow opens, descriptor checks, and
+    // advisory locking. Refuse persistence where those guarantees are absent.
+    Err(SnapshotError::Unsupported)
+}
+
+fn validate_no_symlink_ancestors(path: &Path) -> Result<(), SnapshotError> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(SnapshotError::InvalidState)
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(SnapshotError::Io),
+        }
+    }
+    Ok(())
+}
+
+fn validate_directory_owned(path: &Path) -> Result<(), SnapshotError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| SnapshotError::Io)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(SnapshotError::InvalidState);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(SnapshotError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
+fn validate_open_directory_owned(metadata: &fs::Metadata) -> Result<(), SnapshotError> {
+    if !metadata.file_type().is_dir() {
+        return Err(SnapshotError::InvalidState);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(SnapshotError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> Result<File, SnapshotError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| SnapshotError::Io)?;
+    validate_open_directory_owned(&file.metadata().map_err(|_| SnapshotError::Io)?)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+struct ChildMetadata {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl ChildMetadata {
+    fn is_symlink(&self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32
+    }
+
+    fn matches(&self, metadata: &fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.dev == metadata.dev() && self.ino == metadata.ino()
+    }
+}
+
+#[cfg(unix)]
+fn child_metadata(root: &File, name: &str) -> Result<ChildMetadata, SnapshotError> {
+    let name = CString::new(name).map_err(|_| SnapshotError::InvalidInput)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Err(SnapshotError::NotFound)
+        } else {
+            Err(SnapshotError::Io)
+        };
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(ChildMetadata {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+        mode: stat.st_mode as u32,
+    })
+}
+
+#[cfg(unix)]
+fn open_child_existing(root: &File, name: &str) -> Result<File, SnapshotError> {
+    openat(root, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
+}
+
+#[cfg(unix)]
+fn open_child_new(root: &File, name: &str) -> Result<File, SnapshotError> {
+    openat(
+        root,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        0o600,
+    )
+}
+
+#[cfg(unix)]
+fn openat(root: &File, name: &str, flags: i32, mode: u32) -> Result<File, SnapshotError> {
+    let name = CString::new(name).map_err(|_| SnapshotError::InvalidInput)?;
+    let fd = unsafe { libc::openat(root.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(SnapshotError::Io);
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn rename_child(root: &File, from: &str, to: &str) -> Result<(), SnapshotError> {
+    let from = CString::new(from).map_err(|_| SnapshotError::InvalidInput)?;
+    let to = CString::new(to).map_err(|_| SnapshotError::InvalidInput)?;
+    if unsafe {
+        libc::renameat(
+            root.as_raw_fd(),
+            from.as_ptr(),
+            root.as_raw_fd(),
+            to.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(SnapshotError::Io);
+    }
+    Ok(())
+}
+
+fn validate_regular_owned(path: &Path, expected_mode: u32) -> Result<(), SnapshotError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| SnapshotError::Io)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(SnapshotError::InvalidState);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != expected_mode
+        {
+            return Err(SnapshotError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
+fn validate_open_regular_owned(
+    metadata: &fs::Metadata,
+    expected_mode: u32,
+) -> Result<(), SnapshotError> {
+    if !metadata.file_type().is_file() {
+        return Err(SnapshotError::InvalidState);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != expected_mode
+        {
+            return Err(SnapshotError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    false
+}
+
+fn open_private_new(path: &Path) -> Result<File, SnapshotError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|_| SnapshotError::Io)
+}
+
+fn open_private_existing(path: &Path) -> Result<File, SnapshotError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|_| SnapshotError::Io)
+}
+
+fn sync_directory(path: &Path) -> Result<(), SnapshotError> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| SnapshotError::Io)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct DirectoryStream {
+    directory: *mut libc::DIR,
+    #[cfg(test)]
+    root_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl DirectoryStream {
+    fn from_fd(fd: std::os::unix::io::RawFd, root_path: &Path) -> Result<Self, SnapshotError> {
+        #[cfg(not(test))]
+        let _ = root_path;
+        let directory = unsafe { libc::fdopendir(fd) };
+        if directory.is_null() {
+            unsafe { libc::close(fd) };
+            return Err(SnapshotError::Io);
+        }
+        #[cfg(test)]
+        {
+            let mut active = ACTIVE_DIRECTORY_STREAMS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap();
+            *active.entry(root_path.to_path_buf()).or_default() += 1;
+        }
+        Ok(Self {
+            directory,
+            #[cfg(test)]
+            root_path: root_path.to_path_buf(),
+        })
+    }
+
+    fn next_name(&mut self) -> Result<Option<&CStr>, SnapshotError> {
+        clear_readdir_errno()?;
+        let entry = unsafe { libc::readdir(self.directory) };
+        if entry.is_null() {
+            return if readdir_errno()? == 0 {
+                Ok(None)
+            } else {
+                Err(SnapshotError::Io)
+            };
+        }
+        Ok(Some(unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::closedir(self.directory) };
+        #[cfg(test)]
+        {
+            let mut active = ACTIVE_DIRECTORY_STREAMS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap();
+            let count = active
+                .get_mut(&self.root_path)
+                .expect("directory stream root must be tracked");
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.root_path);
+            }
+        }
+    }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn readdir_errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn readdir_errno_pointer() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn clear_readdir_errno() -> Result<(), SnapshotError> {
+    unsafe { *readdir_errno_pointer() = 0 };
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn readdir_errno() -> Result<libc::c_int, SnapshotError> {
+    Ok(unsafe { *readdir_errno_pointer() })
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn clear_readdir_errno() -> Result<(), SnapshotError> {
+    Err(SnapshotError::Unsupported)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn readdir_errno() -> Result<libc::c_int, SnapshotError> {
+    Err(SnapshotError::Unsupported)
+}
+
+#[cfg(unix)]
+fn cleanup_orphan_temps(root: &File, root_path: &Path) -> Result<(), SnapshotError> {
+    #[cfg(not(test))]
+    let _ = root_path;
+
+    // Open "." relative to the pinned descriptor. Unlike dup(2), this gives
+    // enumeration an independent directory-stream offset while preserving the
+    // store's retained root descriptor and its later state operations.
+    let duplicate = openat(
+        root,
+        ".",
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )?;
+    let mut directory = DirectoryStream::from_fd(duplicate.into_raw_fd(), root_path)?;
+    #[cfg(test)]
+    cleanup_test_fault(root_path, CleanupFault::ReaddirErrorAfterDirectoryOpen)?;
+    loop {
+        let Some(name) = directory.next_name()? else {
+            break;
+        };
+        let Ok(name) = name.to_str() else { continue };
+        if name == "." || name == ".." || !is_inactive_temp_name(name) {
+            continue;
+        }
+        let path_metadata = child_metadata(root, name)?;
+        // Symlinks, directories, and malformed candidates are never cleanup
+        // targets. A substitution after this check fails closed below.
+        if path_metadata.is_symlink()
+            || path_metadata.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+        {
+            continue;
+        }
+        let file = open_child_existing(root, name)?;
+        let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        validate_open_regular_owned(&file_metadata, 0o600)?;
+        if !path_metadata.matches(&file_metadata) {
+            return Err(SnapshotError::InvalidState);
+        }
+        let name = CString::new(name).map_err(|_| SnapshotError::InvalidInput)?;
+        if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(SnapshotError::Io);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cleanup_orphan_temps(_: &File, _: &Path) -> Result<(), SnapshotError> {
+    Err(SnapshotError::Unsupported)
+}
+
+fn is_inactive_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let Some((pid, nonce)) = rest.split_once('-') else {
+        return false;
+    };
+    if pid.is_empty()
+        || (pid.len() > 1 && pid.starts_with('0'))
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    if pid == 0 || pid.to_string() != rest.split_once('-').expect("checked above").0 {
+        return false;
+    }
+    Uuid::parse_str(nonce).ok().is_some_and(|uuid| {
+        uuid.get_version_num() == 4
+            && uuid.get_variant() == Variant::RFC4122
+            && uuid.hyphenated().to_string() == nonce
+    })
+}
+
+struct LockGuard {
+    file: File,
+}
+impl LockGuard {
+    #[cfg(unix)]
+    fn acquire(root: &File, root_path: &Path) -> Result<Self, SnapshotError> {
+        let file = match openat(
+            root,
+            LOCK_FILE,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+            0o600,
+        ) {
+            Ok(file) => file,
+            Err(_) => return Err(SnapshotError::Io),
+        };
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|_| SnapshotError::Io)?;
+        let file_metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+        validate_open_regular_owned(&file_metadata, 0o600)?;
+        pause_after_lock_open(root_path);
+        #[cfg(unix)]
+        {
+            if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) }
+                != 0
+            {
+                return Err(SnapshotError::Io);
+            }
+        }
+        let path_metadata = child_metadata(root, LOCK_FILE)?;
+        if path_metadata.is_symlink() || !path_metadata.matches(&file_metadata) {
+            return Err(SnapshotError::InvalidState);
+        }
+        Ok(Self { file })
+    }
+}
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = unsafe {
+                libc::flock(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&self.file),
+                    libc::LOCK_UN,
+                )
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static HOOK_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "quotabar-c3a-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+    fn store(name: &str) -> ClaudeSnapshotStore {
+        ClaudeSnapshotStore::at_root(root(name)).unwrap()
+    }
+    fn slot(value: &str) -> AccountSlotId {
+        AccountSlotId::parse(value).unwrap()
+    }
+    fn register(store: &ClaudeSnapshotStore, id: AccountSlotId, now: DateTime<Utc>) {
+        store
+            .register_slot(id, "safe".into(), Some(PlanMetadata::Paid), now)
+            .unwrap();
+    }
+    fn available(
+        id: AccountSlotId,
+        epoch: u64,
+        sequence: u64,
+        windows: Vec<ObservationWindow>,
+    ) -> ObservationEnvelopeV1 {
+        ObservationEnvelopeV1 {
+            slot_id: id,
+            binding_epoch: epoch,
+            sequence,
+            observed_at: now(),
+            status: ObservationStatus::Available,
+            source: Some(SourceClass::CompletionSse),
+            windows,
+            error_code: None,
+        }
+    }
+    fn available_at(
+        id: AccountSlotId,
+        epoch: u64,
+        sequence: u64,
+        windows: Vec<ObservationWindow>,
+        observed_at: DateTime<Utc>,
+    ) -> ObservationEnvelopeV1 {
+        let mut observation = available(id, epoch, sequence, windows);
+        observation.observed_at = observed_at;
+        observation
+    }
+    fn window(kind: WindowKind, percent: f64, reset: Option<DateTime<Utc>>) -> ObservationWindow {
+        ObservationWindow {
+            kind,
+            used_percent: percent,
+            reset_at: reset,
+        }
+    }
+    fn projection(store: &ClaudeSnapshotStore, now: DateTime<Utc>) -> ClaudeSlotProjectionDto {
+        store.project(now).unwrap().slots.remove(0)
+    }
+
+    fn overwrite_aggregate(store: &ClaudeSnapshotStore, aggregate: &Aggregate) {
+        let path = store.root.join(STATE_FILE);
+        let bytes = serde_json::to_vec(aggregate).unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+    }
+
+    enum WorkerOutcome<T> {
+        Returned(T),
+        Panicked,
+    }
+
+    #[derive(Default)]
+    struct WorkerAudit {
+        completed: std::sync::atomic::AtomicUsize,
+        joins: std::sync::atomic::AtomicUsize,
+        panics: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WorkerAudit {
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.completed.load(Ordering::SeqCst),
+                self.joins.load(Ordering::SeqCst),
+                self.panics.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum WorkerFailure {
+        Panicked,
+    }
+
+    struct GateWorker<T: Send + 'static> {
+        resume: Option<std::sync::mpsc::Sender<()>>,
+        completed: std::sync::mpsc::Receiver<()>,
+        handle: Option<std::thread::JoinHandle<WorkerOutcome<T>>>,
+        audit: std::sync::Arc<WorkerAudit>,
+    }
+
+    impl<T: Send + 'static> GateWorker<T> {
+        fn spawn<F>(resume: Option<std::sync::mpsc::Sender<()>>, operation: F) -> Self
+        where
+            F: FnOnce() -> T + Send + 'static,
+        {
+            Self::spawn_with_audit(
+                std::sync::Arc::new(WorkerAudit::default()),
+                resume,
+                operation,
+            )
+        }
+
+        fn spawn_with_audit<F>(
+            audit: std::sync::Arc<WorkerAudit>,
+            resume: Option<std::sync::mpsc::Sender<()>>,
+            operation: F,
+        ) -> Self
+        where
+            F: FnOnce() -> T + Send + 'static,
+        {
+            let (completed_tx, completed) = std::sync::mpsc::channel();
+            let worker_audit = audit.clone();
+            let handle = std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+                worker_audit.completed.fetch_add(1, Ordering::SeqCst);
+                let _ = completed_tx.send(());
+                match result {
+                    Ok(value) => WorkerOutcome::Returned(value),
+                    Err(_) => WorkerOutcome::Panicked,
+                }
+            });
+            Self {
+                resume,
+                completed,
+                handle: Some(handle),
+                audit,
+            }
+        }
+
+        fn release(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+
+        fn wait_for_completion(&self) {
+            self.completed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                // Every test worker blocks only at a cancellable gate or behind
+                // a writer whose gate is released before this wait. A timeout
+                // cannot safely be joined in-process; abort avoids detaching it.
+                .unwrap_or_else(|_| std::process::abort());
+        }
+
+        fn finish_after_release(mut self) -> Result<T, WorkerFailure> {
+            self.wait_for_completion();
+            let outcome = self.handle.take().unwrap().join().unwrap();
+            self.audit.joins.fetch_add(1, Ordering::SeqCst);
+            match outcome {
+                WorkerOutcome::Returned(value) => Ok(value),
+                WorkerOutcome::Panicked => {
+                    self.audit.panics.fetch_add(1, Ordering::SeqCst);
+                    Err(WorkerFailure::Panicked)
+                }
+            }
+        }
+
+        fn finish(mut self) -> Result<T, WorkerFailure> {
+            self.release();
+            self.finish_after_release()
+        }
+    }
+
+    impl<T: Send + 'static> Drop for GateWorker<T> {
+        fn drop(&mut self) {
+            if self.handle.is_none() {
+                return;
+            }
+            self.release();
+            self.wait_for_completion();
+            if let Some(handle) = self.handle.take() {
+                self.audit.joins.fetch_add(1, Ordering::SeqCst);
+                if matches!(handle.join().unwrap(), WorkerOutcome::Panicked) {
+                    self.audit.panics.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    struct WorkerPair<W: Send + 'static, R: Send + 'static> {
+        writer: Option<GateWorker<W>>,
+        reader: Option<GateWorker<R>>,
+    }
+
+    impl<W: Send + 'static, R: Send + 'static> WorkerPair<W, R> {
+        fn new(writer: GateWorker<W>, reader: GateWorker<R>) -> Self {
+            Self {
+                writer: Some(writer),
+                reader: Some(reader),
+            }
+        }
+
+        fn finish(mut self) -> (Result<W, WorkerFailure>, Result<R, WorkerFailure>) {
+            self.writer.as_mut().unwrap().release();
+            self.reader.as_mut().unwrap().release();
+            let writer = self.writer.take().unwrap().finish_after_release();
+            let reader = self.reader.take().unwrap().finish_after_release();
+            (writer, reader)
+        }
+    }
+
+    impl<W: Send + 'static, R: Send + 'static> Drop for WorkerPair<W, R> {
+        fn drop(&mut self) {
+            if let Some(writer) = &mut self.writer {
+                writer.release();
+            }
+            if let Some(reader) = &mut self.reader {
+                reader.release();
+            }
+            // Dropping each owned worker acknowledges completion before joining.
+        }
+    }
+
+    struct TestHookScope;
+
+    impl Drop for TestHookScope {
+        fn drop(&mut self) {
+            if let Some(hook) = WRITE_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(hook) = LOCK_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(hook) = LOCK_ATTEMPT_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(hook) = POST_COMMIT_TEST_HOOK.get() {
+                *hook.lock().unwrap() = None;
+            }
+            if let Some(fault) = CLEANUP_TEST_FAULT.get() {
+                *fault.lock().unwrap() = None;
+            }
+        }
+    }
+
+    #[test]
+    fn gate_worker_drop_releases_gate_and_joins_before_returning() {
+        let (gate, reached, resume) = test_gate();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = GateWorker::spawn(Some(resume), {
+            let finished = finished.clone();
+            move || {
+                gate.wait();
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(worker);
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn gate_worker_finish_surfaces_worker_panic_after_bounded_completion() {
+        let worker = GateWorker::spawn(None, || -> () { panic!("controlled worker panic") });
+        assert_eq!(worker.finish(), Err(WorkerFailure::Panicked));
+    }
+
+    fn seed_full_bound_state(s: &ClaudeSnapshotStore, id: AccountSlotId) -> Aggregate {
+        register(s, id.clone(), now());
+        s.mark_unverified(&id, now()).unwrap();
+        s.rebind(&id, now()).unwrap();
+        s.apply_observation(
+            available(
+                id,
+                2,
+                1,
+                vec![
+                    window(WindowKind::FiveHour, 21.0, Some(now() + Duration::hours(2))),
+                    window(WindowKind::Weekly, 63.0, Some(now() + Duration::days(2))),
+                ],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.load(now()).unwrap()
+    }
+
+    fn expected_unpaired(mut aggregate: Aggregate) -> Aggregate {
+        let slot = aggregate.slots.first_mut().unwrap();
+        slot.binding_id = None;
+        slot.binding_state = BindingState::Unbound;
+        slot.next_sequence = 1;
+        slot.windows.clear();
+        aggregate
+    }
+
+    #[test]
+    fn weekly_expiry_hides_only_weekly() {
+        let s = store("weekly");
+        let id = slot("123e4567-e89b-42d3-a456-426614174000");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id,
+                1,
+                1,
+                vec![
+                    window(WindowKind::FiveHour, 20.0, Some(now() + Duration::hours(2))),
+                    window(WindowKind::Weekly, 40.0, Some(now() + Duration::minutes(1))),
+                ],
+            ),
+            now(),
+        )
+        .unwrap();
+        let p = projection(&s, now() + Duration::minutes(2));
+        assert!(p.five_hour.used_percent.is_some());
+        assert!(p.weekly.used_percent.is_none());
+    }
+    #[test]
+    fn five_hour_expiry_hides_only_five_hour() {
+        let s = store("five");
+        let id = slot("123e4567-e89b-42d3-a456-426614174001");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id,
+                1,
+                1,
+                vec![
+                    window(
+                        WindowKind::FiveHour,
+                        20.0,
+                        Some(now() + Duration::minutes(1)),
+                    ),
+                    window(WindowKind::Weekly, 40.0, Some(now() + Duration::hours(2))),
+                ],
+            ),
+            now(),
+        )
+        .unwrap();
+        let p = projection(&s, now() + Duration::minutes(2));
+        assert!(p.five_hour.used_percent.is_none());
+        assert!(p.weekly.used_percent.is_some());
+    }
+    #[test]
+    fn reset_never_unpairs_and_post_reset_repopulates() {
+        let s = store("reset");
+        let id = slot("123e4567-e89b-42d3-a456-426614174002");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(now() + Duration::minutes(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(2)).binding_state,
+            BindingState::Bound
+        );
+        s.apply_observation(
+            available(
+                id,
+                1,
+                2,
+                vec![window(
+                    WindowKind::FiveHour,
+                    1.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now() + Duration::minutes(2),
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(2))
+                .five_hour
+                .used_percent,
+            Some(1.0)
+        );
+    }
+    #[test]
+    fn missing_reset_becomes_unavailable() {
+        let s = store("missing-reset");
+        let id = slot("123e4567-e89b-42d3-a456-426614174003");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(id, 1, 1, vec![window(WindowKind::FiveHour, 20.0, None)]),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(16))
+                .five_hour
+                .status,
+            WindowProjectionStatus::Unavailable
+        );
+    }
+    #[test]
+    fn partial_update_preserves_other_window() {
+        let s = store("partial");
+        let id = slot("123e4567-e89b-42d3-a456-426614174004");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![
+                    window(WindowKind::FiveHour, 20.0, Some(now() + Duration::hours(1))),
+                    window(WindowKind::Weekly, 40.0, Some(now() + Duration::hours(1))),
+                ],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.apply_observation(
+            available(
+                id,
+                1,
+                2,
+                vec![window(
+                    WindowKind::FiveHour,
+                    30.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        let p = projection(&s, now());
+        assert_eq!(p.five_hour.used_percent, Some(30.0));
+        assert_eq!(p.weekly.used_percent, Some(40.0));
+    }
+    #[test]
+    fn old_epoch_replay_and_skipped_sequence_mutate_nothing() {
+        let s = store("sequence");
+        let id = slot("123e4567-e89b-42d3-a456-426614174005");
+        register(&s, id.clone(), now());
+        let one = available(
+            id.clone(),
+            1,
+            1,
+            vec![window(
+                WindowKind::FiveHour,
+                20.0,
+                Some(now() + Duration::hours(1)),
+            )],
+        );
+        s.apply_observation(one.clone(), now()).unwrap();
+        for bad in [
+            available(
+                id.clone(),
+                0,
+                2,
+                vec![window(WindowKind::FiveHour, 1.0, None)],
+            ),
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(WindowKind::FiveHour, 1.0, None)],
+            ),
+            available(id, 1, 3, vec![window(WindowKind::FiveHour, 1.0, None)]),
+        ] {
+            assert!(s.apply_observation(bad, now()).is_err());
+        }
+        assert_eq!(projection(&s, now()).five_hour.used_percent, Some(20.0));
+    }
+    #[test]
+    fn uncertainty_hides_old_values_immediately() {
+        let s = store("uncertain");
+        let id = slot("123e4567-e89b-42d3-a456-426614174006");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.mark_unverified(&id, now()).unwrap();
+        let p = projection(&s, now());
+        assert_eq!(p.binding_state, BindingState::Unverified);
+        assert_eq!(p.five_hour.used_percent, None);
+    }
+
+    #[test]
+    fn uncertainty_rebind_rejects_prior_epoch_and_accepts_new_epoch() {
+        let s = store("rebind");
+        let id = slot("123e4567-e89b-42d3-a456-42661417400e");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.mark_unverified(&id, now()).unwrap();
+        s.rebind(&id, now()).unwrap();
+        assert!(s
+            .apply_observation(
+                available(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        90.0,
+                        Some(now() + Duration::hours(1))
+                    )]
+                ),
+                now()
+            )
+            .is_err());
+        s.apply_observation(
+            available(
+                id,
+                2,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    30.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(projection(&s, now()).five_hour.used_percent, Some(30.0));
+    }
+
+    #[test]
+    fn rollback_next_sequence_is_rejected_and_terminal_state_survives_restart() {
+        let path = root("rollback-next");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-42661417400f");
+        register(&s, id.clone(), now());
+        let future = now() + Duration::hours(1);
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(future + Duration::hours(1)),
+                )],
+            ),
+            future,
+        )
+        .unwrap();
+        assert_eq!(
+            s.apply_observation(
+                available(
+                    id,
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        30.0,
+                        Some(future + Duration::hours(2))
+                    )]
+                ),
+                now()
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        let restarted = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        assert_eq!(projection(&restarted, future).five_hour.used_percent, None);
+        let restarted_again = ClaudeSnapshotStore::at_root(path).unwrap();
+        assert_eq!(
+            projection(&restarted_again, future).five_hour.used_percent,
+            None
+        );
+    }
+    #[test]
+    fn rollback_cannot_resurrect_after_reload() {
+        let s = store("rollback");
+        let id = slot("123e4567-e89b-42d3-a456-426614174007");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id,
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(now() + Duration::minutes(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(2))
+                .five_hour
+                .used_percent,
+            None
+        );
+        assert_eq!(projection(&s, now()).five_hour.used_percent, None);
+    }
+    #[test]
+    fn atomic_file_is_complete_old_or_new() {
+        let s = store("atomic");
+        let id = slot("123e4567-e89b-42d3-a456-426614174008");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id,
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        let data = fs::read(s.root.join(STATE_FILE)).unwrap();
+        let _: Aggregate = serde_json::from_slice(&data).unwrap();
+    }
+    #[test]
+    fn slots_are_independent_and_safe_dto_has_no_private_fields() {
+        let s = store("slots");
+        let a = slot("123e4567-e89b-42d3-a456-426614174009");
+        let b = slot("123e4567-e89b-42d3-a456-42661417400a");
+        register(&s, a.clone(), now());
+        register(&s, b.clone(), now());
+        s.apply_observation(
+            available(
+                a,
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.apply_observation(
+            ObservationEnvelopeV1 {
+                slot_id: b,
+                binding_epoch: 1,
+                sequence: 1,
+                observed_at: now(),
+                status: ObservationStatus::Unavailable,
+                source: None,
+                windows: vec![],
+                error_code: Some(SafeErrorCode::Unavailable),
+            },
+            now(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&s.project(now()).unwrap()).unwrap();
+        assert!(
+            !json.contains("bindingId")
+                && !json.contains("bindingEpoch")
+                && !json.contains("sequence")
+                && !json.contains("BindingId")
+        );
+    }
+    #[test]
+    fn malformed_event_does_not_contaminate_another_slot() {
+        let s = store("malformed-isolation");
+        let a = slot("123e4567-e89b-42d3-a456-42661417400b");
+        let b = slot("123e4567-e89b-42d3-a456-42661417400c");
+        register(&s, a.clone(), now());
+        register(&s, b.clone(), now());
+        s.apply_observation(
+            available(
+                b,
+                1,
+                1,
+                vec![window(
+                    WindowKind::Weekly,
+                    44.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        assert!(s
+            .apply_observation(
+                available(a, 1, 1, vec![window(WindowKind::FiveHour, 101.0, None)]),
+                now()
+            )
+            .is_err());
+        let dto = s.project(now()).unwrap();
+        assert_eq!(dto.slots[1].weekly.used_percent, Some(44.0));
+    }
+
+    #[test]
+    fn offline_restart_has_same_safe_projection() {
+        let root = root("offline-restart");
+        let s = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-42661417400d");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id,
+                1,
+                1,
+                vec![window(
+                    WindowKind::Weekly,
+                    12.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        let before = serde_json::to_string(&s.project(now()).unwrap()).unwrap();
+        let restarted = ClaudeSnapshotStore::at_root(root).unwrap();
+        let after = serde_json::to_string(&restarted.project(now()).unwrap()).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn repeated_sub_tolerance_calls_never_lower_high_water() {
+        let s = store("high-water");
+        let id = slot("123e4567-e89b-42d3-a456-426614174010");
+        let later = now() + Duration::minutes(5);
+        register(&s, id, later);
+        let high_water = s.load(later).unwrap().last_evaluated_wall_time;
+        for offset in [
+            Duration::seconds(1),
+            Duration::seconds(30),
+            Duration::seconds(59),
+        ] {
+            s.project(later - offset).unwrap();
+            assert_eq!(s.load(later).unwrap().last_evaluated_wall_time, high_water);
+        }
+    }
+
+    #[test]
+    fn unpair_is_atomic_and_retains_only_slot_metadata() {
+        let s = store("unpair");
+        let id = slot("123e4567-e89b-42d3-a456-426614174011");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::Weekly,
+                    20.0,
+                    Some(now() + Duration::hours(1)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.unpair(&id, now()).unwrap();
+        let aggregate = s.load(now()).unwrap();
+        assert_eq!(aggregate.slots.len(), 1);
+        assert_eq!(aggregate.slots[0].binding_state, BindingState::Unbound);
+        assert!(aggregate.slots[0].binding_id.is_none());
+        assert!(aggregate.slots[0].windows.is_empty());
+    }
+
+    #[test]
+    fn invalid_structure_and_binding_id_fail_closed_without_overwrite() {
+        let s = store("invalid-state");
+        let id = slot("123e4567-e89b-42d3-a456-426614174012");
+        register(&s, id, now());
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.slots[0].binding_id = Some(BindingId("not-a-uuid".into()));
+        overwrite_aggregate(&s, &aggregate);
+        let before = fs::read(s.root.join(STATE_FILE)).unwrap();
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+        assert_eq!(fs::read(s.root.join(STATE_FILE)).unwrap(), before);
+    }
+
+    #[test]
+    fn duplicate_slot_and_terminal_value_conflict_are_rejected() {
+        let s = store("invalid-records");
+        let id = slot("123e4567-e89b-42d3-a456-426614174013");
+        register(&s, id, now());
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.slots.push(aggregate.slots[0].clone());
+        assert_eq!(aggregate.validate(), Err(SnapshotError::InvalidState));
+        aggregate.slots.pop();
+        aggregate.slots[0].windows.push(WindowRecord {
+            kind: WindowKind::Weekly,
+            used_percent: Some(1.0),
+            observed_at: Some(now()),
+            received_at: Some(now()),
+            reset_at: Some(now() + Duration::hours(1)),
+            source: Some(SourceClass::CompletionSse),
+            terminal_expired: true,
+            clock_terminal: false,
+            last_error_code: None,
+        });
+        assert_eq!(aggregate.validate(), Err(SnapshotError::InvalidState));
+    }
+
+    #[test]
+    fn malformed_json_and_precisely_named_orphan_fail_closed_or_cleanup_under_lock() {
+        let _serial = hook_test_lock();
+        let s = store("malformed-and-orphan");
+        let id = slot("123e4567-e89b-42d3-a456-426614174014");
+        register(&s, id, now());
+        let state = s.root.join(STATE_FILE);
+        fs::write(&state, b"{").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+
+        let temp = s
+            .root
+            .join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        let _file = open_private_new(&temp).unwrap();
+        drop(_file);
+        let _lock = s.lock().unwrap();
+        cleanup_orphan_temps(&s.root_dir, &s.root).unwrap();
+        assert!(!temp.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_app_config_and_final_state_component_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let parent = root("symlinks");
+        fs::create_dir_all(&parent).unwrap();
+        let config = parent.join("config");
+        fs::create_dir(&config).unwrap();
+        let linked = parent.join("linked-config");
+        symlink(&config, &linked).unwrap();
+        assert!(matches!(
+            ClaudeSnapshotStore::in_app_config(&linked),
+            Err(SnapshotError::InvalidState)
+        ));
+
+        let s = ClaudeSnapshotStore::at_root(parent.join("state")).unwrap();
+        let state = s.root.join(STATE_FILE);
+        symlink("missing-target", &state).unwrap();
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+    }
+
+    #[test]
+    fn debug_rendering_redacts_forbidden_internal_values() {
+        let envelope = available(
+            slot("123e4567-e89b-42d3-a456-426614174015"),
+            77,
+            88,
+            vec![window(WindowKind::Weekly, 9.0, None)],
+        );
+        let debug = format!("{envelope:?}");
+        assert!(!debug.contains("77") && !debug.contains("88") && !debug.contains("123e"));
+        let binding_debug = format!("{:?}", BindingId::generate());
+        assert!(!binding_debug.contains('-'));
+    }
+
+    #[test]
+    fn read_side_received_at_rollback_persists_terminal_until_newer_observation() {
+        let path = root("read-rollback");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174016");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    42.0,
+                    Some(now() + Duration::hours(2)),
+                )],
+            ),
+            now(),
+        )
+        .unwrap();
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.slots[0].windows[0].received_at = Some(now() + Duration::seconds(50));
+        overwrite_aggregate(&s, &aggregate);
+
+        let read_time = now() - Duration::seconds(20);
+        let projected = projection(&s, read_time);
+        assert_eq!(projected.five_hour.used_percent, None);
+        let terminal = s.load(now()).unwrap();
+        assert!(terminal.slots[0].windows[0].terminal_expired);
+        assert_eq!(terminal.last_evaluated_wall_time, now());
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        assert_eq!(projection(&restarted, now()).five_hour.used_percent, None);
+        assert!(restarted
+            .apply_observation(
+                available(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(WindowKind::FiveHour, 1.0, None)]
+                ),
+                read_time
+            )
+            .is_err());
+        restarted
+            .apply_observation(
+                available(
+                    id,
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        7.0,
+                        Some(now() + Duration::hours(3)),
+                    )],
+                ),
+                now() + Duration::minutes(2),
+            )
+            .unwrap();
+        assert_eq!(
+            projection(&restarted, now() + Duration::minutes(2))
+                .five_hour
+                .used_percent,
+            Some(7.0)
+        );
+    }
+
+    #[test]
+    fn clock_terminal_recovery_requires_strictly_later_aggregate_high_water() {
+        let path = root("clock-terminal-aggregate-floor");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174030");
+        let high_water = now() + Duration::minutes(10);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available_at(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    42.0,
+                    Some(high_water + Duration::hours(1)),
+                )],
+                high_water,
+            ),
+            high_water,
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, high_water - Duration::seconds(61))
+                .five_hour
+                .used_percent,
+            None
+        );
+
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        let before = fs::read(restarted.root.join(STATE_FILE)).unwrap();
+        let inside_floor = high_water - Duration::seconds(30);
+        assert_eq!(
+            restarted.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    inside_floor,
+                ),
+                inside_floor,
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(fs::read(restarted.root.join(STATE_FILE)).unwrap(), before);
+        assert_eq!(
+            projection(&restarted, high_water).five_hour.used_percent,
+            None
+        );
+
+        let recovered_at = high_water + Duration::minutes(2);
+        let terminal = restarted.load(recovered_at).unwrap();
+        assert_eq!(terminal.slots[0].next_sequence, 2);
+        assert_eq!(
+            recovery_floor(
+                terminal.last_evaluated_wall_time,
+                &terminal.slots[0].windows[0]
+            ),
+            high_water
+        );
+        assert!(!impossible_clock(&terminal, recovered_at));
+        assert!(
+            recovered_at
+                > recovery_floor(
+                    terminal.last_evaluated_wall_time,
+                    &terminal.slots[0].windows[0]
+                )
+        );
+        let recovery = available_at(
+            id,
+            1,
+            2,
+            vec![window(
+                WindowKind::FiveHour,
+                7.0,
+                Some(high_water + Duration::hours(2)),
+            )],
+            recovered_at,
+        );
+        assert!(recovery.validate(recovered_at).is_ok());
+        restarted.apply_observation(recovery, recovered_at).unwrap();
+        let recovered = restarted.load(recovered_at).unwrap();
+        assert_eq!(recovered.last_evaluated_wall_time, recovered_at);
+        assert_eq!(recovered.slots[0].next_sequence, 3);
+        assert_eq!(
+            projection(&restarted, recovered_at).five_hour.used_percent,
+            Some(7.0)
+        );
+    }
+
+    #[test]
+    fn clock_terminal_recovery_uses_later_persisted_receipt_floor() {
+        let s = store("clock-terminal-window-floor");
+        let id = slot("123e4567-e89b-42d3-a456-426614174031");
+        let high_water = now() + Duration::minutes(10);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available_at(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::Weekly,
+                    42.0,
+                    Some(high_water + Duration::hours(1)),
+                )],
+                high_water,
+            ),
+            high_water,
+        )
+        .unwrap();
+        let later_receipt = high_water + Duration::seconds(50);
+        let mut aggregate = s.load(high_water).unwrap();
+        aggregate.slots[0].windows[0].received_at = Some(later_receipt);
+        overwrite_aggregate(&s, &aggregate);
+        assert_eq!(
+            projection(&s, high_water - Duration::seconds(20))
+                .weekly
+                .used_percent,
+            None
+        );
+
+        // The window receipt (H+50s), not aggregate high-water (H), is the
+        // distinct limiting floor for every later recovery attempt.
+        s.apply_observation(
+            ObservationEnvelopeV1 {
+                slot_id: id.clone(),
+                binding_epoch: 1,
+                sequence: 2,
+                observed_at: high_water - Duration::seconds(10),
+                status: ObservationStatus::Unavailable,
+                source: None,
+                windows: vec![],
+                error_code: Some(SafeErrorCode::Unavailable),
+            },
+            high_water - Duration::seconds(10),
+        )
+        .unwrap();
+        let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
+        restarted
+            .apply_observation(
+                ObservationEnvelopeV1 {
+                    slot_id: id.clone(),
+                    binding_epoch: 1,
+                    sequence: 3,
+                    observed_at: high_water,
+                    status: ObservationStatus::Unavailable,
+                    source: None,
+                    windows: vec![],
+                    error_code: Some(SafeErrorCode::Unavailable),
+                },
+                high_water,
+            )
+            .unwrap();
+        let before = fs::read(restarted.root.join(STATE_FILE)).unwrap();
+        assert_eq!(
+            restarted.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    4,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    later_receipt,
+                ),
+                later_receipt,
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(fs::read(restarted.root.join(STATE_FILE)).unwrap(), before);
+        assert!(projection(&restarted, high_water)
+            .weekly
+            .used_percent
+            .is_none());
+        let recovered_at = later_receipt + Duration::seconds(1);
+        restarted
+            .apply_observation(
+                available_at(
+                    id,
+                    1,
+                    4,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    recovered_at,
+                ),
+                recovered_at,
+            )
+            .unwrap();
+        assert_eq!(
+            projection(&restarted, recovered_at).weekly.used_percent,
+            Some(7.0)
+        );
+    }
+
+    #[test]
+    fn unavailable_observation_preserves_clock_terminal_recovery_floor() {
+        let path = root("rollback-unavailable");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174033");
+        let high_water = now() + Duration::minutes(10);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available_at(
+                id.clone(),
+                1,
+                1,
+                vec![window(
+                    WindowKind::FiveHour,
+                    42.0,
+                    Some(high_water + Duration::hours(1)),
+                )],
+                high_water,
+            ),
+            high_water,
+        )
+        .unwrap();
+        // Here aggregate high-water H is deliberately later than the window's
+        // persisted receipt, so H is the distinct limiting recovery floor.
+        let mut aggregate = s.load(high_water).unwrap();
+        aggregate.slots[0].windows[0].received_at = Some(high_water - Duration::seconds(30));
+        overwrite_aggregate(&s, &aggregate);
+        s.project(high_water - Duration::seconds(61)).unwrap();
+        s.apply_observation(
+            ObservationEnvelopeV1 {
+                slot_id: id.clone(),
+                binding_epoch: 1,
+                sequence: 2,
+                observed_at: high_water - Duration::seconds(45),
+                status: ObservationStatus::Unavailable,
+                source: None,
+                windows: vec![],
+                error_code: Some(SafeErrorCode::Unavailable),
+            },
+            high_water - Duration::seconds(45),
+        )
+        .unwrap();
+        assert!(s.load(high_water).unwrap().slots[0].windows[0].clock_terminal);
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        restarted
+            .apply_observation(
+                ObservationEnvelopeV1 {
+                    slot_id: id.clone(),
+                    binding_epoch: 1,
+                    sequence: 3,
+                    observed_at: high_water - Duration::seconds(30),
+                    status: ObservationStatus::Unavailable,
+                    source: None,
+                    windows: vec![],
+                    error_code: Some(SafeErrorCode::Unavailable),
+                },
+                high_water - Duration::seconds(30),
+            )
+            .unwrap();
+        assert!(restarted.load(high_water).unwrap().slots[0].windows[0].clock_terminal);
+        let before = fs::read(restarted.root.join(STATE_FILE)).unwrap();
+        assert_eq!(
+            restarted.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    4,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        5.0,
+                        Some(high_water + Duration::hours(1))
+                    )],
+                    high_water - Duration::seconds(20)
+                ),
+                high_water - Duration::seconds(20),
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(fs::read(restarted.root.join(STATE_FILE)).unwrap(), before);
+        restarted
+            .apply_observation(
+                available_at(
+                    id,
+                    1,
+                    4,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        5.0,
+                        Some(high_water + Duration::hours(1)),
+                    )],
+                    high_water + Duration::seconds(1),
+                ),
+                high_water + Duration::seconds(1),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn already_terminal_windows_upgrade_to_rollback_provenance_before_recovery() {
+        // Aggregate high-water can limit recovery after either ordinary terminal
+        // form. A later persisted receipt cannot coexist with an earlier reset
+        // terminal under structural timestamp validation, so the distinct
+        // receipt-floor fixture below necessarily uses the no-reset form.
+        for (name, reset_at) in [
+            ("terminal-upgrade-reset", Some(now() + Duration::seconds(1))),
+            ("terminal-upgrade-no-reset", None),
+        ] {
+            let path = root(name);
+            let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+            let id = slot("123e4567-e89b-42d3-a456-426614174037");
+            let high_water = if reset_at.is_some() {
+                now() + Duration::minutes(10)
+            } else {
+                now() + Duration::minutes(30)
+            };
+            register(&s, id.clone(), now());
+            s.apply_observation(
+                available(
+                    id.clone(),
+                    1,
+                    1,
+                    vec![window(WindowKind::FiveHour, 42.0, reset_at)],
+                ),
+                now(),
+            )
+            .unwrap();
+            let ordinary_expiry = reset_at.unwrap_or(now() + FRESH_FOR + Duration::seconds(1));
+            assert_eq!(projection(&s, ordinary_expiry).five_hour.used_percent, None);
+            s.project(high_water).unwrap();
+            let terminal = s.load(high_water).unwrap();
+            assert!(terminal.slots[0].windows[0].terminal_expired);
+            assert!(!terminal.slots[0].windows[0].clock_terminal);
+
+            let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+            restarted
+                .project(high_water - Duration::seconds(61))
+                .unwrap();
+            let upgraded = restarted.load(high_water).unwrap();
+            let upgraded_window = &upgraded.slots[0].windows[0];
+            assert!(upgraded_window.clock_terminal);
+            assert_eq!(
+                upgraded_window.last_error_code,
+                Some(SafeErrorCode::ClockRollback)
+            );
+            restarted
+                .apply_observation(
+                    ObservationEnvelopeV1 {
+                        slot_id: id.clone(),
+                        binding_epoch: 1,
+                        sequence: 2,
+                        observed_at: high_water,
+                        status: ObservationStatus::Unavailable,
+                        source: None,
+                        windows: vec![],
+                        error_code: Some(SafeErrorCode::Unavailable),
+                    },
+                    high_water,
+                )
+                .unwrap();
+            let restarted_again = ClaudeSnapshotStore::at_root(restarted.root.clone()).unwrap();
+            let before = fs::read(restarted_again.root.join(STATE_FILE)).unwrap();
+            assert_eq!(
+                restarted_again.apply_observation(
+                    available_at(
+                        id.clone(),
+                        1,
+                        3,
+                        vec![window(
+                            WindowKind::FiveHour,
+                            7.0,
+                            Some(high_water + Duration::hours(2))
+                        )],
+                        high_water,
+                    ),
+                    high_water,
+                ),
+                Err(SnapshotError::Rejected)
+            );
+            assert_eq!(
+                fs::read(restarted_again.root.join(STATE_FILE)).unwrap(),
+                before
+            );
+            restarted_again
+                .apply_observation(
+                    available_at(
+                        id,
+                        1,
+                        3,
+                        vec![window(
+                            WindowKind::FiveHour,
+                            7.0,
+                            Some(high_water + Duration::hours(2)),
+                        )],
+                        high_water + Duration::seconds(1),
+                    ),
+                    high_water + Duration::seconds(1),
+                )
+                .unwrap();
+            assert_eq!(
+                projection(&restarted_again, high_water + Duration::seconds(1))
+                    .five_hour
+                    .used_percent,
+                Some(7.0)
+            );
+        }
+
+        let path = root("terminal-upgrade-window-floor");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174038");
+        let high_water = now() + Duration::minutes(30);
+        let later_receipt = high_water + Duration::seconds(50);
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(
+                id.clone(),
+                1,
+                1,
+                vec![window(WindowKind::Weekly, 42.0, None)],
+            ),
+            now(),
+        )
+        .unwrap();
+        s.project(now() + FRESH_FOR + Duration::seconds(1)).unwrap();
+        s.project(high_water).unwrap();
+        let mut terminal = s.load(high_water).unwrap();
+        terminal.slots[0].windows[0].received_at = Some(later_receipt);
+        overwrite_aggregate(&s, &terminal);
+        let restarted = ClaudeSnapshotStore::at_root(path).unwrap();
+        restarted
+            .project(high_water - Duration::seconds(20))
+            .unwrap();
+        let upgraded = restarted.load(high_water).unwrap();
+        assert!(upgraded.slots[0].windows[0].clock_terminal);
+        assert_eq!(
+            upgraded.slots[0].windows[0].last_error_code,
+            Some(SafeErrorCode::ClockRollback)
+        );
+        let restarted_after_upgrade = ClaudeSnapshotStore::at_root(restarted.root.clone()).unwrap();
+        assert!(
+            restarted_after_upgrade.load(high_water).unwrap().slots[0].windows[0].clock_terminal
+        );
+        let before = fs::read(restarted_after_upgrade.root.join(STATE_FILE)).unwrap();
+        assert_eq!(
+            restarted_after_upgrade.apply_observation(
+                available_at(
+                    id.clone(),
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2))
+                    )],
+                    later_receipt,
+                ),
+                later_receipt,
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(
+            fs::read(restarted_after_upgrade.root.join(STATE_FILE)).unwrap(),
+            before
+        );
+        restarted_after_upgrade
+            .apply_observation(
+                available_at(
+                    id,
+                    1,
+                    2,
+                    vec![window(
+                        WindowKind::Weekly,
+                        7.0,
+                        Some(high_water + Duration::hours(2)),
+                    )],
+                    later_receipt + Duration::seconds(11),
+                ),
+                later_receipt + Duration::seconds(11),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn ambiguous_pre_provenance_schema_fails_closed_without_rewrite() {
+        let s = store("pre-provenance-schema");
+        let id = slot("123e4567-e89b-42d3-a456-426614174034");
+        register(&s, id, now());
+        let mut aggregate = s.load(now()).unwrap();
+        aggregate.schema_version = 1;
+        overwrite_aggregate(&s, &aggregate);
+        let before = fs::read(s.root.join(STATE_FILE)).unwrap();
+
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+        assert_eq!(fs::read(s.root.join(STATE_FILE)).unwrap(), before);
+    }
+
+    #[test]
+    fn timeless_or_inconsistent_numeric_state_fails_closed_without_rewrite() {
+        let s = store("timeless-numeric");
+        let id = slot("123e4567-e89b-42d3-a456-426614174032");
+        register(&s, id.clone(), now());
+        s.apply_observation(
+            available(id, 1, 1, vec![window(WindowKind::FiveHour, 42.0, None)]),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(14))
+                .five_hour
+                .used_percent,
+            Some(42.0)
+        );
+
+        let valid = s.load(now()).unwrap();
+        for invalid in [
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].observed_at = None;
+                aggregate.slots[0].windows[0].received_at = None;
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].observed_at = None;
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].received_at = None;
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].observed_at = Some(now() + Duration::minutes(2));
+                aggregate
+            },
+            {
+                let mut aggregate = valid.clone();
+                aggregate.slots[0].windows[0].reset_at = Some(now() - Duration::minutes(2));
+                aggregate
+            },
+        ] {
+            overwrite_aggregate(&s, &invalid);
+            let bytes = fs::read(s.root.join(STATE_FILE)).unwrap();
+            assert_eq!(invalid.validate(), Err(SnapshotError::InvalidState));
+            assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+            assert_eq!(fs::read(s.root.join(STATE_FILE)).unwrap(), bytes);
+        }
+
+        overwrite_aggregate(&s, &valid);
+        assert_eq!(
+            projection(&s, now() + Duration::minutes(16))
+                .five_hour
+                .used_percent,
+            None
+        );
+    }
+
+    #[test]
+    fn uuid_variant_is_required_for_slot_and_binding_ids() {
+        for invalid in [
+            "123e4567-e89b-42d3-0456-426614174000",
+            "123e4567-e89b-42d3-c456-426614174000",
+            "123e4567-e89b-42d3-e456-426614174000",
+        ] {
+            assert!(AccountSlotId::parse(invalid).is_err());
+            assert!(!BindingId(invalid.into()).is_canonical());
+        }
+        let generated = Uuid::new_v4().hyphenated().to_string();
+        assert!(AccountSlotId::parse(generated.clone()).is_ok());
+        assert!(BindingId(generated).is_canonical());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_root_replacement_fails_closed_without_writing_replacement() {
+        let path = root("pinned-root");
+        let s = ClaudeSnapshotStore::at_root(path.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174017");
+        register(&s, id, now());
+        let displaced = path.with_extension("displaced");
+        fs::rename(&path, &displaced).unwrap();
+        fs::create_dir(&path).unwrap();
+        let decoy = path.join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        drop(open_private_new(&decoy).unwrap());
+        assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+        assert!(!path.join(STATE_FILE).exists());
+        assert!(decoy.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_cleanup_removes_only_verified_orphans_and_keeps_root_usable() {
+        let _serial = hook_test_lock();
+        use std::os::unix::fs::symlink;
+        let s = store("descriptor-cleanup");
+        let orphan = s
+            .root
+            .join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        drop(open_private_new(&orphan).unwrap());
+        let unrelated = s.root.join("unrelated");
+        fs::write(&unrelated, b"keep").unwrap();
+        let malformed = s.root.join(format!("{TEMP_PREFIX}not-a-pid"));
+        fs::write(&malformed, b"keep").unwrap();
+        let directory = s
+            .root
+            .join(format!("{TEMP_PREFIX}99998-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let link = s
+            .root
+            .join(format!("{TEMP_PREFIX}99997-{}", Uuid::new_v4()));
+        symlink(&unrelated, &link).unwrap();
+        let _lock = s.lock().unwrap();
+        cleanup_orphan_temps(&s.root_dir, &s.root).unwrap();
+        assert!(!orphan.exists());
+        assert!(unrelated.exists() && malformed.exists() && directory.exists() && link.exists());
+        drop(_lock);
+        s.project(now()).unwrap();
+    }
+
+    #[test]
+    fn orphan_temp_name_requires_exact_producer_grammar() {
+        let canonical = format!("{TEMP_PREFIX}{}-{}", std::process::id(), Uuid::new_v4());
+        assert!(is_inactive_temp_name(&canonical));
+        for rejected in [
+            format!("{TEMP_PREFIX}0-{}", Uuid::new_v4()),
+            format!("{TEMP_PREFIX}00{}-{}", std::process::id(), Uuid::new_v4()),
+            format!("{TEMP_PREFIX}+{}-{}", std::process::id(), Uuid::new_v4()),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-12d3-a456-426614174000"
+            ),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-42d3-0456-426614174000"
+            ),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-42d3-c456-426614174000"
+            ),
+            format!(
+                "{TEMP_PREFIX}{}-{}",
+                std::process::id(),
+                "123e4567-e89b-42d3-e456-426614174000"
+            ),
+            canonical.to_uppercase(),
+            format!("{canonical}-suffix"),
+            format!(
+                "{TEMP_PREFIX}{}-{}-extra",
+                std::process::id(),
+                Uuid::new_v4()
+            ),
+        ] {
+            assert!(!is_inactive_temp_name(&rejected), "accepted {rejected}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_failures_close_directory_stream_and_preserve_candidates() {
+        let _serial = hook_test_lock();
+        let s = store("cleanup-failures");
+        let id = slot("123e4567-e89b-42d3-a456-426614174022");
+        register(&s, id, now());
+        let candidate = s.root.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::set_permissions(
+            &candidate,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            *CLEANUP_TEST_FAULT
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap() = Some((s.root.clone(), CleanupFault::ReaddirErrorAfterDirectoryOpen));
+            let _lock = s.lock().unwrap();
+            assert!(matches!(
+                cleanup_orphan_temps(&s.root_dir, &s.root),
+                Err(SnapshotError::Io)
+            ));
+            drop(_lock);
+            assert!(candidate.exists());
+            assert_eq!(active_directory_streams(&s.root), 0);
+            s.load(now()).unwrap();
+        }
+
+        for _ in 0..3 {
+            let _lock = s.lock().unwrap();
+            assert!(matches!(
+                cleanup_orphan_temps(&s.root_dir, &s.root),
+                Err(SnapshotError::InvalidState)
+            ));
+            drop(_lock);
+            assert!(candidate.exists());
+            assert_eq!(active_directory_streams(&s.root), 0);
+            s.load(now()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_fault_is_scoped_to_its_intended_root() {
+        let _serial = hook_test_lock();
+        let _scope = TestHookScope;
+        let affected = store("cleanup-fault-affected");
+        let competing = store("cleanup-fault-competing");
+        let affected_temp = affected.root.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let competing_temp = competing.root.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        drop(open_private_new(&affected_temp).unwrap());
+        drop(open_private_new(&competing_temp).unwrap());
+        *CLEANUP_TEST_FAULT
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((
+            affected.root.clone(),
+            CleanupFault::ReaddirErrorAfterDirectoryOpen,
+        ));
+
+        let competing_lock = competing.lock().unwrap();
+        cleanup_orphan_temps(&competing.root_dir, &competing.root).unwrap();
+        drop(competing_lock);
+        assert!(!competing_temp.exists());
+
+        let affected_lock = affected.lock().unwrap();
+        assert_eq!(
+            cleanup_orphan_temps(&affected.root_dir, &affected.root),
+            Err(SnapshotError::Io)
+        );
+        drop(affected_lock);
+        assert!(affected_temp.exists());
+        assert_eq!(active_directory_streams(&affected.root), 0);
+        assert_eq!(active_directory_streams(&competing.root), 0);
+    }
+
+    #[test]
+    fn temp_path_substitution_after_fsync_fails_closed() {
+        let _serial = hook_test_lock();
+        let _scope = TestHookScope;
+        let s = std::sync::Arc::new(store("temp-substitution"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174018");
+        register(&s, id, now());
+        let aggregate = s.load(now()).unwrap();
+        let (gate, reached, resume) = test_gate();
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            gate,
+            temp_path: temp_path.clone(),
+        });
+        let writer = GateWorker::spawn(Some(resume), {
+            let s = s.clone();
+            move || s.write_aggregate(&aggregate)
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let temp = temp_path.lock().unwrap().clone().unwrap();
+        let substitute = temp.with_extension("substitute");
+        fs::rename(&temp, &substitute).unwrap();
+        fs::write(&temp, b"substituted").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&temp, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(writer.finish().unwrap().is_err());
+    }
+
+    #[test]
+    fn active_temp_is_preserved_while_concurrent_projection_waits_on_lock() {
+        let _serial = hook_test_lock();
+        let _scope = TestHookScope;
+        let s = std::sync::Arc::new(store("active-temp"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174019");
+        register(&s, id, now());
+        let (gate, reached, resume) = test_gate();
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let orphan = s
+            .root
+            .join(format!("{TEMP_PREFIX}99999-{}", Uuid::new_v4()));
+        drop(open_private_new(&orphan).unwrap());
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            gate,
+            temp_path: temp_path.clone(),
+        });
+        let writer = GateWorker::spawn(Some(resume), {
+            let s = s.clone();
+            move || s.mutate(now(), |_| Ok(()))
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let active = temp_path.lock().unwrap().clone().unwrap();
+        assert!(active.exists());
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        *LOCK_ATTEMPT_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(LockAttemptTestHook {
+            root: s.root.clone(),
+            attempting: attempting_tx,
+            acquired: acquired_tx,
+        });
+        let reader = GateWorker::spawn(None, {
+            let s = s.clone();
+            move || s.project(now())
+        });
+        let workers = WorkerPair::new(writer, reader);
+        attempting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(active.exists());
+        let (writer, reader) = workers.finish();
+        writer.unwrap().unwrap();
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        reader.unwrap().unwrap();
+        assert!(!active.exists());
+        assert!(!orphan.exists());
+    }
+
+    #[derive(Clone, Copy)]
+    struct ActiveTempFailureCase {
+        name: &'static str,
+        coordinator_panics: bool,
+        writer_panics: bool,
+        reader_panics: bool,
+        early_return: bool,
+    }
+
+    fn run_active_temp_failure_case(case: ActiveTempFailureCase) {
+        let serial = hook_test_lock();
+        let audit = std::sync::Arc::new(WorkerAudit::default());
+        let mut scope = Some(TestHookScope);
+        let s = std::sync::Arc::new(store(case.name));
+        let id = slot("123e4567-e89b-42d3-a456-426614174036");
+        register(&s, id, now());
+        let (gate, reached, resume) = test_gate();
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            gate,
+            temp_path,
+        });
+        let writer = GateWorker::spawn_with_audit(audit.clone(), Some(resume), {
+            let s = s.clone();
+            move || {
+                s.mutate(now(), |_| Ok(())).unwrap();
+                if case.writer_panics {
+                    panic!("controlled writer panic");
+                }
+            }
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        *LOCK_ATTEMPT_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(LockAttemptTestHook {
+            root: s.root.clone(),
+            attempting: attempting_tx,
+            acquired: acquired_tx,
+        });
+        let reader = GateWorker::spawn_with_audit(audit.clone(), None, {
+            let s = s.clone();
+            move || {
+                s.project(now()).unwrap();
+                if case.reader_panics {
+                    panic!("controlled reader panic");
+                }
+            }
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let workers = WorkerPair::new(writer, reader);
+            attempting_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(matches!(
+                acquired_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            if case.coordinator_panics {
+                panic!("controlled coordinator panic after reader pre-lock");
+            }
+            if case.early_return {
+                return None;
+            }
+            Some(workers.finish())
+        }));
+        assert_eq!(outcome.is_err(), case.coordinator_panics);
+        if let Ok(Some((writer, reader))) = outcome {
+            assert_eq!(writer.is_err(), case.writer_panics);
+            assert_eq!(reader.is_err(), case.reader_panics);
+        }
+        assert_eq!(
+            audit.counts(),
+            (
+                2,
+                2,
+                usize::from(case.writer_panics) + usize::from(case.reader_panics)
+            )
+        );
+        drop(scope.take());
+        assert!(WRITE_TEST_HOOK.get().unwrap().lock().unwrap().is_none());
+        assert!(LOCK_ATTEMPT_TEST_HOOK
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_none());
+        drop(serial);
+        let _reusable_scope = hook_test_lock();
+    }
+
+    #[test]
+    fn active_temp_failure_matrix_has_isolated_bounded_worker_evidence() {
+        for case in [
+            ActiveTempFailureCase {
+                name: "active-temp-normal",
+                coordinator_panics: false,
+                writer_panics: false,
+                reader_panics: false,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-early",
+                coordinator_panics: false,
+                writer_panics: false,
+                reader_panics: false,
+                early_return: true,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-coordinator",
+                coordinator_panics: true,
+                writer_panics: false,
+                reader_panics: false,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-writer",
+                coordinator_panics: false,
+                writer_panics: true,
+                reader_panics: false,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-reader",
+                coordinator_panics: false,
+                writer_panics: false,
+                reader_panics: true,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-both",
+                coordinator_panics: false,
+                writer_panics: true,
+                reader_panics: true,
+                early_return: false,
+            },
+            ActiveTempFailureCase {
+                name: "active-temp-combined",
+                coordinator_panics: true,
+                writer_panics: true,
+                reader_panics: false,
+                early_return: false,
+            },
+        ] {
+            run_active_temp_failure_case(case);
+        }
+    }
+
+    #[test]
+    fn unpair_pre_rename_interruption_reopens_wholly_old_state() {
+        let _serial = hook_test_lock();
+        let _scope = TestHookScope;
+        let s = std::sync::Arc::new(store("unpair-interrupt"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174020");
+        let old = seed_full_bound_state(&s, id.clone());
+        let old_bytes = serde_json::to_vec(&old).unwrap();
+        let (gate, reached, resume) = test_gate();
+        let temp_path = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *WRITE_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(WriteTestHook {
+            root: s.root.clone(),
+            gate,
+            temp_path: temp_path.clone(),
+        });
+        let writer = GateWorker::spawn(Some(resume), {
+            let s = s.clone();
+            let id = id.clone();
+            move || s.unpair(&id, now())
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let temp = temp_path.lock().unwrap().clone().unwrap();
+        fs::rename(&temp, temp.with_extension("interrupted")).unwrap();
+        assert!(writer.finish().unwrap().is_err());
+        let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
+        let raw = fs::read(s.root.join(STATE_FILE)).unwrap();
+        assert_eq!(raw, old_bytes);
+        let projected = projection(&restarted, now());
+        assert_eq!(projected.binding_state, BindingState::Bound);
+        assert_eq!(projected.five_hour.used_percent, Some(21.0));
+        assert_eq!(projected.weekly.used_percent, Some(63.0));
+    }
+
+    #[test]
+    fn unpair_post_commit_interruption_reopens_wholly_new_state() {
+        let _serial = hook_test_lock();
+        let _scope = TestHookScope;
+        let s = std::sync::Arc::new(store("unpair-post-commit"));
+        let id = slot("123e4567-e89b-42d3-a456-426614174021");
+        let old = seed_full_bound_state(&s, id.clone());
+        let expected = expected_unpaired(old);
+        let expected_bytes = serde_json::to_vec(&expected).unwrap();
+        let (gate, reached, resume) = test_gate();
+        *POST_COMMIT_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((s.root.clone(), gate));
+        let writer = GateWorker::spawn(Some(resume), {
+            let s = s.clone();
+            let id = id.clone();
+            move || s.unpair(&id, now())
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(writer.finish().unwrap(), Err(SnapshotError::Io)));
+        let raw = fs::read(s.root.join(STATE_FILE)).unwrap();
+        assert_eq!(raw, expected_bytes);
+        let restarted = ClaudeSnapshotStore::at_root(s.root.clone()).unwrap();
+        let projected = projection(&restarted, now());
+        assert_eq!(projected.binding_state, BindingState::Unbound);
+        assert!(projected.five_hour.used_percent.is_none());
+        assert!(projected.weekly.used_percent.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_replacement_between_open_and_flock_fails_closed() {
+        let _serial = hook_test_lock();
+        let _scope = TestHookScope;
+        let s = std::sync::Arc::new(store("lock-replacement"));
+        let (gate, reached, resume) = test_gate();
+        *LOCK_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((s.root.clone(), gate));
+        let worker = GateWorker::spawn(Some(resume), {
+            let s = s.clone();
+            move || s.lock()
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let lock = s.root.join(LOCK_FILE);
+        let replaced = s.root.join("replaced-lock");
+        fs::rename(&lock, &replaced).unwrap();
+        open_private_new(&lock).unwrap();
+        assert!(matches!(
+            worker.finish().unwrap(),
+            Err(SnapshotError::InvalidState)
+        ));
+    }
+}
