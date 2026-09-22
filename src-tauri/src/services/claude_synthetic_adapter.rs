@@ -280,12 +280,9 @@ mod capability_tests {
             now(),
         )
         .unwrap();
-        submit_synthetic_observation(
-            &store,
-            observation(b.clone(), b_capability.clone(), 1),
-            now(),
-        )
-        .unwrap();
+        let mut b_observation = observation(b.clone(), b_capability.clone(), 1);
+        b_observation.plan = Some(PlanMetadata::Free);
+        submit_synthetic_observation(&store, b_observation, now()).unwrap();
 
         for (offset, disposition) in [
             SyntheticDisposition::ContinuityUncertain,
@@ -324,10 +321,12 @@ mod capability_tests {
             .unwrap();
         }
         let slots = store.project(now()).unwrap().slots;
-        assert_eq!(slots[0].plan, Some(PlanMetadata::Paid));
-        assert_eq!(slots[0].weekly.used_percent, Some(34.0));
-        assert_eq!(slots[1].plan, Some(PlanMetadata::Paid));
-        assert_eq!(slots[1].weekly.used_percent, Some(34.0));
+        let a_slot = slots.iter().find(|slot| slot.alias == "a").unwrap();
+        let b_slot = slots.iter().find(|slot| slot.alias == "b").unwrap();
+        assert_eq!(a_slot.plan, Some(PlanMetadata::Paid));
+        assert_eq!(a_slot.weekly.used_percent, Some(34.0));
+        assert_eq!(b_slot.plan, Some(PlanMetadata::Free));
+        assert_eq!(b_slot.weekly.used_percent, Some(34.0));
     }
 
     #[test]
@@ -418,12 +417,14 @@ mod capability_tests {
         assert_eq!(raw_bytes(&store), before_unpaired);
     }
 
-    #[test]
-    fn wrong_epoch_replay_and_skipped_lifecycle_inputs_do_not_consume_sequence() {
-        let root = std::env::temp_dir().join(format!(
-            "quotabar-c3b0-lifecycle-sequence-{}",
-            Uuid::new_v4()
-        ));
+    fn assert_rejected_lifecycle_case(
+        case: &str,
+        binding_epoch: u64,
+        sequence: u64,
+        disposition: SyntheticDisposition,
+    ) {
+        let root =
+            std::env::temp_dir().join(format!("quotabar-c3b0-lifecycle-{case}-{}", Uuid::new_v4()));
         let store = ClaudeSnapshotStore::at_root(root).unwrap();
         let slot_id = slot("00000000-0000-4000-8000-00000000000b");
         let capability = store
@@ -435,40 +436,78 @@ mod capability_tests {
             now(),
         )
         .unwrap();
-        for (epoch, sequence, disposition) in [
-            (2, 2, SyntheticDisposition::ContinuityUncertain),
-            (1, 1, SyntheticDisposition::IdentityChanged),
-            (1, 3, SyntheticDisposition::ContinuityUncertain),
-        ] {
-            let before = raw_bytes(&store);
-            assert_eq!(
-                submit_synthetic_observation(
-                    &store,
-                    lifecycle_observation(
-                        slot_id.clone(),
-                        capability.clone(),
-                        epoch,
-                        sequence,
-                        disposition,
-                    ),
-                    now(),
+        let before_bytes = raw_bytes(&store);
+        let before_projection = serde_json::to_vec(&store.project(now()).unwrap()).unwrap();
+        assert_eq!(
+            submit_synthetic_observation(
+                &store,
+                lifecycle_observation(
+                    slot_id.clone(),
+                    capability.clone(),
+                    binding_epoch,
+                    sequence,
+                    disposition
                 ),
-                Err(SnapshotError::Rejected)
-            );
-            assert_eq!(raw_bytes(&store), before);
-        }
-        submit_synthetic_observation(
-            &store,
-            lifecycle_observation(
-                slot_id,
-                capability,
-                1,
+                now(),
+            ),
+            Err(SnapshotError::Rejected),
+            "{case} must be a fixed rejection"
+        );
+        assert_eq!(
+            raw_bytes(&store),
+            before_bytes,
+            "{case} must not alter disk bytes"
+        );
+        assert_eq!(
+            serde_json::to_vec(&store.project(now()).unwrap()).unwrap(),
+            before_projection,
+            "{case} must preserve binding, plan, and windows"
+        );
+        submit_synthetic_observation(&store, observation(slot_id, capability, 2), now()).unwrap();
+    }
+
+    #[test]
+    fn complete_lifecycle_rejection_matrix_preserves_bytes_and_next_sequence() {
+        for (case, epoch, sequence, disposition) in [
+            (
+                "wrong-epoch-continuity",
+                2,
                 2,
                 SyntheticDisposition::ContinuityUncertain,
             ),
-            now(),
-        )
-        .unwrap();
+            (
+                "wrong-epoch-identity",
+                2,
+                2,
+                SyntheticDisposition::IdentityChanged,
+            ),
+            (
+                "replay-continuity",
+                1,
+                1,
+                SyntheticDisposition::ContinuityUncertain,
+            ),
+            (
+                "replay-identity",
+                1,
+                1,
+                SyntheticDisposition::IdentityChanged,
+            ),
+            (
+                "skipped-continuity",
+                1,
+                3,
+                SyntheticDisposition::ContinuityUncertain,
+            ),
+            (
+                "skipped-identity",
+                1,
+                3,
+                SyntheticDisposition::IdentityChanged,
+            ),
+        ] {
+            assert_rejected_lifecycle_case(case, epoch, sequence, disposition);
+        }
     }
 }
 
@@ -512,6 +551,10 @@ mod tests {
             plan: Some(PlanMetadata::Paid),
             disposition,
         }
+    }
+
+    fn raw_bytes(store: &ClaudeSnapshotStore) -> Vec<u8> {
+        store.persisted_state_bytes_for_test().unwrap()
     }
 
     #[test]
@@ -658,6 +701,86 @@ mod tests {
             serde_json::to_vec(&store.project(now()).unwrap()).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn accepted_unavailable_preserves_windows_persists_safe_error_and_consumes_sequence() {
+        let store = store();
+        submit_synthetic_observation(
+            &store,
+            input(
+                1,
+                SyntheticDisposition::Available {
+                    windows: vec![
+                        SyntheticWindow {
+                            kind: WindowKind::FiveHour,
+                            used_percent: 12.0,
+                            reset_at: Some(now() + Duration::hours(1)),
+                        },
+                        SyntheticWindow {
+                            kind: WindowKind::Weekly,
+                            used_percent: 34.0,
+                            reset_at: Some(now() + Duration::days(1)),
+                        },
+                    ],
+                },
+            ),
+            now(),
+        )
+        .unwrap();
+        let before = raw_bytes(&store);
+
+        submit_synthetic_observation(
+            &store,
+            input(
+                2,
+                SyntheticDisposition::Unavailable {
+                    error: SafeErrorCode::Unavailable,
+                },
+            ),
+            now(),
+        )
+        .unwrap();
+
+        let projection = store.project(now()).unwrap();
+        let slot = projection
+            .slots
+            .iter()
+            .find(|slot| slot.alias == "safe")
+            .unwrap();
+        assert_eq!(slot.plan, Some(PlanMetadata::Paid));
+        assert_eq!(slot.five_hour.used_percent, Some(12.0));
+        assert_eq!(slot.weekly.used_percent, Some(34.0));
+        assert_eq!(
+            slot.five_hour.last_error_code,
+            Some(SafeErrorCode::Unavailable)
+        );
+        assert_eq!(
+            slot.weekly.last_error_code,
+            Some(SafeErrorCode::Unavailable)
+        );
+
+        let after = raw_bytes(&store);
+        assert_ne!(after, before);
+        let durable = String::from_utf8(after).unwrap();
+        assert!(durable.contains("\"last_error_code\":\"unavailable\""));
+        assert!(!durable.contains("provider_error"));
+
+        submit_synthetic_observation(
+            &store,
+            input(
+                3,
+                SyntheticDisposition::Available {
+                    windows: vec![SyntheticWindow {
+                        kind: WindowKind::FiveHour,
+                        used_percent: 56.0,
+                        reset_at: Some(now() + Duration::hours(1)),
+                    }],
+                },
+            ),
+            now(),
+        )
+        .unwrap();
     }
 
     #[test]
