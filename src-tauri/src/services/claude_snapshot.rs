@@ -280,6 +280,7 @@ pub(crate) enum ObservationStatus {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SourceClass {
     CompletionSse,
+    SyntheticFixture,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,8 +327,10 @@ impl ObservationEnvelopeV1 {
         }
         match self.status {
             ObservationStatus::Available => {
-                if self.source != Some(SourceClass::CompletionSse)
-                    || self.error_code.is_some()
+                if !matches!(
+                    self.source,
+                    Some(SourceClass::CompletionSse | SourceClass::SyntheticFixture)
+                ) || self.error_code.is_some()
                     || self.windows.is_empty()
                     || self.windows.len() > 2
                 {
@@ -434,6 +437,19 @@ impl BindingId {
 impl fmt::Debug for BindingId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("BindingId(<opaque>)")
+    }
+}
+
+/// In-memory authority for the current binding. It is intentionally neither
+/// serializable nor reconstructible from slot metadata.
+#[derive(Clone)]
+pub(crate) struct BindingCapability {
+    binding_id: BindingId,
+}
+
+impl fmt::Debug for BindingCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BindingCapability(<redacted>)")
     }
 }
 
@@ -566,10 +582,11 @@ impl ClaudeSnapshotStore {
         alias: String,
         plan: Option<PlanMetadata>,
         now: DateTime<Utc>,
-    ) -> Result<(), SnapshotError> {
+    ) -> Result<BindingCapability, SnapshotError> {
         if !safe_alias(&alias) {
             return Err(SnapshotError::InvalidInput);
         }
+        let binding_id = BindingId::generate();
         self.mutate(now, |aggregate| {
             if aggregate.slots.iter().any(|slot| slot.slot_id == slot_id)
                 || aggregate.slots.len() == MAX_SLOTS
@@ -580,19 +597,30 @@ impl ClaudeSnapshotStore {
                 slot_id,
                 alias,
                 plan,
-                binding_id: Some(BindingId::generate()),
+                binding_id: Some(binding_id.clone()),
                 binding_state: BindingState::Bound,
                 binding_epoch: 1,
                 next_sequence: 1,
                 windows: vec![],
             });
             Ok(())
-        })
+        })?;
+        Ok(BindingCapability { binding_id })
     }
 
-    pub(crate) fn apply_observation(
+    fn apply_observation(
         &self,
         observation: ObservationEnvelopeV1,
+        received_at: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.apply_observation_with_plan(None, observation, None, received_at)
+    }
+
+    fn apply_observation_with_plan(
+        &self,
+        capability: Option<&BindingCapability>,
+        observation: ObservationEnvelopeV1,
+        plan: Option<PlanMetadata>,
         received_at: DateTime<Utc>,
     ) -> Result<(), SnapshotError> {
         observation.validate(received_at)?;
@@ -606,8 +634,14 @@ impl ClaudeSnapshotStore {
             if slot.binding_state != BindingState::Bound
                 || observation.binding_epoch != slot.binding_epoch
                 || observation.sequence != slot.next_sequence
+                || capability.is_some_and(|capability| {
+                    slot.binding_id.as_ref() != Some(&capability.binding_id)
+                })
             {
                 return Err(SnapshotError::Rejected);
+            }
+            if plan.is_some() {
+                slot.plan = plan;
             }
             match observation.status {
                 ObservationStatus::Available => {
@@ -652,6 +686,16 @@ impl ClaudeSnapshotStore {
         })
     }
 
+    pub(crate) fn apply_correlated_observation(
+        &self,
+        capability: &BindingCapability,
+        observation: ObservationEnvelopeV1,
+        plan: Option<PlanMetadata>,
+        received_at: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.apply_observation_with_plan(Some(capability), observation, plan, received_at)
+    }
+
     pub(crate) fn mark_unverified(
         &self,
         slot_id: &AccountSlotId,
@@ -681,7 +725,8 @@ impl ClaudeSnapshotStore {
         &self,
         slot_id: &AccountSlotId,
         now: DateTime<Utc>,
-    ) -> Result<(), SnapshotError> {
+    ) -> Result<BindingCapability, SnapshotError> {
+        let binding_id = BindingId::generate();
         self.mutate(now, |aggregate| {
             let slot = aggregate
                 .slots
@@ -694,12 +739,13 @@ impl ClaudeSnapshotStore {
                     .checked_add(1)
                     .ok_or(SnapshotError::Rejected)?;
             }
-            slot.binding_id = Some(BindingId::generate());
+            slot.binding_id = Some(binding_id.clone());
             slot.binding_state = BindingState::Bound;
             slot.next_sequence = 1;
             slot.windows.clear();
             Ok(())
-        })
+        })?;
+        Ok(BindingCapability { binding_id })
     }
 
     pub(crate) fn unpair(

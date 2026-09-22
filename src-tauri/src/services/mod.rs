@@ -3,6 +3,7 @@ pub mod claude;
 #[cfg(test)]
 mod claude_bridge;
 pub(crate) mod claude_snapshot;
+pub(crate) mod claude_synthetic_adapter;
 pub mod codex;
 mod codex_cache;
 pub(crate) mod codex_profiles;
