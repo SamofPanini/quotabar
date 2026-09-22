@@ -696,7 +696,7 @@ impl ClaudeSnapshotStore {
         self.apply_observation_with_plan(Some(capability), observation, plan, received_at)
     }
 
-    pub(crate) fn mark_unverified(
+    fn mark_unverified(
         &self,
         slot_id: &AccountSlotId,
         now: DateTime<Utc>,
@@ -713,6 +713,44 @@ impl ClaudeSnapshotStore {
                     .checked_add(1)
                     .ok_or(SnapshotError::Rejected)?;
             }
+            slot.next_sequence = 1;
+            slot.binding_state = BindingState::Unverified;
+            slot.binding_id = None;
+            slot.windows.clear();
+            Ok(())
+        })
+    }
+
+    /// Applies a fail-closed lifecycle disposition only when the in-memory
+    /// authority and the durable current binding still agree.  This stays in
+    /// the same mutation transaction as the transition so a caller cannot
+    /// validate a capability under one lock and invalidate a later binding
+    /// under another.
+    pub(crate) fn apply_correlated_lifecycle_transition(
+        &self,
+        capability: &BindingCapability,
+        slot_id: &AccountSlotId,
+        binding_epoch: u64,
+        sequence: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            if slot.binding_state != BindingState::Bound
+                || binding_epoch != slot.binding_epoch
+                || sequence != slot.next_sequence
+                || slot.binding_id.as_ref() != Some(&capability.binding_id)
+            {
+                return Err(SnapshotError::Rejected);
+            }
+            slot.binding_epoch = slot
+                .binding_epoch
+                .checked_add(1)
+                .ok_or(SnapshotError::Rejected)?;
             slot.next_sequence = 1;
             slot.binding_state = BindingState::Unverified;
             slot.binding_id = None;
@@ -765,6 +803,36 @@ impl ClaudeSnapshotStore {
             slot.windows.clear();
             Ok(())
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persisted_state_bytes_for_test(&self) -> Result<Vec<u8>, SnapshotError> {
+        let _lock = self.lock()?;
+        self.verify_root()?;
+        #[cfg(unix)]
+        {
+            let path_metadata = child_metadata(&self.root_dir, STATE_FILE)?;
+            if path_metadata.is_symlink() {
+                return Err(SnapshotError::InvalidState);
+            }
+            let mut file = open_child_existing(&self.root_dir, STATE_FILE)?;
+            let metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+            validate_open_regular_owned(&metadata, 0o600)?;
+            if !path_metadata.matches(&metadata) {
+                return Err(SnapshotError::InvalidState);
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+            std::io::Read::by_ref(&mut file)
+                .take(MAX_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| SnapshotError::Io)?;
+            if bytes.len() as u64 > MAX_FILE_BYTES {
+                return Err(SnapshotError::InvalidState);
+            }
+            return Ok(bytes);
+        }
+        #[cfg(not(unix))]
+        Err(SnapshotError::Unsupported)
     }
 
     pub(crate) fn project(

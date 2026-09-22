@@ -44,9 +44,14 @@ pub(crate) fn submit_synthetic_observation(
     received_at: DateTime<Utc>,
 ) -> Result<(), SnapshotError> {
     match input.disposition {
-        SyntheticDisposition::ContinuityUncertain | SyntheticDisposition::IdentityChanged => {
-            store.mark_unverified(&input.slot_id, received_at)
-        }
+        SyntheticDisposition::ContinuityUncertain | SyntheticDisposition::IdentityChanged => store
+            .apply_correlated_lifecycle_transition(
+                &input.capability,
+                &input.slot_id,
+                input.binding_epoch,
+                input.sequence,
+                received_at,
+            ),
         SyntheticDisposition::Available { windows } => store.apply_correlated_observation(
             &input.capability,
             ObservationEnvelopeV1 {
@@ -121,6 +126,28 @@ mod capability_tests {
         }
     }
 
+    fn lifecycle_observation(
+        slot_id: AccountSlotId,
+        capability: BindingCapability,
+        binding_epoch: u64,
+        sequence: u64,
+        disposition: SyntheticDisposition,
+    ) -> SyntheticDesktopObservation {
+        SyntheticDesktopObservation {
+            slot_id,
+            capability,
+            binding_epoch,
+            sequence,
+            observed_at: now(),
+            plan: None,
+            disposition,
+        }
+    }
+
+    fn raw_bytes(store: &ClaudeSnapshotStore) -> Vec<u8> {
+        store.persisted_state_bytes_for_test().unwrap()
+    }
+
     #[test]
     fn issued_capability_is_required_and_redacted() {
         let root = std::env::temp_dir().join(format!("quotabar-c3b0-cap-{}", Uuid::new_v4()));
@@ -156,7 +183,9 @@ mod capability_tests {
         let old = store
             .register_slot(slot_id.clone(), "safe".into(), None, now())
             .unwrap();
-        store.mark_unverified(&slot_id, now()).unwrap();
+        store
+            .apply_correlated_lifecycle_transition(&old, &slot_id, 1, 1, now())
+            .unwrap();
         let new = store.rebind(&slot_id, now()).unwrap();
         let mut old_input = observation(slot_id.clone(), old, 1);
         old_input.binding_epoch = 2;
@@ -195,7 +224,9 @@ mod capability_tests {
         let capability = store
             .register_slot(slot_id.clone(), "safe".into(), None, now())
             .unwrap();
-        store.mark_unverified(&slot_id, now()).unwrap();
+        store
+            .apply_correlated_lifecycle_transition(&capability, &slot_id, 1, 1, now())
+            .unwrap();
         assert!(
             submit_synthetic_observation(&store, observation(slot_id, capability, 1), now())
                 .is_err()
@@ -228,6 +259,216 @@ mod capability_tests {
             store.project(now()).unwrap().slots[1].weekly.used_percent,
             Some(34.0)
         );
+    }
+
+    #[test]
+    fn wrong_slot_lifecycle_dispositions_preserve_durable_state_and_sequence() {
+        let root =
+            std::env::temp_dir().join(format!("quotabar-c3b0-lifecycle-slots-{}", Uuid::new_v4()));
+        let store = ClaudeSnapshotStore::at_root(root).unwrap();
+        let a = slot("00000000-0000-4000-8000-000000000008");
+        let b = slot("00000000-0000-4000-8000-000000000009");
+        let a_capability = store
+            .register_slot(a.clone(), "a".into(), Some(PlanMetadata::Paid), now())
+            .unwrap();
+        let b_capability = store
+            .register_slot(b.clone(), "b".into(), Some(PlanMetadata::Free), now())
+            .unwrap();
+        submit_synthetic_observation(
+            &store,
+            observation(a.clone(), a_capability.clone(), 1),
+            now(),
+        )
+        .unwrap();
+        submit_synthetic_observation(
+            &store,
+            observation(b.clone(), b_capability.clone(), 1),
+            now(),
+        )
+        .unwrap();
+
+        for (offset, disposition) in [
+            SyntheticDisposition::ContinuityUncertain,
+            SyntheticDisposition::IdentityChanged,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sequence = 2 + offset as u64;
+            let before_bytes = raw_bytes(&store);
+            let before_projection = serde_json::to_vec(&store.project(now()).unwrap()).unwrap();
+            assert_eq!(
+                submit_synthetic_observation(
+                    &store,
+                    lifecycle_observation(
+                        a.clone(),
+                        b_capability.clone(),
+                        1,
+                        sequence,
+                        disposition,
+                    ),
+                    now(),
+                ),
+                Err(SnapshotError::Rejected)
+            );
+            assert_eq!(raw_bytes(&store), before_bytes);
+            assert_eq!(
+                serde_json::to_vec(&store.project(now()).unwrap()).unwrap(),
+                before_projection
+            );
+            submit_synthetic_observation(
+                &store,
+                observation(a.clone(), a_capability.clone(), sequence),
+                now(),
+            )
+            .unwrap();
+        }
+        let slots = store.project(now()).unwrap().slots;
+        assert_eq!(slots[0].plan, Some(PlanMetadata::Paid));
+        assert_eq!(slots[0].weekly.used_percent, Some(34.0));
+        assert_eq!(slots[1].plan, Some(PlanMetadata::Paid));
+        assert_eq!(slots[1].weekly.used_percent, Some(34.0));
+    }
+
+    #[test]
+    fn stale_unverified_and_unpaired_lifecycle_inputs_are_durable_noops() {
+        let root =
+            std::env::temp_dir().join(format!("quotabar-c3b0-lifecycle-stale-{}", Uuid::new_v4()));
+        let store = ClaudeSnapshotStore::at_root(root).unwrap();
+        let slot_id = slot("00000000-0000-4000-8000-00000000000a");
+        let old = store
+            .register_slot(slot_id.clone(), "safe".into(), None, now())
+            .unwrap();
+        submit_synthetic_observation(
+            &store,
+            lifecycle_observation(
+                slot_id.clone(),
+                old.clone(),
+                1,
+                1,
+                SyntheticDisposition::ContinuityUncertain,
+            ),
+            now(),
+        )
+        .unwrap();
+        let before_unverified = raw_bytes(&store);
+        assert_eq!(
+            submit_synthetic_observation(
+                &store,
+                lifecycle_observation(
+                    slot_id.clone(),
+                    old.clone(),
+                    2,
+                    1,
+                    SyntheticDisposition::IdentityChanged,
+                ),
+                now(),
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(raw_bytes(&store), before_unverified);
+
+        let current = store.rebind(&slot_id, now()).unwrap();
+        let before_stale = raw_bytes(&store);
+        assert_eq!(
+            submit_synthetic_observation(
+                &store,
+                lifecycle_observation(
+                    slot_id.clone(),
+                    old,
+                    2,
+                    1,
+                    SyntheticDisposition::ContinuityUncertain,
+                ),
+                now(),
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(raw_bytes(&store), before_stale);
+        submit_synthetic_observation(
+            &store,
+            lifecycle_observation(
+                slot_id.clone(),
+                current,
+                2,
+                1,
+                SyntheticDisposition::IdentityChanged,
+            ),
+            now(),
+        )
+        .unwrap();
+
+        let unpaired = store.rebind(&slot_id, now()).unwrap();
+        store.unpair(&slot_id, now()).unwrap();
+        let before_unpaired = raw_bytes(&store);
+        assert_eq!(
+            submit_synthetic_observation(
+                &store,
+                lifecycle_observation(
+                    slot_id,
+                    unpaired,
+                    3,
+                    1,
+                    SyntheticDisposition::ContinuityUncertain,
+                ),
+                now(),
+            ),
+            Err(SnapshotError::Rejected)
+        );
+        assert_eq!(raw_bytes(&store), before_unpaired);
+    }
+
+    #[test]
+    fn wrong_epoch_replay_and_skipped_lifecycle_inputs_do_not_consume_sequence() {
+        let root = std::env::temp_dir().join(format!(
+            "quotabar-c3b0-lifecycle-sequence-{}",
+            Uuid::new_v4()
+        ));
+        let store = ClaudeSnapshotStore::at_root(root).unwrap();
+        let slot_id = slot("00000000-0000-4000-8000-00000000000b");
+        let capability = store
+            .register_slot(slot_id.clone(), "safe".into(), None, now())
+            .unwrap();
+        submit_synthetic_observation(
+            &store,
+            observation(slot_id.clone(), capability.clone(), 1),
+            now(),
+        )
+        .unwrap();
+        for (epoch, sequence, disposition) in [
+            (2, 2, SyntheticDisposition::ContinuityUncertain),
+            (1, 1, SyntheticDisposition::IdentityChanged),
+            (1, 3, SyntheticDisposition::ContinuityUncertain),
+        ] {
+            let before = raw_bytes(&store);
+            assert_eq!(
+                submit_synthetic_observation(
+                    &store,
+                    lifecycle_observation(
+                        slot_id.clone(),
+                        capability.clone(),
+                        epoch,
+                        sequence,
+                        disposition,
+                    ),
+                    now(),
+                ),
+                Err(SnapshotError::Rejected)
+            );
+            assert_eq!(raw_bytes(&store), before);
+        }
+        submit_synthetic_observation(
+            &store,
+            lifecycle_observation(
+                slot_id,
+                capability,
+                1,
+                2,
+                SyntheticDisposition::ContinuityUncertain,
+            ),
+            now(),
+        )
+        .unwrap();
     }
 }
 
