@@ -280,6 +280,7 @@ pub(crate) enum ObservationStatus {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SourceClass {
     CompletionSse,
+    SyntheticFixture,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,8 +327,10 @@ impl ObservationEnvelopeV1 {
         }
         match self.status {
             ObservationStatus::Available => {
-                if self.source != Some(SourceClass::CompletionSse)
-                    || self.error_code.is_some()
+                if !matches!(
+                    self.source,
+                    Some(SourceClass::CompletionSse | SourceClass::SyntheticFixture)
+                ) || self.error_code.is_some()
                     || self.windows.is_empty()
                     || self.windows.len() > 2
                 {
@@ -434,6 +437,19 @@ impl BindingId {
 impl fmt::Debug for BindingId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("BindingId(<opaque>)")
+    }
+}
+
+/// In-memory authority for the current binding. It is intentionally neither
+/// serializable nor reconstructible from slot metadata.
+#[derive(Clone)]
+pub(crate) struct BindingCapability {
+    binding_id: BindingId,
+}
+
+impl fmt::Debug for BindingCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BindingCapability(<redacted>)")
     }
 }
 
@@ -566,10 +582,11 @@ impl ClaudeSnapshotStore {
         alias: String,
         plan: Option<PlanMetadata>,
         now: DateTime<Utc>,
-    ) -> Result<(), SnapshotError> {
+    ) -> Result<BindingCapability, SnapshotError> {
         if !safe_alias(&alias) {
             return Err(SnapshotError::InvalidInput);
         }
+        let binding_id = BindingId::generate();
         self.mutate(now, |aggregate| {
             if aggregate.slots.iter().any(|slot| slot.slot_id == slot_id)
                 || aggregate.slots.len() == MAX_SLOTS
@@ -580,19 +597,30 @@ impl ClaudeSnapshotStore {
                 slot_id,
                 alias,
                 plan,
-                binding_id: Some(BindingId::generate()),
+                binding_id: Some(binding_id.clone()),
                 binding_state: BindingState::Bound,
                 binding_epoch: 1,
                 next_sequence: 1,
                 windows: vec![],
             });
             Ok(())
-        })
+        })?;
+        Ok(BindingCapability { binding_id })
     }
 
-    pub(crate) fn apply_observation(
+    fn apply_observation(
         &self,
         observation: ObservationEnvelopeV1,
+        received_at: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.apply_observation_with_plan(None, observation, None, received_at)
+    }
+
+    fn apply_observation_with_plan(
+        &self,
+        capability: Option<&BindingCapability>,
+        observation: ObservationEnvelopeV1,
+        plan: Option<PlanMetadata>,
         received_at: DateTime<Utc>,
     ) -> Result<(), SnapshotError> {
         observation.validate(received_at)?;
@@ -606,8 +634,14 @@ impl ClaudeSnapshotStore {
             if slot.binding_state != BindingState::Bound
                 || observation.binding_epoch != slot.binding_epoch
                 || observation.sequence != slot.next_sequence
+                || capability.is_some_and(|capability| {
+                    slot.binding_id.as_ref() != Some(&capability.binding_id)
+                })
             {
                 return Err(SnapshotError::Rejected);
+            }
+            if plan.is_some() {
+                slot.plan = plan;
             }
             match observation.status {
                 ObservationStatus::Available => {
@@ -652,7 +686,17 @@ impl ClaudeSnapshotStore {
         })
     }
 
-    pub(crate) fn mark_unverified(
+    pub(crate) fn apply_correlated_observation(
+        &self,
+        capability: &BindingCapability,
+        observation: ObservationEnvelopeV1,
+        plan: Option<PlanMetadata>,
+        received_at: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.apply_observation_with_plan(Some(capability), observation, plan, received_at)
+    }
+
+    fn mark_unverified(
         &self,
         slot_id: &AccountSlotId,
         now: DateTime<Utc>,
@@ -677,11 +721,50 @@ impl ClaudeSnapshotStore {
         })
     }
 
+    /// Applies a fail-closed lifecycle disposition only when the in-memory
+    /// authority and the durable current binding still agree.  This stays in
+    /// the same mutation transaction as the transition so a caller cannot
+    /// validate a capability under one lock and invalidate a later binding
+    /// under another.
+    pub(crate) fn apply_correlated_lifecycle_transition(
+        &self,
+        capability: &BindingCapability,
+        slot_id: &AccountSlotId,
+        binding_epoch: u64,
+        sequence: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(), SnapshotError> {
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            if slot.binding_state != BindingState::Bound
+                || binding_epoch != slot.binding_epoch
+                || sequence != slot.next_sequence
+                || slot.binding_id.as_ref() != Some(&capability.binding_id)
+            {
+                return Err(SnapshotError::Rejected);
+            }
+            slot.binding_epoch = slot
+                .binding_epoch
+                .checked_add(1)
+                .ok_or(SnapshotError::Rejected)?;
+            slot.next_sequence = 1;
+            slot.binding_state = BindingState::Unverified;
+            slot.binding_id = None;
+            slot.windows.clear();
+            Ok(())
+        })
+    }
+
     pub(crate) fn rebind(
         &self,
         slot_id: &AccountSlotId,
         now: DateTime<Utc>,
-    ) -> Result<(), SnapshotError> {
+    ) -> Result<BindingCapability, SnapshotError> {
+        let binding_id = BindingId::generate();
         self.mutate(now, |aggregate| {
             let slot = aggregate
                 .slots
@@ -694,12 +777,13 @@ impl ClaudeSnapshotStore {
                     .checked_add(1)
                     .ok_or(SnapshotError::Rejected)?;
             }
-            slot.binding_id = Some(BindingId::generate());
+            slot.binding_id = Some(binding_id.clone());
             slot.binding_state = BindingState::Bound;
             slot.next_sequence = 1;
             slot.windows.clear();
             Ok(())
-        })
+        })?;
+        Ok(BindingCapability { binding_id })
     }
 
     pub(crate) fn unpair(
@@ -719,6 +803,36 @@ impl ClaudeSnapshotStore {
             slot.windows.clear();
             Ok(())
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persisted_state_bytes_for_test(&self) -> Result<Vec<u8>, SnapshotError> {
+        let _lock = self.lock()?;
+        self.verify_root()?;
+        #[cfg(unix)]
+        {
+            let path_metadata = child_metadata(&self.root_dir, STATE_FILE)?;
+            if path_metadata.is_symlink() {
+                return Err(SnapshotError::InvalidState);
+            }
+            let mut file = open_child_existing(&self.root_dir, STATE_FILE)?;
+            let metadata = file.metadata().map_err(|_| SnapshotError::Io)?;
+            validate_open_regular_owned(&metadata, 0o600)?;
+            if !path_metadata.matches(&metadata) {
+                return Err(SnapshotError::InvalidState);
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+            std::io::Read::by_ref(&mut file)
+                .take(MAX_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| SnapshotError::Io)?;
+            if bytes.len() as u64 > MAX_FILE_BYTES {
+                return Err(SnapshotError::InvalidState);
+            }
+            return Ok(bytes);
+        }
+        #[cfg(not(unix))]
+        Err(SnapshotError::Unsupported)
     }
 
     pub(crate) fn project(
