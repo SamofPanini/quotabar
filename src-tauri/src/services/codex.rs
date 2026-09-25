@@ -708,7 +708,7 @@ pub(crate) async fn fetch_public_profile(
 ) -> CodexProfilePublicQuota {
     let mut rows = fetch_codex_profiles(vec![profile]).await;
     let Some(row) = rows.pop() else {
-        return CodexProfilePublicQuota::unavailable(alias);
+        return CodexProfilePublicQuota::unavailable(alias, None);
     };
     public_profile_from_quota(alias, row)
 }
@@ -735,6 +735,7 @@ fn public_profile_from_quota(alias: String, row: CodexProfileQuota) -> CodexProf
         available_reset_credits: row.reset_credits.available_count,
         // Existing errors can include transport details. Do not relay them.
         error: (status != "connected").then_some("Profile unavailable".to_string()),
+        diagnostic_code: None,
     }
 }
 

@@ -143,6 +143,7 @@ pub(crate) struct CodexProfilePublicQuota {
     pub(crate) secondary: Option<crate::domain::models::CodexRateLimitWindow>,
     pub(crate) available_reset_credits: u32,
     pub(crate) error: Option<String>,
+    pub(crate) diagnostic_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -153,7 +154,7 @@ pub(crate) struct CodexProfilesResponse {
 }
 
 impl CodexProfilePublicQuota {
-    pub(crate) fn unavailable(alias: String) -> Self {
+    pub(crate) fn unavailable(alias: String, diagnostic_code: Option<&'static str>) -> Self {
         Self {
             alias,
             status: "error".to_string(),
@@ -162,6 +163,7 @@ impl CodexProfilePublicQuota {
             secondary: None,
             available_reset_credits: 0,
             error: Some("Profile configuration is invalid".to_string()),
+            diagnostic_code: diagnostic_code.map(str::to_string),
         }
     }
 }
@@ -260,6 +262,7 @@ mod tests {
             secondary: None,
             available_reset_credits: 1,
             error: None,
+            diagnostic_code: None,
         };
         let output = serde_json::to_value(&dto).unwrap();
         let keys = output
@@ -271,6 +274,7 @@ mod tests {
         let expected_keys = [
             "alias",
             "availableResetCredits",
+            "diagnosticCode",
             "error",
             "planType",
             "primary",
