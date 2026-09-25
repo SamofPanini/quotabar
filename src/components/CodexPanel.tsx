@@ -215,6 +215,21 @@ function customProfileStatus(profile: CodexProfileQuota): {
   }
 }
 
+const CUSTOM_PROFILE_DIAGNOSTICS: Record<string, string> = {
+  invalid_row: 'This profile entry is invalid.',
+  invalid_alias: 'This profile alias is invalid or duplicated.',
+  invalid_home_path: 'This profile home must be an absolute path without .. components.',
+  invalid_home: 'This profile home is unavailable or is not a directory.',
+  default_home_conflict: 'This profile home is already the Default account.',
+  duplicate_home: 'Another custom profile already uses this home.',
+};
+
+function customProfileDiagnostic(profile: CodexProfileQuota): string {
+  return profile.diagnosticCode
+    ? CUSTOM_PROFILE_DIAGNOSTICS[profile.diagnosticCode] ?? 'Custom Codex quota unavailable'
+    : 'Custom Codex quota unavailable';
+}
+
 export default function CodexPanel({
   onConnectionChange,
   onUsageChange,
@@ -659,7 +674,7 @@ export default function CodexPanel({
               </div>
             </div>
           ) : (
-            <div className="empty-state"><p>Custom Codex quota unavailable</p></div>
+            <div className="empty-state"><p>{customProfileDiagnostic(selectedCustomProfile)}</p></div>
           )}
         </div>
         {renderDefaultCostSummary}

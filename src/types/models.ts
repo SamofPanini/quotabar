@@ -93,6 +93,7 @@ export interface CodexProfileQuota {
   primary?: CodexRateLimitWindow;
   secondary?: CodexRateLimitWindow;
   availableResetCredits: number;
+  diagnosticCode?: string | null;
   error?: string;
 }
 

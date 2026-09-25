@@ -35,6 +35,7 @@ enum RegistryEntry {
     },
     Invalid {
         alias: String,
+        diagnostic_code: &'static str,
     },
 }
 
@@ -108,6 +109,7 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
             break;
         }
         let entry = serde_json::from_value::<ConfigProfile>(raw_entry);
+        let entry_is_valid = entry.is_ok();
         let valid_alias = entry
             .as_ref()
             .ok()
@@ -116,23 +118,34 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
         let alias = valid_alias
             .clone()
             .unwrap_or_else(|| invalid_alias(index, &reserved_aliases, &mut aliases));
-        let home = entry.ok().and_then(|entry| {
-            (entry.home.is_absolute()
-                && !entry
+        let home_result = entry.as_ref().ok().and_then(|entry| {
+            if !entry.home.is_absolute()
+                || entry
                     .home
                     .components()
-                    .any(|part| matches!(part, Component::ParentDir)))
-            .then(|| entry.home.canonicalize().ok())
-            .flatten()
-            .filter(|home| home.is_dir())
+                    .any(|part| matches!(part, Component::ParentDir))
+            {
+                return None;
+            }
+            entry.home.canonicalize().ok().filter(|home| home.is_dir())
         });
-        match (valid_alias, home) {
+        let path_is_invalid = entry.as_ref().ok().is_some_and(|entry| {
+            !entry.home.is_absolute()
+                || entry
+                    .home
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+        });
+        match (valid_alias, home_result) {
             (Some(alias), Some(home))
                 if default_home
                     .as_ref()
                     .is_some_and(|default| default == &home) =>
             {
-                entries.push(RegistryEntry::Invalid { alias });
+                entries.push(RegistryEntry::Invalid {
+                    alias,
+                    diagnostic_code: "default_home_conflict",
+                });
             }
             (Some(alias), Some(home)) if routes.insert(home.clone()) => {
                 entries.push(RegistryEntry::Valid {
@@ -140,7 +153,26 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
                     alias,
                 });
             }
-            _ => entries.push(RegistryEntry::Invalid { alias }),
+            (None, _) => entries.push(RegistryEntry::Invalid {
+                alias,
+                diagnostic_code: if entry_is_valid {
+                    "invalid_alias"
+                } else {
+                    "invalid_row"
+                },
+            }),
+            (Some(alias), None) => entries.push(RegistryEntry::Invalid {
+                alias,
+                diagnostic_code: if path_is_invalid {
+                    "invalid_home_path"
+                } else {
+                    "invalid_home"
+                },
+            }),
+            (Some(alias), Some(_)) => entries.push(RegistryEntry::Invalid {
+                alias,
+                diagnostic_code: "duplicate_home",
+            }),
         }
     }
     Registry {
@@ -160,9 +192,13 @@ pub(crate) async fn fetch_from_config(
             RegistryEntry::Valid { alias, profile } => {
                 profiles.push(codex::fetch_public_profile(alias, profile).await)
             }
-            RegistryEntry::Invalid { alias } => {
-                profiles.push(CodexProfilePublicQuota::unavailable(alias))
-            }
+            RegistryEntry::Invalid {
+                alias,
+                diagnostic_code,
+            } => profiles.push(CodexProfilePublicQuota::unavailable(
+                alias,
+                Some(diagnostic_code),
+            )),
         }
     }
     CodexProfilesResponse {
@@ -275,7 +311,7 @@ mod tests {
         );
         let registry = load_registry(&dir, None);
         assert!(
-            matches!(&registry.entries[0], RegistryEntry::Invalid { alias } if alias != "profile-1")
+            matches!(&registry.entries[0], RegistryEntry::Invalid { alias, .. } if alias != "profile-1")
         );
         assert!(
             matches!(&registry.entries[1], RegistryEntry::Valid { alias, .. } if alias == "profile-1")
@@ -394,6 +430,59 @@ mod tests {
         assert_eq!(
             registry.error.as_deref(),
             Some("Too many custom profiles configured")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_rows_have_fixed_safe_diagnostic_codes_without_blocking_valid_rows() {
+        let dir = temp("diagnostic-codes");
+        let default = dir.join("default");
+        let first = dir.join("first");
+        let last = dir.join("last");
+        fs::create_dir_all(&default).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&last).unwrap();
+        write(
+            &dir,
+            serde_json::json!({ "version": 1, "profiles": [
+                { "alias": "broken" },
+                entry("default-copy", &default),
+                entry("relative", Path::new("relative")),
+                entry("missing", &dir.join("missing")),
+                entry("first", &first),
+                entry("duplicate-route", &first),
+                entry("first", &last),
+                entry("last", &last)
+            ]}),
+        );
+        let registry = load_registry(&dir, Some(&default));
+        let codes = registry
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                RegistryEntry::Invalid {
+                    diagnostic_code, ..
+                } => Some(*diagnostic_code),
+                RegistryEntry::Valid { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec![
+                "invalid_row",
+                "default_home_conflict",
+                "invalid_home_path",
+                "invalid_home",
+                "duplicate_home",
+                "invalid_alias"
+            ]
+        );
+        assert!(
+            matches!(&registry.entries[4], RegistryEntry::Valid { alias, .. } if alias == "first")
+        );
+        assert!(
+            matches!(&registry.entries[7], RegistryEntry::Valid { alias, .. } if alias == "last")
         );
         let _ = fs::remove_dir_all(dir);
     }

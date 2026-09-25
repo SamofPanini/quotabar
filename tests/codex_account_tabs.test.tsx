@@ -159,6 +159,52 @@ describe('Codex account tabs', () => {
     await act(async () => renderer.unmount());
   });
 
+  it('renders fixed safe diagnostic copy and falls back safely for unknown or missing codes', async () => {
+    const messages = {
+      invalid_row: 'This profile entry is invalid.',
+      invalid_alias: 'This profile alias is invalid or duplicated.',
+      invalid_home_path: 'This profile home must be an absolute path without .. components.',
+      invalid_home: 'This profile home is unavailable or is not a directory.',
+      default_home_conflict: 'This profile home is already the Default account.',
+      duplicate_home: 'Another custom profile already uses this home.',
+    };
+    const unavailable = (diagnosticCode?: string): CodexProfileQuota => ({
+      ...profile('Broken'), status: 'error', primary: undefined, secondary: undefined, diagnosticCode,
+    });
+
+    for (const [diagnosticCode, message] of Object.entries(messages)) {
+      const renderer = await renderPanel({
+        profiles: { profiles: [unavailable(diagnosticCode)], registryError: 'registry-only-detail' },
+      });
+      await act(async () => { renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick(); await flush(); });
+      const text = JSON.stringify(renderer.toJSON());
+      expect(text).toContain(message);
+      expect(text).not.toContain('registry-only-detail');
+      await act(async () => renderer.unmount());
+    }
+
+    for (const diagnosticCode of [undefined, 'unexpected-code']) {
+      const renderer = await renderPanel({ profiles: { profiles: [unavailable(diagnosticCode)], registryError: null } });
+      await act(async () => { renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick(); await flush(); });
+      expect(JSON.stringify(renderer.toJSON())).toContain('Custom Codex quota unavailable');
+      await act(async () => renderer.unmount());
+    }
+  });
+
+  it('keeps default and valid custom profiles usable when another profile has a diagnostic', async () => {
+    const invalid: CodexProfileQuota = {
+      ...profile('Broken'), status: 'error', primary: undefined, secondary: undefined, diagnosticCode: 'invalid_row',
+    };
+    const renderer = await renderPanel({ profiles: { profiles: [invalid, profile('Working', 31)], registryError: null } });
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    expect(tabs.map((tab) => tab.children.join(''))).toEqual(['Default', 'Broken', 'Working']);
+    await act(async () => { tabs[2].props.onClick(); await flush(); });
+    expect(JSON.stringify(renderer.toJSON())).toContain('ChatGPT Plus');
+    await act(async () => { renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick(); await flush(); });
+    expect(JSON.stringify(renderer.toJSON())).toContain('This profile entry is invalid.');
+    await act(async () => renderer.unmount());
+  });
+
   it('discards a profile-only failed generation before publishing a later refresh', async () => {
     mockDefaultCalls();
     vi.mocked(backend.getCodexInfo)
