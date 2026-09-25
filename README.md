@@ -94,6 +94,86 @@ This `v0.4.0` screenshot was refreshed on 2026-08-31 from the production React U
 - Grok Build login (`grok login`) for Grok quota data
 - Antigravity installed for Antigravity provider status
 
+## Codex multi-account registry
+
+QuotaBar does not discover other Codex homes automatically. It does not create a
+second account, run Codex login or logout, refresh tokens, or write credentials.
+The Default account remains implicit; additional accounts come only from a
+QuotaBar-owned registry. There is currently no UI for creating or editing that
+registry.
+
+### Registry location
+
+The logical location is `<Tauri app_config_dir>/codex-profiles.json`. This
+release uses Tauri 2 with bundle identifier `com.majiayu.quotabar`; on macOS,
+that resolves to:
+
+```text
+~/Library/Application Support/com.majiayu.quotabar/codex-profiles.json
+```
+
+### Schema and validation
+
+Use schema version 1. The `home` value must be the absolute path to an already
+existing Codex home that you created and manage outside QuotaBar. Do not add the
+Default home to this file.
+
+```json
+{
+  "version": 1,
+  "profiles": [
+    {
+      "alias": "Work",
+      "home": "<ABSOLUTE_EXISTING_CODEX_HOME>"
+    }
+  ]
+}
+```
+
+QuotaBar accepts at most 12 custom profiles. Each alias is trimmed, must be 1
+through 48 ASCII graphic characters, cannot contain `/` or `\\`, cannot be
+`default` (case-insensitive), and cannot repeat another alias. Every `home`
+must be absolute, must not contain a `..` component, must resolve to a directory,
+and must be distinct after canonicalization. A custom home cannot resolve to the
+Default home, and two custom profiles cannot resolve to the same home. Unknown
+fields are rejected both in the top-level object and in profile objects.
+
+### Runtime behavior
+
+- If the registry is missing or its `profiles` array is empty, QuotaBar shows
+  only Default; this is not an error.
+- If the registry cannot be read, is invalid JSON, has the wrong schema, or has
+  a version other than 1, QuotaBar does not load custom profiles and records a
+  registry error in its backend response.
+- An invalid individual profile is represented as an unavailable custom profile
+  without blocking Default or other valid rows. Invalid aliases are replaced by
+  a sanitized generated label.
+- A custom home whose `auth.json` is missing or cannot be read can appear as an
+  unavailable custom profile; it does not change the Default account route.
+- Custom-profile data is read through the same read-only Codex path as Default.
+  QuotaBar does not log in, log out, or refresh a token for any profile.
+
+The current UI has a diagnostic limitation: some invalid custom profiles show
+only generic unavailable information, so it may not distinguish the precise
+cause (for example, an invalid registry row, a missing auth file, or a duplicate
+canonical home).
+
+### Safe setup and rollback
+
+1. Fully quit QuotaBar.
+2. Confirm that the additional Codex home already exists and was established
+   legally outside QuotaBar.
+3. Create or update only `codex-profiles.json` using the schema above.
+4. Restart QuotaBar and check the Codex account tabs.
+5. To roll back, restore or remove only `codex-profiles.json`, then restart
+   QuotaBar.
+
+Do not open, print, copy, summarize, hash, or link an `auth.json` file. Do not
+copy bearer tokens, JWTs, cookies, account identifiers, or email addresses into
+a terminal, issue, pull request, or documentation. Do not use a symlink to
+share an `auth.json`, and do not modify the Default account runtime to configure
+a custom profile.
+
 ## Development
 
 ```bash
