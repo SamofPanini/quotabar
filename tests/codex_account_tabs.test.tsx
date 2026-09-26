@@ -166,22 +166,27 @@ describe('Codex account tabs', () => {
     const tabText = () => JSON.stringify(renderer.toJSON());
     const meterTexts = () => renderer.root.findAllByProps({ role: 'progressbar' })
       .map((meter) => meter.props['aria-valuetext']);
-    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    const clickTab = async (index: number) => {
+      await act(async () => {
+        renderer.root.findAllByProps({ role: 'tab' })[index].props.onClick();
+        await flush();
+      });
+    };
 
     expect(tabText()).toContain('Ordinary usage permitted');
     expect(meterTexts()).toContain('100% used');
     expect(tabText()).not.toContain('Weekly exhausted');
 
-    await act(async () => { tabs[1].props.onClick(); await flush(); });
+    await clickTab(1);
     expect(tabText()).toContain('Ordinary usage blocked');
     expect(meterTexts()).toContain('0% used');
     expect(tabText()).not.toContain('Weekly exhausted');
 
-    await act(async () => { tabs[2].props.onClick(); await flush(); });
+    await clickTab(2);
     expect(tabText()).toContain('Availability unknown');
     expect(meterTexts()).toContain('44% used');
 
-    await act(async () => { tabs[0].props.onClick(); await flush(); });
+    await clickTab(0);
     expect(tabText()).toContain('Ordinary usage permitted');
     expect(meterTexts()).toContain('100% used');
     expect(tabText()).not.toContain('Ordinary usage blocked');
