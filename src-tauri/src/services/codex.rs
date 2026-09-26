@@ -1009,9 +1009,12 @@ mod tests {
 
             let public = public_profile_from_quota("synthetic".into(), public_quota(true, limits));
             let serialized = serde_json::to_value(public).expect("public quota should serialize");
+            let expected_public_permission = expected_permission
+                .map(serde_json::Value::Bool)
+                .unwrap_or(serde_json::Value::Null);
             assert_eq!(
                 serialized.get("ordinaryUsageAllowed"),
-                expected_permission.map(serde_json::Value::Bool).as_ref(),
+                Some(&expected_public_permission),
                 "{name}"
             );
             assert!(serialized.get("profileId").is_none(), "{name}");
