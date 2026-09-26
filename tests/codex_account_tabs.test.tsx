@@ -168,6 +168,21 @@ describe('Codex account tabs', () => {
     const tabText = () => JSON.stringify(renderer.toJSON());
     const meterTexts = () => renderer.root.findAllByProps({ role: 'progressbar' })
       .map((meter) => meter.props['aria-valuetext']);
+    const permissionLabels = () => renderer.root.findAllByProps({ className: 'codex-updated' })
+      .map((node) => node.children.join(''))
+      .filter((text) => [
+        'Ordinary usage permitted',
+        'Ordinary usage blocked',
+        'Availability unknown',
+      ].includes(text));
+    const expectSelectedTab = (label: string, meters: string[]) => {
+      expect(permissionLabels()).toEqual([label]);
+      expect(meterTexts()).toEqual(meters);
+      expect(tabText()).not.toContain('Weekly exhausted');
+      expect(tabText()).not.toContain('Weekly is used up.');
+      expect(tabText()).not.toContain('Resets after ordinary usage is restored');
+      expect(tabText()).not.toContain('Codex weekly is at 100%.');
+    };
     const clickTab = async (index: number) => {
       await act(async () => {
         renderer.root.findAllByProps({ role: 'tab' })[index].props.onClick();
@@ -175,24 +190,19 @@ describe('Codex account tabs', () => {
       });
     };
 
-    expect(tabText()).toContain('Ordinary usage permitted');
-    expect(meterTexts()).toContain('100% used');
-    expect(tabText()).not.toContain('Weekly exhausted');
+    expectSelectedTab('Ordinary usage permitted', ['100% used', '90% used']);
 
     await clickTab(1);
-    expect(tabText()).toContain('Ordinary usage blocked');
-    expect(meterTexts()).toContain('0% used');
-    expect(tabText()).not.toContain('Weekly exhausted');
+    expectSelectedTab('Ordinary usage blocked', ['0% used', '10% used']);
 
     await clickTab(2);
-    expect(tabText()).toContain('Availability unknown');
-    expect(meterTexts()).toContain('44% used');
+    expectSelectedTab('Availability unknown', ['44% used', '54% used']);
 
     await clickTab(0);
-    expect(tabText()).toContain('Ordinary usage permitted');
-    expect(meterTexts()).toContain('100% used');
-    expect(tabText()).not.toContain('Ordinary usage blocked');
-    expect(tabText()).not.toContain('Availability unknown');
+    expectSelectedTab('Ordinary usage permitted', ['100% used', '90% used']);
+
+    await clickTab(1);
+    expectSelectedTab('Ordinary usage blocked', ['0% used', '10% used']);
     await act(async () => renderer.unmount());
   });
 
