@@ -2,19 +2,19 @@ import { describe, expect, test } from 'vitest';
 import { bonusReadyEntered, canReportBonusReady, formatBonusReadyMessage } from '../src/services/bonus_ready';
 
 describe('canReportBonusReady', () => {
-  test('waits for connected credits and a readable official weekly window', () => {
+  test('does not infer bonus readiness from credits or a numeric weekly window', () => {
     expect(canReportBonusReady(null, 100)).toBe(false);
     expect(canReportBonusReady({ connected: false }, 100)).toBe(false);
     expect(canReportBonusReady({ connected: true })).toBe(false);
     expect(canReportBonusReady({ connected: true }, Number.NaN)).toBe(false);
-    expect(canReportBonusReady({ connected: true }, 40)).toBe(true);
-    expect(canReportBonusReady({ connected: true }, 100)).toBe(true);
+    expect(canReportBonusReady({ connected: true }, 40)).toBe(false);
+    expect(canReportBonusReady({ connected: true }, 100)).toBe(false);
   });
 
-  test('waits when the API count and filtered credits disagree', () => {
+  test('does not infer bonus readiness when counts agree', () => {
     expect(canReportBonusReady({ connected: true, availableCount: 1 }, 100, 0)).toBe(false);
-    expect(canReportBonusReady({ connected: true, availableCount: 1 }, 100, 1)).toBe(true);
-    expect(canReportBonusReady({ connected: true, availableCount: 0 }, 100, 0)).toBe(true);
+    expect(canReportBonusReady({ connected: true, availableCount: 1 }, 100, 1)).toBe(false);
+    expect(canReportBonusReady({ connected: true, availableCount: 0 }, 100, 0)).toBe(false);
   });
 });
 
@@ -23,18 +23,18 @@ describe('bonusReadyEntered', () => {
     expect(bonusReadyEntered(null, { exhausted: true, availableCount: 1 })).toBe(false);
   });
 
-  test('fires when usage crosses 100% with an existing credit', () => {
+  test('does not fire from an unqualified exhausted transition', () => {
     expect(bonusReadyEntered(
       { exhausted: false, availableCount: 1 },
       { exhausted: true, availableCount: 1 },
-    )).toBe(true);
+    )).toBe(false);
   });
 
-  test('fires when a credit arrives while already exhausted', () => {
+  test('does not fire when a credit arrives with an unqualified exhausted state', () => {
     expect(bonusReadyEntered(
       { exhausted: true, availableCount: 0 },
       { exhausted: true, availableCount: 1 },
-    )).toBe(true);
+    )).toBe(false);
   });
 
   test('does not fire when exhausted with an unchanged credit', () => {
@@ -54,10 +54,10 @@ describe('bonusReadyEntered', () => {
 
 describe('formatBonusReadyMessage', () => {
   test('uses singular copy for one credit', () => {
-    expect(formatBonusReadyMessage(1)).toBe('Codex weekly is at 100%. 1 bonus reset available.');
+    expect(formatBonusReadyMessage(1)).toBe('1 Codex bonus reset available.');
   });
 
   test('uses plural copy for multiple credits', () => {
-    expect(formatBonusReadyMessage(2)).toBe('Codex weekly is at 100%. 2 bonus resets available.');
+    expect(formatBonusReadyMessage(2)).toBe('2 Codex bonus resets available.');
   });
 });

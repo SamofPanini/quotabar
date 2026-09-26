@@ -68,6 +68,7 @@ export interface CodexRateLimits {
   primary?: CodexRateLimitWindow;
   secondary?: CodexRateLimitWindow;
   credits?: CodexCredits;
+  ordinaryUsageAllowed?: boolean | null;
   error?: string;
 }
 
@@ -93,6 +94,7 @@ export interface CodexProfileQuota {
   primary?: CodexRateLimitWindow;
   secondary?: CodexRateLimitWindow;
   availableResetCredits: number;
+  ordinaryUsageAllowed?: boolean | null;
   diagnosticCode?: string | null;
   error?: string;
 }

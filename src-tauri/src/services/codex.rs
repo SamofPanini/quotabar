@@ -194,6 +194,12 @@ fn parse_rate_limit_window(window: &serde_json::Value) -> Option<CodexRateLimitW
     })
 }
 
+fn parse_ordinary_usage_allowed(rate_limit: Option<&serde_json::Value>) -> Option<bool> {
+    rate_limit
+        .and_then(|value| value.get("allowed"))
+        .and_then(serde_json::Value::as_bool)
+}
+
 fn retain_last_good_info(
     cached: Option<&LastGoodInfo>,
     stamp: Option<&AuthFileStamp>,
@@ -452,12 +458,13 @@ async fn fetch_codex_rate_limits_from_auth(
         }
     };
 
-    let primary = data["rate_limit"]
-        .get("primary_window")
+    let rate_limit = data.get("rate_limit");
+    let primary = rate_limit
+        .and_then(|limit| limit.get("primary_window"))
         .and_then(parse_rate_limit_window);
 
-    let secondary = data["rate_limit"]
-        .get("secondary_window")
+    let secondary = rate_limit
+        .and_then(|limit| limit.get("secondary_window"))
         .and_then(parse_rate_limit_window);
 
     if primary.is_none() && secondary.is_none() {
@@ -487,6 +494,7 @@ async fn fetch_codex_rate_limits_from_auth(
         primary,
         secondary,
         credits,
+        ordinary_usage_allowed: parse_ordinary_usage_allowed(rate_limit),
         error: None,
     };
 
@@ -733,6 +741,7 @@ fn public_profile_from_quota(alias: String, row: CodexProfileQuota) -> CodexProf
         primary: row.rate_limits.primary,
         secondary: row.rate_limits.secondary,
         available_reset_credits: row.reset_credits.available_count,
+        ordinary_usage_allowed: row.rate_limits.ordinary_usage_allowed,
         // Existing errors can include transport details. Do not relay them.
         error: (status != "connected").then_some("Profile unavailable".to_string()),
         diagnostic_code: None,
@@ -786,10 +795,11 @@ pub(crate) async fn fetch_codex_profile_inputs(
 mod tests {
     use super::{
         aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs,
-        fetch_codex_profiles, parse_rate_limit_window, parse_reset_credit,
-        public_profile_from_quota, read_auth_json_with_stamp, retain_last_good_info,
-        should_preserve_for_status, should_preserve_transport_failure, window_minutes_from_seconds,
-        AuthFileStamp, BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
+        fetch_codex_profiles, parse_ordinary_usage_allowed, parse_rate_limit_window,
+        parse_reset_credit, public_profile_from_quota, read_auth_json_with_stamp,
+        retain_last_good_info, should_preserve_for_status, should_preserve_transport_failure,
+        window_minutes_from_seconds, AuthFileStamp, BatchSnapshotProbe, CodexData, LastGoodInfo,
+        BATCH_SNAPSHOT_PROBE,
     };
     use crate::domain::account::{CodexProfile, CodexProfileInput, CodexProfileQuota};
     use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits, CodexResetCredits};
@@ -905,6 +915,29 @@ mod tests {
         assert_eq!(low.used_percent, 0.0);
     }
 
+    #[test]
+    fn parse_ordinary_usage_allowed_accepts_only_json_booleans() {
+        assert_eq!(
+            parse_ordinary_usage_allowed(Some(&json!({ "allowed": true }))),
+            Some(true)
+        );
+        assert_eq!(
+            parse_ordinary_usage_allowed(Some(&json!({ "allowed": false }))),
+            Some(false)
+        );
+
+        for rate_limit in [
+            json!(null),
+            json!({}),
+            json!({ "allowed": null }),
+            json!({ "allowed": "true" }),
+            json!({ "allowed": 1 }),
+        ] {
+            assert_eq!(parse_ordinary_usage_allowed(Some(&rate_limit)), None);
+        }
+        assert_eq!(parse_ordinary_usage_allowed(None), None);
+    }
+
     fn auth_stamp(len: u64, secs: u64) -> AuthFileStamp {
         AuthFileStamp {
             len,
@@ -948,6 +981,7 @@ mod tests {
             }),
             secondary: None,
             credits: None,
+            ordinary_usage_allowed: None,
             error: error.map(str::to_string),
         }
     }
@@ -976,6 +1010,7 @@ mod tests {
                     primary: None,
                     secondary: None,
                     credits: None,
+                    ordinary_usage_allowed: None,
                     error: Some("Network error".into()),
                 },
             ),

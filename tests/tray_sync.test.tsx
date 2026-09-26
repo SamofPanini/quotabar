@@ -121,12 +121,14 @@ describe('tray icon sync', () => {
   test('changes the Codex tray window locally without another acquisition call', async () => {
     vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
       connected: true,
+      ordinaryUsageAllowed: true,
       primary: { usedPercent: 18, windowMinutes: 300 },
       secondary: { usedPercent: 52, windowMinutes: 10_080 },
     });
     vi.mocked(backend.getCodexProfiles).mockResolvedValue({
       profiles: [{
         alias: 'Work', status: 'connected', availableResetCredits: 0,
+        ordinaryUsageAllowed: true,
         primary: { usedPercent: 79, windowMinutes: 300 },
         secondary: { usedPercent: 31, windowMinutes: 10_080 },
       }],
@@ -163,6 +165,22 @@ describe('tray icon sync', () => {
     const codexUpdate = vi.mocked(backend.updateTrayIcon).mock.calls.find((call) => call[0] === 'codex');
     expect(codexUpdate?.[1]).toBe(79);
     expect(codexUpdate?.[2]).toBe(true);
+    await unmount(renderer);
+  });
+
+  test('keeps the Codex percent unavailable when permission is unknown', async () => {
+    vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
+      connected: true,
+      primary: { usedPercent: 18, windowMinutes: 300 },
+      secondary: { usedPercent: 52, windowMinutes: 10_080 },
+    });
+    const renderer = await render_app();
+    await act(flush);
+
+    const codexUpdate = vi.mocked(backend.updateTrayIcon).mock.calls
+      .filter((call) => call[0] === 'codex')
+      .at(-1);
+    expect(codexUpdate?.[1]).toBeNull();
     await unmount(renderer);
   });
 });

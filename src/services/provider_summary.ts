@@ -41,6 +41,7 @@ export interface CodexTrayAccountSnapshot {
   connected: boolean;
   primary?: CodexRateLimitWindow;
   secondary?: CodexRateLimitWindow;
+  ordinaryUsageAllowed?: boolean | null;
 }
 
 function isValidUsedPercent(value: unknown): value is number {
@@ -53,7 +54,7 @@ export function getCodexTrayUsedPercent(
 ): number | null {
   let highest: number | null = null;
   for (const account of accounts) {
-    if (!account.connected) continue;
+    if (!account.connected || account.ordinaryUsageAllowed !== true) continue;
     // The provider contract identifies primary as five-hour and secondary as weekly.
     const limit = window === 'five_hour' ? account.primary : account.secondary;
     if (!isValidUsedPercent(limit?.usedPercent)) continue;

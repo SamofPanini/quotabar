@@ -123,6 +123,8 @@ export function formatOfficialUpdatedAt(updatedAtMs: number, now = Date.now()): 
   return `Updated ${minutes}m ago`;
 }
 
-export function isWeeklyExhausted(usedPercent?: number): boolean {
-  return typeof usedPercent === 'number' && Number.isFinite(usedPercent) && usedPercent >= 100;
+export function isWeeklyExhausted(): boolean {
+  // The currently modeled rate-limit payload contains permission, not an
+  // authoritative exhaustion reason. Do not derive exhaustion from it.
+  return false;
 }

@@ -7,9 +7,10 @@ import type { CodexRateLimits, CodexResetCredits } from '../src/types/models';
 
 const hiddenSections = { timeline: false, cost: false, trend: false, tips: false };
 
-const exhaustedLimits = {
+const blockedLimits = {
   connected: true,
   planType: 'plus',
+  ordinaryUsageAllowed: false,
   secondary: {
     usedPercent: 100,
     windowMinutes: 10_080,
@@ -51,7 +52,7 @@ async function render_panel(
   credits: CodexResetCredits,
   onBonusReadyChange: (ready: { exhausted: boolean; availableCount: number }) => void,
   manualRefreshNonce = 0,
-  limits: CodexRateLimits = exhaustedLimits,
+  limits: CodexRateLimits = blockedLimits,
 ): Promise<ReactTestRenderer> {
   vi.spyOn(backend, 'getCodexInfo').mockResolvedValue({ connected: true, planType: 'plus' });
   vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue(limits);
@@ -80,7 +81,7 @@ describe('Codex bonusReady reporting', () => {
     await act(async () => renderer.unmount());
   });
 
-  it('reports the first connected leftover snapshot after fail-soft credits', async () => {
+  it('does not emit bonus-ready when credits recover while ordinary usage is blocked', async () => {
     const onBonusReadyChange = vi.fn();
     const renderer = await render_panel(disconnectedCredits, onBonusReadyChange);
     expect(onBonusReadyChange).not.toHaveBeenCalled();
@@ -98,22 +99,14 @@ describe('Codex bonusReady reporting', () => {
       await Promise.resolve();
     });
 
-    expect(onBonusReadyChange).toHaveBeenCalledTimes(1);
-    expect(onBonusReadyChange).toHaveBeenCalledWith({
-      exhausted: true,
-      availableCount: 1,
-    });
+    expect(onBonusReadyChange).not.toHaveBeenCalled();
     await act(async () => renderer.unmount());
   });
 
-  it('does not overwrite a connected leftover snapshot when credits later fail-soft', async () => {
+  it('does not emit bonus-ready for blocked ordinary usage with available credits', async () => {
     const onBonusReadyChange = vi.fn();
     const renderer = await render_panel(leftoverCredits, onBonusReadyChange);
-    expect(onBonusReadyChange).toHaveBeenCalledTimes(1);
-    expect(onBonusReadyChange).toHaveBeenCalledWith({
-      exhausted: true,
-      availableCount: 1,
-    });
+    expect(onBonusReadyChange).not.toHaveBeenCalled();
 
     vi.spyOn(backend, 'getCodexResetCredits').mockResolvedValue(disconnectedCredits);
     await act(async () => {
@@ -128,7 +121,7 @@ describe('Codex bonusReady reporting', () => {
       await Promise.resolve();
     });
 
-    expect(onBonusReadyChange).toHaveBeenCalledTimes(1);
+    expect(onBonusReadyChange).not.toHaveBeenCalled();
     await act(async () => renderer.unmount());
   });
 
@@ -139,12 +132,12 @@ describe('Codex bonusReady reporting', () => {
     await act(async () => renderer.unmount());
   });
 
-  it('reports the first leftover snapshot after official weekly usage appears', async () => {
+  it('does not emit bonus-ready when a blocked numeric weekly window appears', async () => {
     const onBonusReadyChange = vi.fn();
     const renderer = await render_panel(leftoverCredits, onBonusReadyChange, 0, emptyLimits);
     expect(onBonusReadyChange).not.toHaveBeenCalled();
 
-    vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue(exhaustedLimits);
+    vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue(blockedLimits);
     await act(async () => {
       renderer.update(createElement(CodexPanel, {
         autoRefreshIntervalMs: 0,
@@ -157,18 +150,14 @@ describe('Codex bonusReady reporting', () => {
       await Promise.resolve();
     });
 
-    expect(onBonusReadyChange).toHaveBeenCalledTimes(1);
-    expect(onBonusReadyChange).toHaveBeenCalledWith({
-      exhausted: true,
-      availableCount: 1,
-    });
+    expect(onBonusReadyChange).not.toHaveBeenCalled();
     await act(async () => renderer.unmount());
   });
 
-  it('does not overwrite a leftover snapshot when official weekly usage later disappears', async () => {
+  it('does not emit bonus-ready when a blocked weekly window later disappears', async () => {
     const onBonusReadyChange = vi.fn();
     const renderer = await render_panel(leftoverCredits, onBonusReadyChange);
-    expect(onBonusReadyChange).toHaveBeenCalledTimes(1);
+    expect(onBonusReadyChange).not.toHaveBeenCalled();
 
     vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue(emptyLimits);
     await act(async () => {
@@ -183,7 +172,17 @@ describe('Codex bonusReady reporting', () => {
       await Promise.resolve();
     });
 
-    expect(onBonusReadyChange).toHaveBeenCalledTimes(1);
+    expect(onBonusReadyChange).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it('does not emit bonus-ready when ordinary usage availability is unknown', async () => {
+    const onBonusReadyChange = vi.fn();
+    const renderer = await render_panel(leftoverCredits, onBonusReadyChange, 0, {
+      ...blockedLimits,
+      ordinaryUsageAllowed: undefined,
+    });
+    expect(onBonusReadyChange).not.toHaveBeenCalled();
     await act(async () => renderer.unmount());
   });
 });
