@@ -6,6 +6,7 @@ import { backend } from '../src/services/backend';
 import type {
   CodexProfileQuota,
   CodexProfilesResponse,
+  CodexRateLimits,
   CostDailySeries,
   CostOverview,
 } from '../src/types/models';
@@ -43,9 +44,9 @@ async function flush(): Promise<void> {
   await Promise.resolve();
 }
 
-function mockDefaultCalls(): void {
+function mockDefaultCalls(limits?: CodexRateLimits): void {
   vi.spyOn(backend, 'getCodexInfo').mockResolvedValue({ connected: true, planType: 'plus' });
-  vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue({
+  vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue(limits ?? {
     connected: true,
     planType: 'plus',
     ordinaryUsageAllowed: true,
@@ -65,10 +66,11 @@ async function renderPanel(options: {
   onUsageChange?: (used: number | null) => void;
   onTrayQuotaSnapshotsChange?: (snapshots: CodexTrayAccountSnapshot[]) => void;
   manualRefreshNonce?: number;
+  defaultRateLimits?: CodexRateLimits;
   showCostSummary?: boolean;
   sections?: typeof hiddenSections;
 } = {}): Promise<ReactTestRenderer> {
-  mockDefaultCalls();
+  mockDefaultCalls(options.defaultRateLimits);
   vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue(options.profiles ?? { profiles: [], registryError: null });
   let renderer!: ReactTestRenderer;
   await act(async () => {
@@ -145,14 +147,14 @@ describe('Codex account tabs', () => {
   });
 
   it('keeps conflicting ordinary-usage labels and neutral meters bound to their selected tab', async () => {
-    vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue({
-      connected: true,
-      planType: 'plus',
-      ordinaryUsageAllowed: true,
-      primary: { usedPercent: 100, windowMinutes: 300, resetsAt: 1_788_000_000 },
-      secondary: { usedPercent: 90, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
-    });
     const renderer = await renderPanel({
+      defaultRateLimits: {
+        connected: true,
+        planType: 'plus',
+        ordinaryUsageAllowed: true,
+        primary: { usedPercent: 100, windowMinutes: 300, resetsAt: 1_788_000_000 },
+        secondary: { usedPercent: 90, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
+      },
       profiles: {
         profiles: [
           profile('Blocked', 0, false),
