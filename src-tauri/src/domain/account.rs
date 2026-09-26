@@ -142,6 +142,7 @@ pub(crate) struct CodexProfilePublicQuota {
     pub(crate) primary: Option<crate::domain::models::CodexRateLimitWindow>,
     pub(crate) secondary: Option<crate::domain::models::CodexRateLimitWindow>,
     pub(crate) available_reset_credits: u32,
+    pub(crate) ordinary_usage_allowed: Option<bool>,
     pub(crate) error: Option<String>,
     pub(crate) diagnostic_code: Option<String>,
 }
@@ -162,6 +163,7 @@ impl CodexProfilePublicQuota {
             primary: None,
             secondary: None,
             available_reset_credits: 0,
+            ordinary_usage_allowed: None,
             error: Some("Profile configuration is invalid".to_string()),
             diagnostic_code: diagnostic_code.map(str::to_string),
         }
@@ -261,6 +263,7 @@ mod tests {
             primary: None,
             secondary: None,
             available_reset_credits: 1,
+            ordinary_usage_allowed: None,
             error: None,
             diagnostic_code: None,
         };
@@ -276,6 +279,7 @@ mod tests {
             "availableResetCredits",
             "diagnosticCode",
             "error",
+            "ordinaryUsageAllowed",
             "planType",
             "primary",
             "secondary",

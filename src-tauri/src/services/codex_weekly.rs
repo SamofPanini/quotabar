@@ -188,6 +188,7 @@ mod tests {
             primary: primary.map(|(used, minutes)| window(used, minutes)),
             secondary: secondary.map(|(used, minutes)| window(used, minutes)),
             credits: None,
+            ordinary_usage_allowed: None,
             error: None,
         }
     }

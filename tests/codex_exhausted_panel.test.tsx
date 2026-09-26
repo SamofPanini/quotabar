@@ -19,6 +19,7 @@ async function render_exhausted(options?: {
   bonusCount?: number;
   valueObservedAt?: string;
   valueResetsAt?: string;
+  ordinaryUsageAllowed?: boolean | null;
   onOpenDashboard?: () => void;
 }): Promise<ReactTestRenderer> {
   const usedPercent = options?.usedPercent ?? 100;
@@ -27,6 +28,9 @@ async function render_exhausted(options?: {
   vi.spyOn(backend, 'getCodexInfo').mockResolvedValue({ connected: true, planType: 'plus' });
   vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue({
     connected: true,
+    ordinaryUsageAllowed: options?.ordinaryUsageAllowed === undefined
+      ? false
+      : options.ordinaryUsageAllowed,
     planType: 'plus',
     primary: {
       usedPercent,
@@ -84,25 +88,25 @@ describe('Codex exhausted panel', () => {
     vi.restoreAllMocks();
   });
 
-  it('keeps official 100%, last estimate, and a clickable bonus card', async () => {
+  it('keeps a blocked 100% meter distinct from exhaustion and bonus readiness', async () => {
     const onOpenDashboard = vi.fn();
     const renderer = await render_exhausted({ onOpenDashboard });
     const text = rendered_text(renderer);
 
     expect(text).toContain('100%');
-    expect(text).toContain('Weekly exhausted');
+    expect(text).toContain('Ordinary usage blocked');
     expect(text).toContain('API-equivalent week');
     expect(text).toContain('Last estimate');
     expect(text).toContain('$186.00');
     expect(text).not.toContain('Weekly value unavailable');
     expect(text).not.toContain('Local pace unavailable');
     expect(text).toContain('Local extras paused');
-    expect(text).toContain('Weekly is used up.');
-    expect(text).toContain('or use 1 bonus reset');
-    expect(text).not.toContain('Codex Weekly is at 100%.');
+    expect(text).not.toContain('Weekly exhausted');
+    expect(text).not.toContain('Weekly is used up.');
+    expect(text).not.toContain('or use 1 bonus reset');
+    expect(text).toContain('Codex Weekly is at 100%.');
     expect(text).toContain('Opens ChatGPT. QuotaBar cannot apply this reset.');
     expect(text).toContain('Updated just now');
-    expect(text).toContain('Quota current');
 
     const button = renderer.root.findByProps({ className: 'bonus-panel bonus-panel-action' });
     await act(async () => {
@@ -112,11 +116,11 @@ describe('Codex exhausted panel', () => {
     await unmount(renderer);
   });
 
-  it('hides the bonus card and uses the wait tip when no credit is available', async () => {
+  it('hides the bonus card without deriving reset recovery when no credit is available', async () => {
     const renderer = await render_exhausted({ bonusCount: 0 });
     const text = rendered_text(renderer);
 
-    expect(text).toContain('Weekly is used up. Resets');
+    expect(text).not.toContain('Weekly is used up. Resets');
     expect(text).not.toContain('bonus reset');
     expect(text).not.toContain('Bonus resets');
     await unmount(renderer);
@@ -137,6 +141,7 @@ describe('Codex exhausted panel', () => {
   it('keeps the fresh estimate card when the week is not exhausted', async () => {
     const renderer = await render_exhausted({
       usedPercent: 40,
+      ordinaryUsageAllowed: true,
       bonusCount: 0,
       valueObservedAt: new Date().toISOString(),
     });
@@ -146,6 +151,34 @@ describe('Codex exhausted panel', () => {
     expect(text).not.toContain('Weekly exhausted');
     expect(text).toContain('Local estimate');
     expect(text).not.toContain('Last estimate');
+    expect(text).not.toContain('Weekly is used up.');
+    await unmount(renderer);
+  });
+
+  it('keeps a 100% weekly window non-exhausted when availability is unknown', async () => {
+    const renderer = await render_exhausted({
+      ordinaryUsageAllowed: null,
+      bonusCount: 0,
+      valueObservedAt: new Date().toISOString(),
+    });
+    const text = rendered_text(renderer);
+
+    expect(text).toContain('Availability unknown');
+    expect(text).not.toContain('Weekly exhausted');
+    expect(text).not.toContain('Weekly is used up.');
+    await unmount(renderer);
+  });
+
+  it('keeps a permitted 100% weekly window distinct from exhaustion', async () => {
+    const renderer = await render_exhausted({
+      ordinaryUsageAllowed: true,
+      bonusCount: 0,
+      valueObservedAt: new Date().toISOString(),
+    });
+    const text = rendered_text(renderer);
+
+    expect(text).toContain('Ordinary usage permitted');
+    expect(text).not.toContain('Weekly exhausted');
     expect(text).not.toContain('Weekly is used up.');
     await unmount(renderer);
   });

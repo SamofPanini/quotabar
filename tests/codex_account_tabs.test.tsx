@@ -6,6 +6,7 @@ import { backend } from '../src/services/backend';
 import type {
   CodexProfileQuota,
   CodexProfilesResponse,
+  CodexRateLimits,
   CostDailySeries,
   CostOverview,
 } from '../src/types/models';
@@ -13,13 +14,18 @@ import type { CodexTrayAccountSnapshot } from '../src/services/provider_summary'
 
 const hiddenSections = { timeline: false, cost: false, trend: false, tips: false };
 
-const profile = (alias: string, usedPercent = 12): CodexProfileQuota => ({
+const profile = (
+  alias: string,
+  usedPercent = 12,
+  ordinaryUsageAllowed: boolean | null | undefined = true,
+): CodexProfileQuota => ({
   alias,
   status: 'connected',
   planType: 'plus',
   primary: { usedPercent, windowMinutes: 300, resetsAt: 1_788_000_000 },
   secondary: { usedPercent: usedPercent + 10, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
   availableResetCredits: 2,
+  ordinaryUsageAllowed,
 });
 
 function deferred<T>() {
@@ -38,11 +44,12 @@ async function flush(): Promise<void> {
   await Promise.resolve();
 }
 
-function mockDefaultCalls(): void {
+function mockDefaultCalls(limits?: CodexRateLimits): void {
   vi.spyOn(backend, 'getCodexInfo').mockResolvedValue({ connected: true, planType: 'plus' });
-  vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue({
+  vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue(limits ?? {
     connected: true,
     planType: 'plus',
+    ordinaryUsageAllowed: true,
     primary: { usedPercent: 8, windowMinutes: 300, resetsAt: 1_788_000_000 },
     secondary: { usedPercent: 20, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
   });
@@ -59,10 +66,11 @@ async function renderPanel(options: {
   onUsageChange?: (used: number | null) => void;
   onTrayQuotaSnapshotsChange?: (snapshots: CodexTrayAccountSnapshot[]) => void;
   manualRefreshNonce?: number;
+  defaultRateLimits?: CodexRateLimits;
   showCostSummary?: boolean;
   sections?: typeof hiddenSections;
 } = {}): Promise<ReactTestRenderer> {
-  mockDefaultCalls();
+  mockDefaultCalls(options.defaultRateLimits);
   vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue(options.profiles ?? { profiles: [], registryError: null });
   let renderer!: ReactTestRenderer;
   await act(async () => {
@@ -135,6 +143,66 @@ describe('Codex account tabs', () => {
     expect(backend.getCodexProfiles).toHaveBeenCalledTimes(1);
     expect(backend.getCodexInfo).toHaveBeenCalledTimes(1);
     expect(onUsageChange).toHaveBeenCalledTimes(callbackCount);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps conflicting ordinary-usage labels and neutral meters bound to their selected tab', async () => {
+    const unknownProfile = profile('Unknown', 44);
+    delete unknownProfile.ordinaryUsageAllowed;
+    const renderer = await renderPanel({
+      defaultRateLimits: {
+        connected: true,
+        planType: 'plus',
+        ordinaryUsageAllowed: true,
+        primary: { usedPercent: 100, windowMinutes: 300, resetsAt: 1_788_000_000 },
+        secondary: { usedPercent: 90, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
+      },
+      profiles: {
+        profiles: [
+          profile('Blocked', 0, false),
+          unknownProfile,
+        ],
+        registryError: null,
+      },
+    });
+    const tabText = () => JSON.stringify(renderer.toJSON());
+    const meterTexts = () => renderer.root.findAllByProps({ role: 'progressbar' })
+      .map((meter) => meter.props['aria-valuetext']);
+    const permissionLabels = () => renderer.root.findAllByProps({ className: 'codex-updated' })
+      .map((node) => node.children.join(''))
+      .filter((text) => [
+        'Ordinary usage permitted',
+        'Ordinary usage blocked',
+        'Availability unknown',
+      ].includes(text));
+    const expectSelectedTab = (label: string, meters: string[]) => {
+      expect(permissionLabels()).toEqual([label]);
+      expect(meterTexts()).toEqual(meters);
+      expect(tabText()).not.toContain('Weekly exhausted');
+      expect(tabText()).not.toContain('Weekly is used up.');
+      expect(tabText()).not.toContain('Resets after ordinary usage is restored');
+      expect(tabText()).not.toContain('Codex weekly is at 100%.');
+    };
+    const clickTab = async (index: number) => {
+      await act(async () => {
+        renderer.root.findAllByProps({ role: 'tab' })[index].props.onClick();
+        await flush();
+      });
+    };
+
+    expectSelectedTab('Ordinary usage permitted', ['100% used', '90% used']);
+
+    await clickTab(1);
+    expectSelectedTab('Ordinary usage blocked', ['0% used', '10% used']);
+
+    await clickTab(2);
+    expectSelectedTab('Availability unknown', ['44% used', '54% used']);
+
+    await clickTab(0);
+    expectSelectedTab('Ordinary usage permitted', ['100% used', '90% used']);
+
+    await clickTab(1);
+    expectSelectedTab('Ordinary usage blocked', ['0% used', '10% used']);
     await act(async () => renderer.unmount());
   });
 

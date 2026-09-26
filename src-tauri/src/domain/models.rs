@@ -128,6 +128,8 @@ pub struct CodexRateLimits {
     pub primary: Option<CodexRateLimitWindow>,
     pub secondary: Option<CodexRateLimitWindow>,
     pub credits: Option<CodexCredits>,
+    #[serde(rename = "ordinaryUsageAllowed")]
+    pub ordinary_usage_allowed: Option<bool>,
     pub error: Option<String>,
 }
 
@@ -139,6 +141,7 @@ impl CodexRateLimits {
             primary: None,
             secondary: None,
             credits: None,
+            ordinary_usage_allowed: None,
             error: Some(error.into()),
         }
     }

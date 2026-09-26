@@ -194,6 +194,53 @@ fn parse_rate_limit_window(window: &serde_json::Value) -> Option<CodexRateLimitW
     })
 }
 
+fn parse_ordinary_usage_allowed(rate_limit: Option<&serde_json::Value>) -> Option<bool> {
+    rate_limit
+        .and_then(|value| value.get("allowed"))
+        .and_then(serde_json::Value::as_bool)
+}
+
+fn parse_codex_rate_limits_response(data: &serde_json::Value) -> CodexRateLimits {
+    let rate_limit = data.get("rate_limit");
+    let primary = rate_limit
+        .and_then(|limit| limit.get("primary_window"))
+        .and_then(parse_rate_limit_window);
+    let secondary = rate_limit
+        .and_then(|limit| limit.get("secondary_window"))
+        .and_then(parse_rate_limit_window);
+
+    if primary.is_none() && secondary.is_none() {
+        return CodexRateLimits::disconnected(
+            "Failed to parse response: no numeric Codex rate limit usage fields",
+        );
+    }
+
+    let credits = data["credits"].as_object().map(|credits| CodexCredits {
+        has_credits: credits
+            .get("has_credits")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        unlimited: credits
+            .get("unlimited")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        balance: credits
+            .get("balance")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+    });
+
+    CodexRateLimits {
+        connected: true,
+        plan_type: data["plan_type"].as_str().map(ToString::to_string),
+        primary,
+        secondary,
+        credits,
+        ordinary_usage_allowed: parse_ordinary_usage_allowed(rate_limit),
+        error: None,
+    }
+}
+
 fn retain_last_good_info(
     cached: Option<&LastGoodInfo>,
     stamp: Option<&AuthFileStamp>,
@@ -452,43 +499,13 @@ async fn fetch_codex_rate_limits_from_auth(
         }
     };
 
-    let primary = data["rate_limit"]
-        .get("primary_window")
-        .and_then(parse_rate_limit_window);
-
-    let secondary = data["rate_limit"]
-        .get("secondary_window")
-        .and_then(parse_rate_limit_window);
-
-    if primary.is_none() && secondary.is_none() {
-        let error = "Failed to parse response: no numeric Codex rate limit usage fields";
-        log_msg(&format!("[RateLimits] {error}"));
-        return CodexRateLimits::disconnected(error);
+    let limits = parse_codex_rate_limits_response(&data);
+    if !limits.connected {
+        if let Some(error) = limits.error.as_deref() {
+            log_msg(&format!("[RateLimits] {error}"));
+        }
+        return limits;
     }
-
-    let credits = data["credits"].as_object().map(|credits| CodexCredits {
-        has_credits: credits
-            .get("has_credits")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        unlimited: credits
-            .get("unlimited")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        balance: credits
-            .get("balance")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
-    });
-
-    let limits = CodexRateLimits {
-        connected: true,
-        plan_type: data["plan_type"].as_str().map(ToString::to_string),
-        primary,
-        secondary,
-        credits,
-        error: None,
-    };
 
     match account_key {
         Some(account_key) => {
@@ -733,6 +750,7 @@ fn public_profile_from_quota(alias: String, row: CodexProfileQuota) -> CodexProf
         primary: row.rate_limits.primary,
         secondary: row.rate_limits.secondary,
         available_reset_credits: row.reset_credits.available_count,
+        ordinary_usage_allowed: row.rate_limits.ordinary_usage_allowed,
         // Existing errors can include transport details. Do not relay them.
         error: (status != "connected").then_some("Profile unavailable".to_string()),
         diagnostic_code: None,
@@ -786,10 +804,11 @@ pub(crate) async fn fetch_codex_profile_inputs(
 mod tests {
     use super::{
         aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs,
-        fetch_codex_profiles, parse_rate_limit_window, parse_reset_credit,
-        public_profile_from_quota, read_auth_json_with_stamp, retain_last_good_info,
-        should_preserve_for_status, should_preserve_transport_failure, window_minutes_from_seconds,
-        AuthFileStamp, BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
+        fetch_codex_profiles, parse_codex_rate_limits_response, parse_ordinary_usage_allowed,
+        parse_rate_limit_window, parse_reset_credit, public_profile_from_quota,
+        read_auth_json_with_stamp, retain_last_good_info, should_preserve_for_status,
+        should_preserve_transport_failure, window_minutes_from_seconds, AuthFileStamp,
+        BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
     };
     use crate::domain::account::{CodexProfile, CodexProfileInput, CodexProfileQuota};
     use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits, CodexResetCredits};
@@ -905,6 +924,180 @@ mod tests {
         assert_eq!(low.used_percent, 0.0);
     }
 
+    #[test]
+    fn parse_ordinary_usage_allowed_accepts_only_json_booleans() {
+        assert_eq!(
+            parse_ordinary_usage_allowed(Some(&json!({ "allowed": true }))),
+            Some(true)
+        );
+        assert_eq!(
+            parse_ordinary_usage_allowed(Some(&json!({ "allowed": false }))),
+            Some(false)
+        );
+
+        for rate_limit in [
+            json!(null),
+            json!({}),
+            json!({ "allowed": null }),
+            json!({ "allowed": "true" }),
+            json!({ "allowed": 1 }),
+        ] {
+            assert_eq!(parse_ordinary_usage_allowed(Some(&rate_limit)), None);
+        }
+        assert_eq!(parse_ordinary_usage_allowed(None), None);
+    }
+
+    #[test]
+    fn shared_rate_limit_parser_preserves_windows_and_permission_through_public_projection() {
+        let window = |used_percent| {
+            json!({
+                "used_percent": used_percent,
+                "limit_window_seconds": 18_000,
+                "reset_at": 1_781_000_000,
+            })
+        };
+        let cases = [
+            (
+                "permitted at 100",
+                json!({ "rate_limit": { "allowed": true, "primary_window": window(100), "secondary_window": window(90) } }),
+                Some(true),
+                Some(100.0),
+                Some(90.0),
+                true,
+                None,
+            ),
+            (
+                "blocked at 0",
+                json!({ "rate_limit": { "allowed": false, "primary_window": window(0), "secondary_window": window(10) } }),
+                Some(false),
+                Some(0.0),
+                Some(10.0),
+                true,
+                None,
+            ),
+            (
+                "null permission",
+                json!({ "rate_limit": { "allowed": null, "primary_window": window(25), "secondary_window": window(35) } }),
+                None,
+                Some(25.0),
+                Some(35.0),
+                true,
+                None,
+            ),
+            (
+                "missing permission",
+                json!({ "rate_limit": { "primary_window": window(50), "secondary_window": window(60) } }),
+                None,
+                Some(50.0),
+                Some(60.0),
+                true,
+                None,
+            ),
+            (
+                "wrong-type permission",
+                json!({ "rate_limit": { "allowed": "true", "primary_window": window(75), "secondary_window": window(85) } }),
+                None,
+                Some(75.0),
+                Some(85.0),
+                true,
+                None,
+            ),
+            (
+                "absent rate limit",
+                json!({}),
+                None,
+                None,
+                None,
+                false,
+                Some("Failed to parse response: no numeric Codex rate limit usage fields"),
+            ),
+        ];
+
+        for (
+            name,
+            response,
+            expected_permission,
+            expected_primary,
+            expected_secondary,
+            expected_connected,
+            expected_error,
+        ) in cases
+        {
+            let limits = parse_codex_rate_limits_response(&response);
+            assert_eq!(limits.ordinary_usage_allowed, expected_permission, "{name}");
+            assert_eq!(
+                limits.primary.as_ref().map(|window| window.used_percent),
+                expected_primary,
+                "{name}"
+            );
+            assert_eq!(
+                limits.secondary.as_ref().map(|window| window.used_percent),
+                expected_secondary,
+                "{name}"
+            );
+            assert_eq!(limits.connected, expected_connected, "{name}");
+            assert_eq!(limits.error.as_deref(), expected_error, "{name}");
+
+            let default_serialized =
+                serde_json::to_value(&limits).expect("default quota should serialize");
+            let default_keys = default_serialized
+                .as_object()
+                .expect("default quota must serialize as an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                default_keys,
+                [
+                    "connected",
+                    "planType",
+                    "primary",
+                    "secondary",
+                    "credits",
+                    "ordinaryUsageAllowed",
+                    "error"
+                ]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+                "{name}"
+            );
+
+            let public = public_profile_from_quota("synthetic".into(), public_quota(true, limits));
+            let serialized = serde_json::to_value(public).expect("public quota should serialize");
+            let expected_public_permission = expected_permission
+                .map(serde_json::Value::Bool)
+                .unwrap_or(serde_json::Value::Null);
+            assert_eq!(
+                serialized.get("ordinaryUsageAllowed"),
+                Some(&expected_public_permission),
+                "{name}"
+            );
+            let public_keys = serialized
+                .as_object()
+                .expect("public quota must serialize as an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                public_keys,
+                [
+                    "alias",
+                    "status",
+                    "planType",
+                    "primary",
+                    "secondary",
+                    "availableResetCredits",
+                    "ordinaryUsageAllowed",
+                    "error",
+                    "diagnosticCode"
+                ]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+                "{name}"
+            );
+        }
+    }
+
     fn auth_stamp(len: u64, secs: u64) -> AuthFileStamp {
         AuthFileStamp {
             len,
@@ -948,6 +1141,7 @@ mod tests {
             }),
             secondary: None,
             credits: None,
+            ordinary_usage_allowed: None,
             error: error.map(str::to_string),
         }
     }
@@ -976,6 +1170,7 @@ mod tests {
                     primary: None,
                     secondary: None,
                     credits: None,
+                    ordinary_usage_allowed: None,
                     error: Some("Network error".into()),
                 },
             ),

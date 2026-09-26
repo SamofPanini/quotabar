@@ -193,6 +193,7 @@ mod tests {
             }),
             secondary: None,
             credits: None,
+            ordinary_usage_allowed: None,
             error: None,
         }
     }

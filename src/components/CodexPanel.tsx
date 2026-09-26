@@ -20,7 +20,6 @@ import {
   type CodexTrayAccountSnapshot,
   type QuotaWindowSummary,
 } from '../services/provider_summary';
-import { canReportBonusReady } from '../services/bonus_ready';
 import {
   checkWeeklyQuotaWindow,
   checkWeeklyValueEstimate,
@@ -30,7 +29,7 @@ import {
   isSoftDisplayCheck,
   isWeeklyExhausted,
 } from '../services/codex_weekly_display';
-import { getAvailableResetCredits, getExhaustedWeekTip, getHighUsageTip } from '../services/detail_helpers';
+import { getAvailableResetCredits, getHighUsageTip } from '../services/detail_helpers';
 import { clampProgressValue, formatPaceText, formatPlanType, formatResetTime, getProgressStyle } from '../utils/quota_format';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
 import { useLatestRequestGeneration } from '../hooks/use_latest_request_generation';
@@ -230,6 +229,12 @@ function customProfileDiagnostic(profile: CodexProfileQuota): string {
     : 'Custom Codex quota unavailable';
 }
 
+function ordinaryUsageLabel(allowed?: boolean | null): string {
+  if (allowed === true) return 'Ordinary usage permitted';
+  if (allowed === false) return 'Ordinary usage blocked';
+  return 'Availability unknown';
+}
+
 export default function CodexPanel({
   onConnectionChange,
   onUsageChange,
@@ -241,7 +246,6 @@ export default function CodexPanel({
   showCostSummary = true,
   sections = defaultPanelSections(),
   onBonusExpiring,
-  onBonusReadyChange,
   onOpenDashboard,
 }: CodexPanelProps) {
   const [codexData, setCodexData] = useState<CodexData | null>(null);
@@ -277,12 +281,14 @@ export default function CodexPanel({
         connected: Boolean(pending.defaultResult.limits.connected || pending.defaultResult.info.connected),
         primary: pending.defaultResult.limits.primary,
         secondary: pending.defaultResult.limits.secondary,
+        ordinaryUsageAllowed: pending.defaultResult.limits.ordinaryUsageAllowed,
       },
       ...pending.profiles.map((profile) => ({
         accountId: profile.alias,
         connected: profile.status === 'connected' || profile.status === 'stale',
         primary: profile.primary,
         secondary: profile.secondary,
+        ordinaryUsageAllowed: profile.ordinaryUsageAllowed,
       })),
     ]);
     pendingTrayCoordination.current = null;
@@ -412,30 +418,9 @@ export default function CodexPanel({
   }, [resetCredits, onBonusExpiring]);
 
   const officialWeeklyLimit = selectOfficialWeeklyLimitWindow(rateLimits);
-  const weeklyExhausted = isWeeklyExhausted(officialWeeklyLimit?.usedPercent);
+  const weeklyExhausted = isWeeklyExhausted();
+  const ordinaryUsageBlocked = rateLimits?.ordinaryUsageAllowed === false;
   const availableResetCredits = getAvailableResetCredits(resetCredits);
-
-  useEffect(() => {
-    if (
-      !onBonusReadyChange
-      || !canReportBonusReady(
-        resetCredits,
-        officialWeeklyLimit?.usedPercent,
-        availableResetCredits.length,
-      )
-    ) return;
-    onBonusReadyChange({
-      exhausted: weeklyExhausted,
-      availableCount: availableResetCredits.length,
-    });
-  }, [
-    availableResetCredits.length,
-    officialWeeklyLimit?.usedPercent,
-    onBonusReadyChange,
-    rateLimits,
-    resetCredits,
-    weeklyExhausted,
-  ]);
 
   useEffect(() => {
     if (selectedAccountId !== 'default' && !customProfiles.some((profile) => profile.alias === selectedAccountId)) {
@@ -529,21 +514,18 @@ export default function CodexPanel({
     ? 'Stale data'
     : quotaUnavailable
       ? 'Quota unavailable'
-      : weeklyExhausted
-        ? 'Weekly exhausted'
+      : ordinaryUsageBlocked
+        ? 'Ordinary usage blocked'
         : connected
           ? 'Connected'
           : 'Offline';
   const headerTone = showingStaleLimits
     ? 'pending'
-    : quotaUnavailable || weeklyExhausted
+    : quotaUnavailable || ordinaryUsageBlocked
       ? 'error'
       : connected
         ? 'online'
         : 'offline';
-  const exhaustedTip = weeklyExhausted
-    ? getExhaustedWeekTip(formatResetAt(officialWeeklyLimit?.resetsAt), availableResetCredits.length)
-    : null;
   const renderBonusPanel = () => {
     if (availableResetCredits.length === 0) return null;
     const body = (
@@ -617,6 +599,7 @@ export default function CodexPanel({
       planType: selectedCustomProfile.planType,
       primary: selectedCustomProfile.primary,
       secondary: selectedCustomProfile.secondary,
+      ordinaryUsageAllowed: selectedCustomProfile.ordinaryUsageAllowed,
     };
     const customWindows = buildCodexQuotaWindows(customLimits);
     const customTopWindow = sortMostConstrained(customWindows)[0];
@@ -659,6 +642,7 @@ export default function CodexPanel({
             usageLabel={customTopWindow?.label}
             tone={status.tone}
           />
+          <div className="codex-updated">{ordinaryUsageLabel(customLimits.ordinaryUsageAllowed)}</div>
           {hasCustomLimits ? (
             <div className="section">
               <div className="section-title">Usage</div>
@@ -705,6 +689,7 @@ export default function CodexPanel({
             usageLabel={topWindow?.label}
             tone={headerTone}
           />
+          <div className="codex-updated">{ordinaryUsageLabel(rateLimits?.ordinaryUsageAllowed)}</div>
           {officialUpdatedAt != null && (
             <div className="codex-updated">
               <span>{formatOfficialUpdatedAt(officialUpdatedAt)}</span>
@@ -887,7 +872,7 @@ export default function CodexPanel({
           )}
 
           {sections.tips && (
-            <SmartTip message={weeklyExhausted ? exhaustedTip : getHighUsageTip(windows)} />
+            <SmartTip message={getHighUsageTip(windows)} />
           )}
 
           {!weeklyExhausted && renderBonusPanel()}
