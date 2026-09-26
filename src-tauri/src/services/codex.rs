@@ -938,6 +938,87 @@ mod tests {
         assert_eq!(parse_ordinary_usage_allowed(None), None);
     }
 
+    fn rate_limits_from_synthetic_response(data: &serde_json::Value) -> CodexRateLimits {
+        let rate_limit = data.get("rate_limit");
+        CodexRateLimits {
+            connected: true,
+            plan_type: data["plan_type"].as_str().map(ToString::to_string),
+            primary: rate_limit
+                .and_then(|limit| limit.get("primary_window"))
+                .and_then(parse_rate_limit_window),
+            secondary: rate_limit
+                .and_then(|limit| limit.get("secondary_window"))
+                .and_then(parse_rate_limit_window),
+            credits: None,
+            ordinary_usage_allowed: parse_ordinary_usage_allowed(rate_limit),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn synthetic_rate_limit_responses_preserve_windows_and_permission_through_public_projection() {
+        let window = |used_percent| {
+            json!({
+                "used_percent": used_percent,
+                "limit_window_seconds": 18_000,
+                "reset_at": 1_781_000_000,
+            })
+        };
+        let cases = [
+            (
+                "permitted at 100",
+                json!({ "rate_limit": { "allowed": true, "primary_window": window(100) } }),
+                Some(true),
+                Some(100.0),
+            ),
+            (
+                "blocked at 0",
+                json!({ "rate_limit": { "allowed": false, "primary_window": window(0) } }),
+                Some(false),
+                Some(0.0),
+            ),
+            (
+                "null permission",
+                json!({ "rate_limit": { "allowed": null, "primary_window": window(25) } }),
+                None,
+                Some(25.0),
+            ),
+            (
+                "missing permission",
+                json!({ "rate_limit": { "primary_window": window(50) } }),
+                None,
+                Some(50.0),
+            ),
+            (
+                "wrong-type permission",
+                json!({ "rate_limit": { "allowed": "true", "primary_window": window(75) } }),
+                None,
+                Some(75.0),
+            ),
+            ("absent rate limit", json!({}), None, None),
+        ];
+
+        for (name, response, expected_permission, expected_used_percent) in cases {
+            let limits = rate_limits_from_synthetic_response(&response);
+            assert_eq!(limits.ordinary_usage_allowed, expected_permission, "{name}");
+            assert_eq!(
+                limits.primary.as_ref().map(|window| window.used_percent),
+                expected_used_percent,
+                "{name}"
+            );
+
+            let public = public_profile_from_quota("synthetic".into(), public_quota(true, limits));
+            let serialized = serde_json::to_value(public).expect("public quota should serialize");
+            assert_eq!(
+                serialized.get("ordinaryUsageAllowed"),
+                expected_permission.map(serde_json::Value::Bool).as_ref(),
+                "{name}"
+            );
+            assert!(serialized.get("profileId").is_none(), "{name}");
+            assert!(serialized.get("accountId").is_none(), "{name}");
+        }
+    }
+
     fn auth_stamp(len: u64, secs: u64) -> AuthFileStamp {
         AuthFileStamp {
             len,

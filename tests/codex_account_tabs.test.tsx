@@ -13,13 +13,18 @@ import type { CodexTrayAccountSnapshot } from '../src/services/provider_summary'
 
 const hiddenSections = { timeline: false, cost: false, trend: false, tips: false };
 
-const profile = (alias: string, usedPercent = 12): CodexProfileQuota => ({
+const profile = (
+  alias: string,
+  usedPercent = 12,
+  ordinaryUsageAllowed: boolean | null | undefined = true,
+): CodexProfileQuota => ({
   alias,
   status: 'connected',
   planType: 'plus',
   primary: { usedPercent, windowMinutes: 300, resetsAt: 1_788_000_000 },
   secondary: { usedPercent: usedPercent + 10, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
   availableResetCredits: 2,
+  ordinaryUsageAllowed,
 });
 
 function deferred<T>() {
@@ -43,6 +48,7 @@ function mockDefaultCalls(): void {
   vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue({
     connected: true,
     planType: 'plus',
+    ordinaryUsageAllowed: true,
     primary: { usedPercent: 8, windowMinutes: 300, resetsAt: 1_788_000_000 },
     secondary: { usedPercent: 20, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
   });
@@ -135,6 +141,47 @@ describe('Codex account tabs', () => {
     expect(backend.getCodexProfiles).toHaveBeenCalledTimes(1);
     expect(backend.getCodexInfo).toHaveBeenCalledTimes(1);
     expect(onUsageChange).toHaveBeenCalledTimes(callbackCount);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps conflicting ordinary-usage labels and neutral meters bound to their selected tab', async () => {
+    vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
+      connected: true,
+      planType: 'plus',
+      ordinaryUsageAllowed: true,
+      primary: { usedPercent: 100, windowMinutes: 300, resetsAt: 1_788_000_000 },
+      secondary: { usedPercent: 90, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
+    });
+    const renderer = await renderPanel({
+      profiles: {
+        profiles: [
+          profile('Blocked', 0, false),
+          profile('Unknown', 44, undefined),
+        ],
+        registryError: null,
+      },
+    });
+    const tabText = () => JSON.stringify(renderer.toJSON());
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+
+    expect(tabText()).toContain('Ordinary usage permitted');
+    expect(tabText()).toContain('100%');
+    expect(tabText()).not.toContain('Weekly exhausted');
+
+    await act(async () => { tabs[1].props.onClick(); await flush(); });
+    expect(tabText()).toContain('Ordinary usage blocked');
+    expect(tabText()).toContain('0%');
+    expect(tabText()).not.toContain('Weekly exhausted');
+
+    await act(async () => { tabs[2].props.onClick(); await flush(); });
+    expect(tabText()).toContain('Availability unknown');
+    expect(tabText()).toContain('44%');
+
+    await act(async () => { tabs[0].props.onClick(); await flush(); });
+    expect(tabText()).toContain('Ordinary usage permitted');
+    expect(tabText()).toContain('100%');
+    expect(tabText()).not.toContain('Ordinary usage blocked');
+    expect(tabText()).not.toContain('Availability unknown');
     await act(async () => renderer.unmount());
   });
 
