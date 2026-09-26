@@ -145,7 +145,7 @@ describe('Codex account tabs', () => {
   });
 
   it('keeps conflicting ordinary-usage labels and neutral meters bound to their selected tab', async () => {
-    vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
+    vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue({
       connected: true,
       planType: 'plus',
       ordinaryUsageAllowed: true,
