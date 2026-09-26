@@ -164,24 +164,26 @@ describe('Codex account tabs', () => {
       },
     });
     const tabText = () => JSON.stringify(renderer.toJSON());
+    const meterTexts = () => renderer.root.findAllByProps({ role: 'progressbar' })
+      .map((meter) => meter.props['aria-valuetext']);
     const tabs = renderer.root.findAllByProps({ role: 'tab' });
 
     expect(tabText()).toContain('Ordinary usage permitted');
-    expect(tabText()).toContain('100%');
+    expect(meterTexts()).toContain('100% used');
     expect(tabText()).not.toContain('Weekly exhausted');
 
     await act(async () => { tabs[1].props.onClick(); await flush(); });
     expect(tabText()).toContain('Ordinary usage blocked');
-    expect(tabText()).toContain('0%');
+    expect(meterTexts()).toContain('0% used');
     expect(tabText()).not.toContain('Weekly exhausted');
 
     await act(async () => { tabs[2].props.onClick(); await flush(); });
     expect(tabText()).toContain('Availability unknown');
-    expect(tabText()).toContain('44%');
+    expect(meterTexts()).toContain('44% used');
 
     await act(async () => { tabs[0].props.onClick(); await flush(); });
     expect(tabText()).toContain('Ordinary usage permitted');
-    expect(tabText()).toContain('100%');
+    expect(meterTexts()).toContain('100% used');
     expect(tabText()).not.toContain('Ordinary usage blocked');
     expect(tabText()).not.toContain('Availability unknown');
     await act(async () => renderer.unmount());
