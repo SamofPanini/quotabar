@@ -147,6 +147,8 @@ describe('Codex account tabs', () => {
   });
 
   it('keeps conflicting ordinary-usage labels and neutral meters bound to their selected tab', async () => {
+    const unknownProfile = profile('Unknown', 44);
+    delete unknownProfile.ordinaryUsageAllowed;
     const renderer = await renderPanel({
       defaultRateLimits: {
         connected: true,
@@ -158,7 +160,7 @@ describe('Codex account tabs', () => {
       profiles: {
         profiles: [
           profile('Blocked', 0, false),
-          profile('Unknown', 44, undefined),
+          unknownProfile,
         ],
         registryError: null,
       },
