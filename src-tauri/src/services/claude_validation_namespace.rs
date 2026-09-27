@@ -12,7 +12,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 
 const MANIFEST: &str = ".quotabar-c3b1-owner";
-const MANIFEST_BYTES: &[u8] = b"c3-b1a-owner-v1\n";
+const MANIFEST_HEADER: &str = "quotabar-c3b1-owner-v2";
 const PRIVATE_MODE: u32 = 0o700;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub(crate) enum NamespaceError {
     Io,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct OwnedEntry {
     name: CString,
     dev: u64,
@@ -59,19 +59,19 @@ impl ValidationNamespace {
         let root_entry = OwnedEntry::from_stat(root_name.clone(), &root_stat, PRIVATE_MODE);
         let manifest = CString::new(MANIFEST).map_err(|_| NamespaceError::Collision)?;
         let mut manifest_file = create_file_at(root_file.as_raw_fd(), &manifest, 0o600)?;
-        manifest_file
-            .write_all(MANIFEST_BYTES)
-            .map_err(|_| NamespaceError::Io)?;
+        manifest_file.flush().map_err(|_| NamespaceError::Io)?;
         let manifest_stat =
             stat_at(root_file.as_raw_fd(), &manifest)?.ok_or(NamespaceError::Mismatch)?;
         validate_file_stat(&manifest_stat, 0o600)?;
-        Ok(Self {
+        let mut namespace = Self {
             parent,
             root: root_file,
             root_name,
             root_entry,
             entries: vec![OwnedEntry::from_stat(manifest, &manifest_stat, 0o600)],
-        })
+        };
+        namespace.persist_inventory()?;
+        Ok(namespace)
     }
 
     /// Only direct normal names are admitted.  This makes the cleanup manifest
@@ -87,7 +87,39 @@ impl ValidationNamespace {
         validate_dir_stat(&child_stat, Some(PRIVATE_MODE))?;
         self.entries
             .push(OwnedEntry::from_stat(name, &child_stat, PRIVATE_MODE));
+        self.persist_inventory()?;
         Ok(())
+    }
+
+    pub(crate) fn reopen(root: PathBuf) -> Result<Self, NamespaceError> {
+        reject_collision(&root)?;
+        let parent_path = root.parent().ok_or(NamespaceError::Collision)?;
+        let root_name = c_name(root.file_name().ok_or(NamespaceError::Collision)?)?;
+        let parent = open_dir(parent_path)?;
+        let root_file = open_dir_at(parent.as_raw_fd(), &root_name)?;
+        let root_stat = stat_fd(&root_file)?;
+        validate_dir_stat(&root_stat, Some(PRIVATE_MODE))?;
+        let root_entry = OwnedEntry::from_stat(root_name.clone(), &root_stat, PRIVATE_MODE);
+        let manifest = CString::new(MANIFEST).map_err(|_| NamespaceError::Collision)?;
+        let manifest_stat =
+            stat_at(root_file.as_raw_fd(), &manifest)?.ok_or(NamespaceError::Mismatch)?;
+        validate_file_stat(&manifest_stat, 0o600)?;
+        let mut entries = vec![OwnedEntry::from_stat(
+            manifest.clone(),
+            &manifest_stat,
+            0o600,
+        )];
+        entries.extend(parse_inventory(&read_file_at(
+            root_file.as_raw_fd(),
+            &manifest,
+        )?)?);
+        Ok(Self {
+            parent,
+            root: root_file,
+            root_name,
+            root_entry,
+            entries,
+        })
     }
 
     /// Exact bottom-up cleanup.  A descriptor/stat mismatch stops before any
@@ -108,7 +140,14 @@ impl ValidationNamespace {
             .iter()
             .find(|entry| entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes())
             .ok_or(NamespaceError::Mismatch)?;
-        if read_file_at(self.root.as_raw_fd(), &manifest.name)? != MANIFEST_BYTES {
+        if parse_inventory(&read_file_at(self.root.as_raw_fd(), &manifest.name)?)?
+            != self
+                .entries
+                .iter()
+                .filter(|entry| entry.name.as_c_str().to_bytes() != MANIFEST.as_bytes())
+                .cloned()
+                .collect::<Vec<_>>()
+        {
             return Err(NamespaceError::Mismatch);
         }
         // Preflight the full manifest before unlinking anything.  In
@@ -123,12 +162,17 @@ impl ValidationNamespace {
         if actual != expected {
             return Err(NamespaceError::Mismatch);
         }
-        for entry in self.entries.iter().rev() {
+        // All entry identities must be checked before deletion begins.  The
+        // subsequent loop is mutation-only, preventing reverse-order partial
+        // cleanup when an earlier entry has been replaced in place.
+        for entry in &self.entries {
             let stat =
                 stat_at(self.root.as_raw_fd(), &entry.name)?.ok_or(NamespaceError::Mismatch)?;
             if !entry.matches(&stat) {
                 return Err(NamespaceError::Mismatch);
             }
+        }
+        for entry in self.entries.iter().rev() {
             let is_manifest = entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes();
             unlink_at(
                 self.root.as_raw_fd(),
@@ -137,6 +181,24 @@ impl ValidationNamespace {
             )?;
         }
         unlink_at(self.parent.as_raw_fd(), &self.root_name, libc::AT_REMOVEDIR)
+    }
+
+    fn persist_inventory(&mut self) -> Result<(), NamespaceError> {
+        let manifest = self
+            .entries
+            .iter()
+            .find(|entry| entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes())
+            .ok_or(NamespaceError::Mismatch)?;
+        let bytes = render_inventory(&self.entries);
+        let mut file = unsafe {
+            file_from_fd(libc::openat(
+                self.root.as_raw_fd(),
+                manifest.name.as_ptr(),
+                libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            ))
+        }?;
+        file.write_all(&bytes).map_err(|_| NamespaceError::Io)?;
+        file.sync_all().map_err(|_| NamespaceError::Io)
     }
 }
 
@@ -156,6 +218,61 @@ impl OwnedEntry {
             && stat.st_ino as u64 == self.ino
             && (stat.st_mode as u32 & 0o777) == self.mode
     }
+}
+
+fn render_inventory(entries: &[OwnedEntry]) -> Vec<u8> {
+    let mut text = format!("{MANIFEST_HEADER}\n");
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.name.as_c_str().to_bytes() != MANIFEST.as_bytes())
+    {
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            entry.name.to_string_lossy(),
+            entry.dev,
+            entry.ino,
+            entry.mode
+        ));
+    }
+    text.into_bytes()
+}
+
+fn parse_inventory(bytes: &[u8]) -> Result<Vec<OwnedEntry>, NamespaceError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| NamespaceError::Mismatch)?;
+    let mut lines = text.lines();
+    if lines.next() != Some(MANIFEST_HEADER) {
+        return Err(NamespaceError::Mismatch);
+    }
+    let mut entries = Vec::new();
+    for line in lines {
+        let mut fields = line.split('\t');
+        let name = checked_direct_name(fields.next().ok_or(NamespaceError::Mismatch)?)?;
+        let dev = fields
+            .next()
+            .ok_or(NamespaceError::Mismatch)?
+            .parse()
+            .map_err(|_| NamespaceError::Mismatch)?;
+        let ino = fields
+            .next()
+            .ok_or(NamespaceError::Mismatch)?
+            .parse()
+            .map_err(|_| NamespaceError::Mismatch)?;
+        let mode = fields
+            .next()
+            .ok_or(NamespaceError::Mismatch)?
+            .parse()
+            .map_err(|_| NamespaceError::Mismatch)?;
+        if fields.next().is_some() || mode != PRIVATE_MODE {
+            return Err(NamespaceError::Mismatch);
+        }
+        entries.push(OwnedEntry {
+            name,
+            dev,
+            ino,
+            mode,
+        });
+    }
+    Ok(entries)
 }
 
 fn c_name(value: &std::ffi::OsStr) -> Result<CString, NamespaceError> {
@@ -389,6 +506,43 @@ mod tests {
         assert!(root.join("slots").exists());
         let _ = fs::remove_file(root.join(MANIFEST));
         let _ = fs::remove_dir(root.join("slots"));
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn replaced_earlier_reverse_entry_causes_zero_deletion() {
+        let root = root();
+        let mut namespace = ValidationNamespace::prepare(root.clone()).unwrap();
+        namespace.create_private_dir("slots").unwrap();
+        namespace.create_private_dir("observer").unwrap();
+        fs::remove_dir(root.join("slots")).unwrap();
+        fs::create_dir(root.join("slots")).unwrap();
+        assert_eq!(namespace.cleanup().unwrap_err(), NamespaceError::Mismatch);
+        assert!(root.join(MANIFEST).exists());
+        assert!(root.join("slots").exists());
+        assert!(root.join("observer").exists());
+        let _ = fs::remove_dir(root.join("slots"));
+        let _ = fs::remove_dir(root.join("observer"));
+        let _ = fs::remove_file(root.join(MANIFEST));
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn reopened_inventory_retains_zero_delete_proof() {
+        let root = root();
+        let mut namespace = ValidationNamespace::prepare(root.clone()).unwrap();
+        namespace.create_private_dir("slots").unwrap();
+        namespace.create_private_dir("observer").unwrap();
+        drop(namespace);
+        fs::remove_dir(root.join("slots")).unwrap();
+        fs::create_dir(root.join("slots")).unwrap();
+        let reopened = ValidationNamespace::reopen(root.clone()).unwrap();
+        assert_eq!(reopened.cleanup().unwrap_err(), NamespaceError::Mismatch);
+        assert!(root.join(MANIFEST).exists());
+        assert!(root.join("observer").exists());
+        let _ = fs::remove_dir(root.join("slots"));
+        let _ = fs::remove_dir(root.join("observer"));
+        let _ = fs::remove_file(root.join(MANIFEST));
         let _ = fs::remove_dir(root);
     }
 

@@ -10,13 +10,13 @@ use super::claude_snapshot::{
 use super::claude_synthetic_adapter::{
     submit_correlated_observation, CorrelatedDisposition, CorrelatedObservation, SyntheticWindow,
 };
-use super::claude_validation_pairing::{PairingConsume, PairingTable};
+use super::claude_validation_pairing::{PairingConsume, PairingTable, SessionAuthority};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -108,11 +108,24 @@ impl SocketRoot {
         self.classify_existing_endpoint()?;
         let path = self.socket_path()?;
         let listener = UnixListener::bind(&path).map_err(|_| TransportError::Rejected)?;
+        let created = fs::symlink_metadata(&path).map_err(|_| TransportError::Rejected)?;
+        if !created.file_type().is_socket() || created.file_type().is_symlink() {
+            return Err(TransportError::Rejected);
+        }
         let socket = CStringName::new(SOCKET_NAME)?;
         if unsafe { libc::fchmodat(self.descriptor.as_raw_fd(), socket.as_ptr(), 0o600, 0) } != 0 {
             return Err(TransportError::Io);
         }
-        self.assert_pinned()?;
+        if self.assert_pinned().is_err() {
+            // Only remove the exact inode created by this attempt; a
+            // replacement at the pathname is left untouched.
+            if let Ok(current) = fs::symlink_metadata(&path) {
+                if current.dev() == created.dev() && current.ino() == created.ino() {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            return Err(TransportError::Rejected);
+        }
         let metadata =
             stat_at(self.descriptor.as_raw_fd(), &socket)?.ok_or(TransportError::Rejected)?;
         if (metadata.st_mode & libc::S_IFMT) != libc::S_IFSOCK
@@ -205,6 +218,14 @@ impl SocketRoot {
             return Err(TransportError::Rejected);
         }
         self.assert_pinned()?;
+        let current =
+            stat_at(self.descriptor.as_raw_fd(), &socket)?.ok_or(TransportError::Rejected)?;
+        if current.st_dev != metadata.st_dev
+            || current.st_ino != metadata.st_ino
+            || current.st_mode != metadata.st_mode
+        {
+            return Err(TransportError::Rejected);
+        }
         if unsafe { libc::unlinkat(self.descriptor.as_raw_fd(), socket.as_ptr(), 0) } == 0 {
             Ok(())
         } else {
@@ -370,6 +391,20 @@ pub(crate) fn handle_authenticated_session(
     peer_pid: u32,
     now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
+    let authority = authenticate_session(stream, pairing, peer_uid, peer_pid, now)?;
+    handle_session_loop(stream, store, authority, now)
+}
+
+/// Authentication is the only phase that borrows the shared pairing table.
+/// Once this returns, callers may release their table guard before any frame
+/// I/O or snapshot mutation begins.
+pub(crate) fn authenticate_session(
+    stream: &mut UnixStream,
+    pairing: &mut PairingTable,
+    peer_uid: u32,
+    peer_pid: u32,
+    now: DateTime<Utc>,
+) -> Result<SessionAuthority, TransportError> {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(3)))
         .map_err(|_| TransportError::Io)?;
@@ -378,10 +413,10 @@ pub(crate) fn handle_authenticated_session(
         .map_err(|_| TransportError::Io)?;
     let handshake = read_secret_frame(stream, HANDSHAKE_MAX)?;
     let (slot, token) = parse_handshake(&handshake)?;
-    let authority = match pairing.consume(&slot, &token, peer_uid, peer_pid, now) {
+    match pairing.consume(&slot, &token, peer_uid, peer_pid, now) {
         PairingConsume::Accepted(authority) => {
             write_fixed_result(stream, "accepted")?;
-            authority
+            Ok(authority)
         }
         PairingConsume::Expired => {
             write_fixed_result(stream, "expired")?;
@@ -391,12 +426,24 @@ pub(crate) fn handle_authenticated_session(
             write_fixed_result(stream, "rejected")?;
             return Err(TransportError::Rejected);
         }
-    };
+    }
+}
+
+/// Per-session worker phase: deliberately receives owned authority only and
+/// cannot retain a pairing-table reference or synchronization guard.
+pub(crate) fn handle_session_loop(
+    stream: &mut UnixStream,
+    store: &ClaudeSnapshotStore,
+    authority: SessionAuthority,
+    now: DateTime<Utc>,
+) -> Result<(), TransportError> {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|_| TransportError::Io)?;
     let mut frames = 1usize;
-    let mut bytes = handshake.len() + 4;
+    // The exact handshake payload is no longer retained after authentication;
+    // reserve its maximum framing budget for a conservative session cap.
+    let mut bytes = HANDSHAKE_MAX + 4;
     while frames < SESSION_MAX_FRAMES && bytes < SESSION_MAX_BYTES {
         let frame = match read_frame(stream, FRAME_MAX) {
             Ok(frame) => frame,
