@@ -3419,6 +3419,7 @@ dependencies = [
  "ccstats",
  "chrono",
  "dirs 5.0.1",
+ "getrandom 0.3.4",
  "image",
  "libc",
  "objc2-app-kit",
@@ -3428,12 +3429,14 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
