@@ -244,6 +244,10 @@ impl AccountSlotId {
             .map(|_| Self(value))
             .ok_or(SnapshotError::InvalidInput)
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,6 +650,66 @@ impl ClaudeSnapshotStore {
         Ok(ValidationBindingIssuance {
             capability,
             epoch: 1,
+        })
+    }
+
+    /// Transactionally selects first registration or an explicit foreground
+    /// rebind from durable slot state.  In-memory transport sessions are never
+    /// consulted: process restart must invalidate old authority while leaving
+    /// the slot eligible for a fresh foreground bind.
+    pub(crate) fn register_or_rebind_validation_slot(
+        &self,
+        slot_id: AccountSlotId,
+        alias: String,
+        plan: PlanMetadata,
+        now: DateTime<Utc>,
+    ) -> Result<ValidationBindingIssuance, SnapshotError> {
+        if !safe_alias(&alias) {
+            return Err(SnapshotError::InvalidInput);
+        }
+        let binding_id = BindingId::generate();
+        let mut issued_epoch = 0;
+        self.mutate(now, |aggregate| {
+            if let Some(slot) = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| slot.slot_id == slot_id)
+            {
+                if slot.plan != Some(plan) {
+                    return Err(SnapshotError::Rejected);
+                }
+                if slot.binding_state != BindingState::Unverified {
+                    slot.binding_epoch = slot
+                        .binding_epoch
+                        .checked_add(1)
+                        .ok_or(SnapshotError::Rejected)?;
+                }
+                slot.binding_id = Some(binding_id.clone());
+                slot.binding_state = BindingState::Bound;
+                slot.next_sequence = 1;
+                slot.windows.clear();
+                issued_epoch = slot.binding_epoch;
+                return Ok(());
+            }
+            if aggregate.slots.len() == MAX_SLOTS {
+                return Err(SnapshotError::InvalidInput);
+            }
+            aggregate.slots.push(SlotState {
+                slot_id,
+                alias,
+                plan: Some(plan),
+                binding_id: Some(binding_id.clone()),
+                binding_state: BindingState::Bound,
+                binding_epoch: 1,
+                next_sequence: 1,
+                windows: vec![],
+            });
+            issued_epoch = 1;
+            Ok(())
+        })?;
+        Ok(ValidationBindingIssuance {
+            capability: BindingCapability { binding_id },
+            epoch: issued_epoch,
         })
     }
 

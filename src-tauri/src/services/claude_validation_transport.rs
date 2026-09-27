@@ -10,21 +10,26 @@ use super::claude_snapshot::{
 use super::claude_synthetic_adapter::{
     submit_correlated_observation, CorrelatedDisposition, CorrelatedObservation, SyntheticWindow,
 };
-use super::claude_validation_pairing::{PairingResult, PairingTable};
+use super::claude_validation_pairing::{PairingConsume, PairingTable};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 const HANDSHAKE_MAX: usize = 1024;
 const FRAME_MAX: usize = 16 * 1024;
 const SESSION_MAX_FRAMES: usize = 8;
 const SESSION_MAX_BYTES: usize = 128 * 1024;
+const SOCKET_NAME: &str = "v1.sock";
+const SOCKET_MANIFEST: &str = ".quotabar-c3b1-socket-owner";
+const SOCKET_PID: &str = ".quotabar-c3b1-socket-pid";
+const SOCKET_MANIFEST_BYTES: &[u8] = b"quotabar-c3b1-socket-owner-v1\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportError {
@@ -50,6 +55,10 @@ pub(crate) struct SocketRoot {
 
 impl SocketRoot {
     pub(crate) fn for_synthetic(root: PathBuf) -> Result<Self, TransportError> {
+        let expected_name = format!("quotabar-c3b1-{}", unsafe { libc::geteuid() });
+        if root.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            return Err(TransportError::Rejected);
+        }
         let encoded = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())
             .map_err(|_| TransportError::Rejected)?;
         let fd = unsafe {
@@ -71,17 +80,19 @@ impl SocketRoot {
         {
             return Err(TransportError::Rejected);
         }
-        Ok(Self {
+        let socket_root = Self {
             root,
             descriptor,
             dev: metadata.dev(),
             ino: metadata.ino(),
-        })
+        };
+        socket_root.initialize_owner_markers()?;
+        Ok(socket_root)
     }
 
     pub(crate) fn socket_path(&self) -> Result<PathBuf, TransportError> {
         self.assert_pinned()?;
-        let candidate = self.root.join("v1.sock");
+        let candidate = self.root.join(SOCKET_NAME);
         // macOS sockaddr_un accepts at most 104 bytes; reject rather than
         // relying on truncation or a fallback path.
         if candidate.as_os_str().as_encoded_bytes().len() >= 104 {
@@ -94,20 +105,111 @@ impl SocketRoot {
     }
 
     pub(crate) fn bind(&self) -> Result<UnixListener, TransportError> {
+        self.classify_existing_endpoint()?;
         let path = self.socket_path()?;
         let listener = UnixListener::bind(&path).map_err(|_| TransportError::Rejected)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .map_err(|_| TransportError::Io)?;
+        let socket = CStringName::new(SOCKET_NAME)?;
+        if unsafe { libc::fchmodat(self.descriptor.as_raw_fd(), socket.as_ptr(), 0o600, 0) } != 0 {
+            return Err(TransportError::Io);
+        }
         self.assert_pinned()?;
-        let metadata = fs::symlink_metadata(&path).map_err(|_| TransportError::Rejected)?;
-        if !metadata.file_type().is_socket()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || (metadata.mode() & 0o777) != 0o600
+        let metadata =
+            stat_at(self.descriptor.as_raw_fd(), &socket)?.ok_or(TransportError::Rejected)?;
+        if (metadata.st_mode & libc::S_IFMT) != libc::S_IFSOCK
+            || metadata.st_uid != unsafe { libc::geteuid() }
+            || (metadata.st_mode as u32 & 0o777) != 0o600
         {
             return Err(TransportError::Rejected);
         }
         Ok(listener)
+    }
+
+    fn initialize_owner_markers(&self) -> Result<(), TransportError> {
+        self.assert_pinned()?;
+        let manifest = CStringName::new(SOCKET_MANIFEST)?;
+        let pid = CStringName::new(SOCKET_PID)?;
+        if stat_at(self.descriptor.as_raw_fd(), &manifest)?.is_some()
+            || stat_at(self.descriptor.as_raw_fd(), &pid)?.is_some()
+        {
+            return self.validate_owner_markers();
+        }
+        if stat_at(self.descriptor.as_raw_fd(), &CStringName::new(SOCKET_NAME)?)?.is_some() {
+            return Err(TransportError::Rejected);
+        }
+        write_private_at(
+            self.descriptor.as_raw_fd(),
+            &manifest,
+            SOCKET_MANIFEST_BYTES,
+        )?;
+        write_private_at(
+            self.descriptor.as_raw_fd(),
+            &pid,
+            std::process::id().to_string().as_bytes(),
+        )?;
+        self.validate_owner_markers()
+    }
+
+    fn validate_owner_markers(&self) -> Result<(), TransportError> {
+        self.assert_pinned()?;
+        let manifest = CStringName::new(SOCKET_MANIFEST)?;
+        let pid = CStringName::new(SOCKET_PID)?;
+        for name in [&manifest, &pid] {
+            let metadata =
+                stat_at(self.descriptor.as_raw_fd(), name)?.ok_or(TransportError::Rejected)?;
+            if (metadata.st_mode & libc::S_IFMT) != libc::S_IFREG
+                || metadata.st_uid != unsafe { libc::geteuid() }
+                || (metadata.st_mode as u32 & 0o777) != 0o600
+            {
+                return Err(TransportError::Rejected);
+            }
+        }
+        if read_private_at(self.descriptor.as_raw_fd(), &manifest)? != SOCKET_MANIFEST_BYTES {
+            return Err(TransportError::Rejected);
+        }
+        let pid = String::from_utf8(read_private_at(self.descriptor.as_raw_fd(), &pid)?)
+            .map_err(|_| TransportError::Rejected)?;
+        let parsed = pid.parse::<u32>().map_err(|_| TransportError::Rejected)?;
+        if parsed == 0 {
+            return Err(TransportError::Rejected);
+        }
+        Ok(())
+    }
+
+    fn classify_existing_endpoint(&self) -> Result<(), TransportError> {
+        self.validate_owner_markers()?;
+        let socket = CStringName::new(SOCKET_NAME)?;
+        let metadata = match stat_at(self.descriptor.as_raw_fd(), &socket)? {
+            Some(metadata) => metadata,
+            None => return Ok(()),
+        };
+        if (metadata.st_mode & libc::S_IFMT) != libc::S_IFSOCK
+            || metadata.st_uid != unsafe { libc::geteuid() }
+            || (metadata.st_mode as u32 & 0o777) != 0o600
+        {
+            return Err(TransportError::Rejected);
+        }
+        let endpoint = self.root.join(SOCKET_NAME);
+        if UnixStream::connect(&endpoint).is_ok() {
+            return Err(TransportError::Rejected);
+        }
+        let pid = String::from_utf8(read_private_at(
+            self.descriptor.as_raw_fd(),
+            &CStringName::new(SOCKET_PID)?,
+        )?)
+        .map_err(|_| TransportError::Rejected)?
+        .parse::<i32>()
+        .map_err(|_| TransportError::Rejected)?;
+        let dead = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if !dead {
+            return Err(TransportError::Rejected);
+        }
+        self.assert_pinned()?;
+        if unsafe { libc::unlinkat(self.descriptor.as_raw_fd(), socket.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(TransportError::Rejected)
+        }
     }
 
     fn assert_pinned(&self) -> Result<(), TransportError> {
@@ -130,6 +232,69 @@ impl SocketRoot {
         }
         Ok(())
     }
+}
+
+struct CStringName(std::ffi::CString);
+
+impl CStringName {
+    fn new(name: &str) -> Result<Self, TransportError> {
+        if name.is_empty() || name.contains('/') {
+            return Err(TransportError::Rejected);
+        }
+        std::ffi::CString::new(name)
+            .map(Self)
+            .map_err(|_| TransportError::Rejected)
+    }
+
+    fn as_ptr(&self) -> *const libc::c_char {
+        self.0.as_ptr()
+    }
+}
+
+fn stat_at(dirfd: i32, name: &CStringName) -> Result<Option<libc::stat>, TransportError> {
+    let mut stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+        Ok(Some(stat))
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(TransportError::Rejected)
+    }
+}
+
+fn write_private_at(dirfd: i32, name: &CStringName, bytes: &[u8]) -> Result<(), TransportError> {
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(TransportError::Rejected);
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    file.write_all(bytes).map_err(|_| TransportError::Io)?;
+    file.sync_all().map_err(|_| TransportError::Io)
+}
+
+fn read_private_at(dirfd: i32, name: &CStringName) -> Result<Vec<u8>, TransportError> {
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(TransportError::Rejected);
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| TransportError::Io)?;
+    Ok(bytes)
 }
 
 /// Returns both credentials required by the contract. Absence of either is a
@@ -211,19 +376,22 @@ pub(crate) fn handle_authenticated_session(
     stream
         .set_write_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|_| TransportError::Io)?;
-    let handshake = read_frame(stream, HANDSHAKE_MAX)?;
+    let handshake = read_secret_frame(stream, HANDSHAKE_MAX)?;
     let (slot, token) = parse_handshake(&handshake)?;
-    match pairing.consume(&slot, &token, peer_uid, peer_pid, now) {
-        PairingResult::Accepted => write_fixed_result(stream, "accepted")?,
-        PairingResult::Expired => {
+    let authority = match pairing.consume(&slot, &token, peer_uid, peer_pid, now) {
+        PairingConsume::Accepted(authority) => {
+            write_fixed_result(stream, "accepted")?;
+            authority
+        }
+        PairingConsume::Expired => {
             write_fixed_result(stream, "expired")?;
             return Err(TransportError::Expired);
         }
-        PairingResult::Rejected => {
+        PairingConsume::Rejected => {
             write_fixed_result(stream, "rejected")?;
             return Err(TransportError::Rejected);
         }
-    }
+    };
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|_| TransportError::Io)?;
@@ -241,19 +409,18 @@ pub(crate) fn handle_authenticated_session(
         if bytes > SESSION_MAX_BYTES {
             return Err(TransportError::Rejected);
         }
-        let authority = pairing
-            .session_authority(&slot)
-            .ok_or(TransportError::Rejected)?;
-        let event = parse_ingress(&frame, &slot, authority.1)?;
+        let event = parse_ingress(&frame, &authority.slot_id, authority.epoch, authority.plan)?;
         submit_correlated_observation(
             store,
             CorrelatedObservation {
-                slot_id: slot.clone(),
-                capability: authority.0,
-                binding_epoch: authority.1,
+                slot_id: authority.slot_id.clone(),
+                capability: authority.capability.clone(),
+                binding_epoch: authority.epoch,
                 sequence: event.sequence,
                 observed_at: event.observed_at,
-                plan: event.plan,
+                // Slot plan is app-owned at foreground registration. Transport
+                // metadata must never relabel an existing validation slot.
+                plan: None,
                 disposition: event.disposition,
             },
             now,
@@ -281,6 +448,28 @@ fn read_frame(stream: &mut UnixStream, max: usize) -> Result<Vec<u8>, TransportE
     Ok(frame)
 }
 
+/// The pairing frame contains the one-shot transport authority, so retain its
+/// payload only in a zeroizing allocation.  Event frames intentionally remain
+/// ordinary bounded JSON buffers because they carry no authority material.
+fn read_secret_frame(
+    stream: &mut UnixStream,
+    max: usize,
+) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    let mut length = [0u8; 4];
+    stream
+        .read_exact(&mut length)
+        .map_err(|_| TransportError::Io)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > max {
+        return Err(TransportError::Rejected);
+    }
+    let mut frame = Zeroizing::new(vec![0; length]);
+    stream
+        .read_exact(&mut frame)
+        .map_err(|_| TransportError::Io)?;
+    Ok(frame)
+}
+
 fn write_fixed_result(stream: &mut UnixStream, result: &str) -> Result<(), TransportError> {
     let bytes = format!("{{\"result\":\"{result}\"}}").into_bytes();
     stream
@@ -289,17 +478,45 @@ fn write_fixed_result(stream: &mut UnixStream, result: &str) -> Result<(), Trans
     stream.write_all(&bytes).map_err(|_| TransportError::Io)
 }
 
-fn parse_handshake(bytes: &[u8]) -> Result<(AccountSlotId, Vec<u8>), TransportError> {
-    let object = strict_object(bytes, &["kind", "slot", "token"])?;
-    if string(&object, "kind")? != "pair" {
+fn parse_handshake(bytes: &[u8]) -> Result<(AccountSlotId, Zeroizing<Vec<u8>>), TransportError> {
+    // This deliberately accepts one canonical, escape-free wire shape.  It
+    // avoids constructing a String or serde_json::Value containing the
+    // transport secret while still rejecting duplicate keys and alternate JSON
+    // representations at the boundary.
+    const PREFIX: &[u8] = br#"{"kind":"pair","slot":"#;
+    const TOKEN_MARKER: &[u8] = br#"","token":"#;
+    const SUFFIX: &[u8] = br#""}"#;
+    const SLOT_BYTES: usize = 36;
+    const TOKEN_BYTES: usize = 43;
+    let expected = PREFIX.len() + SLOT_BYTES + TOKEN_MARKER.len() + TOKEN_BYTES + SUFFIX.len();
+    if bytes.len() != expected
+        || !bytes.starts_with(PREFIX)
+        || &bytes[PREFIX.len() + SLOT_BYTES..PREFIX.len() + SLOT_BYTES + TOKEN_MARKER.len()]
+            != TOKEN_MARKER
+        || !bytes.ends_with(SUFFIX)
+    {
         return Err(TransportError::Rejected);
     }
-    let slot =
-        AccountSlotId::parse(string(&object, "slot")?).map_err(|_| TransportError::Rejected)?;
-    let token = URL_SAFE_NO_PAD
-        .decode(string(&object, "token")?)
+    let slot_bytes = &bytes[PREFIX.len()..PREFIX.len() + SLOT_BYTES];
+    let slot = AccountSlotId::parse(
+        std::str::from_utf8(slot_bytes)
+            .map_err(|_| TransportError::Rejected)?
+            .to_owned(),
+    )
+    .map_err(|_| TransportError::Rejected)?;
+    let token_start = PREFIX.len() + SLOT_BYTES + TOKEN_MARKER.len();
+    let encoded = &bytes[token_start..token_start + TOKEN_BYTES];
+    if !encoded
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(TransportError::Rejected);
+    }
+    let mut token = Zeroizing::new(vec![0; 32]);
+    let written = URL_SAFE_NO_PAD
+        .decode_slice(encoded, &mut token)
         .map_err(|_| TransportError::Rejected)?;
-    if token.len() != 32 {
+    if written != 32 {
         return Err(TransportError::Rejected);
     }
     Ok((slot, token))
@@ -308,7 +525,6 @@ fn parse_handshake(bytes: &[u8]) -> Result<(AccountSlotId, Vec<u8>), TransportEr
 struct ParsedIngress {
     sequence: u64,
     observed_at: DateTime<Utc>,
-    plan: Option<PlanMetadata>,
     disposition: CorrelatedDisposition,
 }
 
@@ -316,6 +532,7 @@ fn parse_ingress(
     bytes: &[u8],
     slot: &AccountSlotId,
     epoch: u64,
+    owner_plan: PlanMetadata,
 ) -> Result<ParsedIngress, TransportError> {
     let raw = strict_value(bytes)?;
     let object = raw.as_object().ok_or(TransportError::Rejected)?;
@@ -331,12 +548,17 @@ fn parse_ingress(
     }
     let sequence = canonical_u64(string(object, "sequence")?)?;
     let observed_at = canonical_time(string(object, "observedAt")?)?;
-    let plan = match object.get("plan") {
-        Some(Value::String(v)) if v == "paid" => Some(PlanMetadata::Paid),
-        Some(Value::String(v)) if v == "free" => Some(PlanMetadata::Free),
-        None => None,
-        _ => return Err(TransportError::Rejected),
+    let plan_matches_owner = match object.get("plan") {
+        Some(Value::String(v)) => {
+            (v == "paid" && owner_plan == PlanMetadata::Paid)
+                || (v == "free" && owner_plan == PlanMetadata::Free)
+        }
+        None => true,
+        _ => false,
     };
+    if !plan_matches_owner {
+        return Err(TransportError::Rejected);
+    }
     let disposition = match string(object, "event")? {
         "continuity_uncertain" => {
             reject_any(
@@ -358,7 +580,6 @@ fn parse_ingress(
     Ok(ParsedIngress {
         sequence,
         observed_at,
-        plan,
         disposition,
     })
 }
@@ -430,13 +651,6 @@ fn parse_observation(object: &Map<String, Value>) -> Result<CorrelatedDispositio
         }
         _ => Err(TransportError::Rejected),
     }
-}
-
-fn strict_object(bytes: &[u8], exact: &[&str]) -> Result<Map<String, Value>, TransportError> {
-    let value = strict_value(bytes)?;
-    let object = value.as_object().cloned().ok_or(TransportError::Rejected)?;
-    required_exact(&object, exact, &[])?;
-    Ok(object)
 }
 
 // serde_json normally retains the last duplicate key.  This small lexical
@@ -557,21 +771,56 @@ mod tests {
 
     const CHILD_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD";
 
-    #[test]
-    fn pinned_socket_root_rejects_path_substitution() {
-        let root = PathBuf::from("/tmp").join(format!("qt-c3b1-substitute-{}", Uuid::new_v4()));
+    fn socket_root(label: &str) -> PathBuf {
+        let parent =
+            PathBuf::from("/private/tmp").join(format!("qt-c3b1-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join(format!("quotabar-c3b1-{}", unsafe { libc::geteuid() }));
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[test]
+    fn pinned_socket_root_rejects_path_substitution() {
+        let root = socket_root("substitute");
         let socket_root = SocketRoot::for_synthetic(root.clone()).unwrap();
         let moved = root.with_extension("moved");
+        let substituted = root.parent().unwrap().join("substituted");
+        std::fs::create_dir(&substituted).unwrap();
         std::fs::rename(&root, &moved).unwrap();
-        std::os::unix::fs::symlink("/tmp", &root).unwrap();
+        std::os::unix::fs::symlink(&substituted, &root).unwrap();
         assert_eq!(
             socket_root.socket_path().unwrap_err(),
             TransportError::Rejected
         );
+        assert!(!substituted.join(SOCKET_NAME).exists());
         std::fs::remove_file(&root).unwrap();
-        std::fs::remove_dir(moved).unwrap();
+        std::fs::remove_dir_all(moved.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fixed_root_classifies_live_stale_and_collision_endpoints() {
+        let root = socket_root("lifecycle");
+        let socket_root = SocketRoot::for_synthetic(root.clone()).unwrap();
+        let live = socket_root.bind().unwrap();
+        assert_eq!(socket_root.bind().unwrap_err(), TransportError::Rejected);
+        drop(live);
+        let mut exited = Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = exited.id();
+        assert!(exited.wait().unwrap().success());
+        std::fs::write(root.join(SOCKET_PID), dead_pid.to_string()).unwrap();
+        std::fs::set_permissions(
+            root.join(SOCKET_PID),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let stale_reclaimed = socket_root.bind().unwrap();
+        drop(stale_reclaimed);
+        std::fs::remove_file(root.join(SOCKET_NAME)).unwrap();
+        std::fs::write(root.join(SOCKET_NAME), b"ordinary").unwrap();
+        assert_eq!(socket_root.bind().unwrap_err(), TransportError::Rejected);
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
@@ -579,6 +828,16 @@ mod tests {
             .write_all(&(bytes.len() as u32).to_be_bytes())
             .unwrap();
         stream.write_all(bytes).unwrap();
+    }
+
+    fn synthetic_handshake(slot: &[u8], token: &[u8]) -> Zeroizing<Vec<u8>> {
+        let mut handshake = Zeroizing::new(Vec::with_capacity(128));
+        handshake.extend_from_slice(br#"{"kind":"pair","slot":"#);
+        handshake.extend_from_slice(slot);
+        handshake.extend_from_slice(br#"","token":"#);
+        handshake.extend_from_slice(token);
+        handshake.extend_from_slice(br#""}"#);
+        handshake
     }
 
     fn read_frame_for_test(stream: &mut UnixStream) -> Vec<u8> {
@@ -595,9 +854,7 @@ mod tests {
             synthetic_child();
             return;
         }
-        let root = PathBuf::from("/tmp").join(format!("qt-c3b1-{}", Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = socket_root("reexec");
         let socket_root = SocketRoot::for_synthetic(root.clone()).unwrap();
         let endpoint = socket_root.socket_path().unwrap();
         let listener = socket_root.bind().unwrap();
@@ -629,16 +886,19 @@ mod tests {
                 now,
             )
             .unwrap();
-        let payload = serde_json::json!({
-            "endpoint": endpoint,
-            "token": bootstrap.canonical_token_for_synthetic_child(),
-            "slot": bootstrap.slot_id(),
-        });
-        let bytes = serde_json::to_vec(&payload).unwrap();
-        parent_bootstrap
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .unwrap();
-        parent_bootstrap.write_all(&bytes).unwrap();
+        let endpoint = endpoint.as_os_str().as_encoded_bytes();
+        let slot = bootstrap.slot_id().as_str().as_bytes();
+        let token = bootstrap.token_bytes_for_synthetic_child();
+        let probe = synthetic_handshake(slot, token);
+        assert!(parse_handshake(&probe).is_ok());
+        let mut bytes = Zeroizing::new(Vec::with_capacity(
+            2 + endpoint.len() + slot.len() + token.len(),
+        ));
+        bytes.extend_from_slice(&(endpoint.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(endpoint);
+        bytes.extend_from_slice(slot);
+        bytes.extend_from_slice(token);
+        write_frame(&mut parent_bootstrap, &bytes);
         drop(parent_bootstrap);
         let (mut accepted, _) = listener.accept().unwrap();
         let peer = peer_credentials(&accepted).unwrap();
@@ -647,27 +907,23 @@ mod tests {
         handle_authenticated_session(&mut accepted, &store, &mut pairing, peer.uid, peer.pid, now)
             .unwrap();
         assert!(child.wait().unwrap().success());
-        std::fs::remove_file(socket_root.root.join("v1.sock")).unwrap();
+        std::fs::remove_file(socket_root.root.join(SOCKET_NAME)).unwrap();
         std::fs::remove_dir(root.join("state")).unwrap_or(());
-        std::fs::remove_dir(root).unwrap_or(());
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     fn synthetic_child() {
         let mut bootstrap = unsafe { UnixStream::from_raw_fd(3) };
-        let payload = read_frame_for_test(&mut bootstrap);
-        let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        let endpoint = payload["endpoint"].as_str().unwrap();
-        let token = payload["token"].as_str().unwrap();
-        let slot = payload["slot"].as_str().unwrap();
+        let payload = Zeroizing::new(read_frame_for_test(&mut bootstrap));
+        let endpoint_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        let endpoint_end = 2 + endpoint_len;
+        let slot_end = endpoint_end + 36;
+        let endpoint = std::str::from_utf8(&payload[2..endpoint_end]).unwrap();
+        let slot = &payload[endpoint_end..slot_end];
+        let token = &payload[slot_end..];
         let mut stream = UnixStream::connect(endpoint).unwrap();
-        write_frame(
-            &mut stream,
-            serde_json::to_string(&serde_json::json!({
-                "kind": "pair", "slot": slot, "token": token,
-            }))
-            .unwrap()
-            .as_bytes(),
-        );
+        let handshake = synthetic_handshake(slot, token);
+        write_frame(&mut stream, &handshake);
         assert_eq!(
             read_frame_for_test(&mut stream),
             br#"{"result":"accepted"}"#
@@ -686,10 +942,24 @@ mod tests {
     fn available_windows_require_known_order_and_monotonic_resets() {
         let slot = AccountSlotId::parse("11111111-1111-4111-8111-111111111111").unwrap();
         let valid = br#"{"event":"observation","slot":"11111111-1111-4111-8111-111111111111","epoch":"1","sequence":"1","observedAt":"2024-01-01T00:00:00Z","status":"available","source":"completion_sse","windows":[{"kind":"five_hour","usedPercent":1,"resetAt":"2024-01-01T01:00:00Z"},{"kind":"weekly","usedPercent":2,"resetAt":"2024-01-02T00:00:00Z"}]}"#;
-        assert!(parse_ingress(valid, &slot, 1).is_ok());
+        assert!(parse_ingress(valid, &slot, 1, PlanMetadata::Paid).is_ok());
         let reversed = br#"{"event":"observation","slot":"11111111-1111-4111-8111-111111111111","epoch":"1","sequence":"1","observedAt":"2024-01-01T00:00:00Z","status":"available","source":"completion_sse","windows":[{"kind":"weekly","usedPercent":1},{"kind":"five_hour","usedPercent":2}]}"#;
-        assert!(parse_ingress(reversed, &slot, 1).is_err());
+        assert!(parse_ingress(reversed, &slot, 1, PlanMetadata::Paid).is_err());
         let bad_reset = br#"{"event":"observation","slot":"11111111-1111-4111-8111-111111111111","epoch":"1","sequence":"1","observedAt":"2024-01-01T00:00:00Z","status":"available","source":"completion_sse","windows":[{"kind":"five_hour","usedPercent":1,"resetAt":"2024-01-03T00:00:00Z"},{"kind":"weekly","usedPercent":2,"resetAt":"2024-01-02T00:00:00Z"}]}"#;
-        assert!(parse_ingress(bad_reset, &slot, 1).is_err());
+        assert!(parse_ingress(bad_reset, &slot, 1, PlanMetadata::Paid).is_err());
+    }
+
+    #[test]
+    fn ingress_plan_cannot_relabel_an_app_owned_slot() {
+        let paid = AccountSlotId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let free = AccountSlotId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        let paid_event = br#"{"event":"observation","slot":"11111111-1111-4111-8111-111111111111","epoch":"1","sequence":"1","observedAt":"2024-01-01T00:00:00Z","status":"unavailable","errorCode":"unavailable","plan":"paid"}"#;
+        let free_event = br#"{"event":"observation","slot":"22222222-2222-4222-8222-222222222222","epoch":"1","sequence":"1","observedAt":"2024-01-01T00:00:00Z","status":"unavailable","errorCode":"unavailable","plan":"free"}"#;
+        let missing_plan = br#"{"event":"observation","slot":"11111111-1111-4111-8111-111111111111","epoch":"1","sequence":"1","observedAt":"2024-01-01T00:00:00Z","status":"unavailable","errorCode":"unavailable"}"#;
+        assert!(parse_ingress(paid_event, &paid, 1, PlanMetadata::Paid).is_ok());
+        assert!(parse_ingress(free_event, &free, 1, PlanMetadata::Free).is_ok());
+        assert!(parse_ingress(free_event, &free, 1, PlanMetadata::Paid).is_err());
+        assert!(parse_ingress(paid_event, &paid, 1, PlanMetadata::Free).is_err());
+        assert!(parse_ingress(missing_plan, &paid, 1, PlanMetadata::Paid).is_ok());
     }
 }

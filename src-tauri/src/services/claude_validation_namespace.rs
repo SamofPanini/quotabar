@@ -4,13 +4,15 @@
 //! descriptor.  Paths are accepted only at the outer boundary and are never
 //! followed again after the descriptor identity has been recorded.
 
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 
 const MANIFEST: &str = ".quotabar-c3b1-owner";
+const MANIFEST_BYTES: &[u8] = b"c3-b1a-owner-v1\n";
 const PRIVATE_MODE: u32 = 0o700;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +60,7 @@ impl ValidationNamespace {
         let manifest = CString::new(MANIFEST).map_err(|_| NamespaceError::Collision)?;
         let mut manifest_file = create_file_at(root_file.as_raw_fd(), &manifest, 0o600)?;
         manifest_file
-            .write_all(b"c3-b1a-owner-v1\n")
+            .write_all(MANIFEST_BYTES)
             .map_err(|_| NamespaceError::Io)?;
         let manifest_stat =
             stat_at(root_file.as_raw_fd(), &manifest)?.ok_or(NamespaceError::Mismatch)?;
@@ -96,6 +98,31 @@ impl ValidationNamespace {
         if !self.root_entry.matches(&root_stat) {
             return Err(NamespaceError::Mismatch);
         }
+        let parent_root =
+            stat_at(self.parent.as_raw_fd(), &self.root_name)?.ok_or(NamespaceError::Mismatch)?;
+        if !self.root_entry.matches(&parent_root) {
+            return Err(NamespaceError::Mismatch);
+        }
+        let manifest = self
+            .entries
+            .iter()
+            .find(|entry| entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes())
+            .ok_or(NamespaceError::Mismatch)?;
+        if read_file_at(self.root.as_raw_fd(), &manifest.name)? != MANIFEST_BYTES {
+            return Err(NamespaceError::Mismatch);
+        }
+        // Preflight the full manifest before unlinking anything.  In
+        // particular, an attacker-added or replaced entry cannot leave a
+        // partially cleaned namespace behind.
+        let actual = direct_names(&self.root)?;
+        let expected: BTreeSet<Vec<u8>> = self
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_bytes().to_vec())
+            .collect();
+        if actual != expected {
+            return Err(NamespaceError::Mismatch);
+        }
         for entry in self.entries.iter().rev() {
             let stat =
                 stat_at(self.root.as_raw_fd(), &entry.name)?.ok_or(NamespaceError::Mismatch)?;
@@ -108,11 +135,6 @@ impl ValidationNamespace {
                 &entry.name,
                 if is_manifest { 0 } else { libc::AT_REMOVEDIR },
             )?;
-        }
-        let parent_root =
-            stat_at(self.parent.as_raw_fd(), &self.root_name)?.ok_or(NamespaceError::Mismatch)?;
-        if !self.root_entry.matches(&parent_root) {
-            return Err(NamespaceError::Mismatch);
         }
         unlink_at(self.parent.as_raw_fd(), &self.root_name, libc::AT_REMOVEDIR)
     }
@@ -165,8 +187,25 @@ fn reject_collision(root: &Path) -> Result<(), NamespaceError> {
 }
 
 fn open_dir(path: &Path) -> Result<File, NamespaceError> {
-    let path = c_name(path.as_os_str())?;
-    unsafe { file_from_fd(libc::open(path.as_ptr(), dir_flags())) }
+    if !path.is_absolute() {
+        return Err(NamespaceError::Collision);
+    }
+    // Opening only the final component with O_NOFOLLOW leaves every ancestor
+    // vulnerable to substitution.  Walk the absolute path one component at a
+    // time through pinned descriptors so each ancestor is itself no-follow.
+    let slash = CString::new("/").map_err(|_| NamespaceError::Io)?;
+    let mut current = unsafe { file_from_fd(libc::open(slash.as_ptr(), dir_flags())) }?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let name = c_name(name)?;
+        current = open_dir_at(current.as_raw_fd(), &name)?;
+        if (stat_fd(&current)?.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            return Err(NamespaceError::Mismatch);
+        }
+    }
+    Ok(current)
 }
 fn open_dir_at(dirfd: i32, name: &CStr) -> Result<File, NamespaceError> {
     unsafe { file_from_fd(libc::openat(dirfd, name.as_ptr(), dir_flags())) }
@@ -197,6 +236,19 @@ fn create_file_at(dirfd: i32, name: &CStr, mode: u32) -> Result<File, NamespaceE
             mode,
         ))
     }
+}
+fn read_file_at(dirfd: i32, name: &CStr) -> Result<Vec<u8>, NamespaceError> {
+    let mut file = unsafe {
+        file_from_fd(libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ))
+    }?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| NamespaceError::Io)?;
+    Ok(bytes)
 }
 fn stat_fd(file: &File) -> Result<libc::stat, NamespaceError> {
     let mut stat = unsafe { std::mem::zeroed() };
@@ -244,6 +296,33 @@ fn unlink_at(dirfd: i32, name: &CStr, flags: i32) -> Result<(), NamespaceError> 
     }
 }
 
+fn direct_names(directory: &File) -> Result<BTreeSet<Vec<u8>>, NamespaceError> {
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(NamespaceError::Io);
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(NamespaceError::Io);
+    }
+    let mut names = BTreeSet::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.insert(name.to_vec());
+        }
+    }
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(NamespaceError::Io);
+    }
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,7 +330,9 @@ mod tests {
     use uuid::Uuid;
 
     fn root() -> PathBuf {
-        std::env::temp_dir().join(format!("quotabar-c3b1-ns-{}", Uuid::new_v4()))
+        std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("quotabar-c3b1-ns-{}", Uuid::new_v4()))
     }
 
     #[test]
@@ -279,5 +360,52 @@ mod tests {
         let _ = fs::remove_file(root.join("slots"));
         let _ = fs::remove_file(root.join(MANIFEST));
         let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn cleanup_preflights_unknown_entries_before_any_deletion() {
+        let root = root();
+        let mut namespace = ValidationNamespace::prepare(root.clone()).unwrap();
+        namespace.create_private_dir("slots").unwrap();
+        fs::write(root.join("unexpected"), b"x").unwrap();
+        assert_eq!(namespace.cleanup().unwrap_err(), NamespaceError::Mismatch);
+        assert!(root.join(MANIFEST).exists());
+        assert!(root.join("slots").exists());
+        assert!(root.join("unexpected").exists());
+        let _ = fs::remove_file(root.join("unexpected"));
+        let _ = fs::remove_dir(root.join("slots"));
+        let _ = fs::remove_file(root.join(MANIFEST));
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn altered_manifest_causes_zero_cleanup() {
+        let root = root();
+        let mut namespace = ValidationNamespace::prepare(root.clone()).unwrap();
+        namespace.create_private_dir("slots").unwrap();
+        fs::write(root.join(MANIFEST), b"altered\n").unwrap();
+        assert_eq!(namespace.cleanup().unwrap_err(), NamespaceError::Mismatch);
+        assert!(root.join(MANIFEST).exists());
+        assert!(root.join("slots").exists());
+        let _ = fs::remove_file(root.join(MANIFEST));
+        let _ = fs::remove_dir(root.join("slots"));
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn prepare_rejects_symlinked_ancestor() {
+        let base = root();
+        fs::create_dir(&base).unwrap();
+        let redirected = base.join("redirected");
+        fs::create_dir(&redirected).unwrap();
+        let linked = base.join("linked");
+        std::os::unix::fs::symlink(&redirected, &linked).unwrap();
+        assert!(matches!(
+            ValidationNamespace::prepare(linked.join("child")),
+            Err(NamespaceError::Io | NamespaceError::Collision | NamespaceError::Mismatch)
+        ));
+        let _ = fs::remove_file(&linked);
+        let _ = fs::remove_dir(&redirected);
+        let _ = fs::remove_dir(&base);
     }
 }
