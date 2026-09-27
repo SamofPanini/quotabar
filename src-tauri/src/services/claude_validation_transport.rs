@@ -10,24 +10,56 @@ use super::claude_snapshot::{
 use super::claude_synthetic_adapter::{
     submit_correlated_observation, CorrelatedDisposition, CorrelatedObservation, SyntheticWindow,
 };
-use super::claude_validation_pairing::{PairingConsume, PairingTable, SessionAuthority};
+use super::claude_validation_pairing::{PairingConsume, PairingRegistry, SessionAuthority};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const HANDSHAKE_MAX: usize = 1024;
 const FRAME_MAX: usize = 16 * 1024;
-const SESSION_MAX_FRAMES: usize = 8;
-const SESSION_MAX_BYTES: usize = 128 * 1024;
+const FRAME_BURST: u8 = 4;
+const FRAME_REFILL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportError {
     Rejected,
     Expired,
     Io,
+}
+
+/// Integer, per-session ingress limiter.  It bounds long sessions without a
+/// lifetime timer or a background activity source.
+struct FrameBucket {
+    tokens: u8,
+    last_refill: Instant,
+}
+
+impl FrameBucket {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: FRAME_BURST,
+            last_refill: now,
+        }
+    }
+    fn take(&mut self, now: Instant) -> bool {
+        let periods = now.duration_since(self.last_refill).as_secs() / FRAME_REFILL.as_secs();
+        if periods > 0 {
+            self.tokens = self
+                .tokens
+                .saturating_add(periods.min(u8::MAX as u64) as u8)
+                .min(FRAME_BURST);
+            self.last_refill += FRAME_REFILL * periods as u32;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 /*
@@ -364,7 +396,7 @@ pub(crate) fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials, T
 pub(crate) fn handle_authenticated_session(
     stream: &mut UnixStream,
     store: &ClaudeSnapshotStore,
-    pairing: &mut PairingTable,
+    pairing: &PairingRegistry,
     now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
     let authority = authenticate_session(stream, pairing, now)?;
@@ -376,7 +408,7 @@ pub(crate) fn handle_authenticated_session(
 /// I/O or snapshot mutation begins.
 pub(crate) fn authenticate_session(
     stream: &mut UnixStream,
-    pairing: &mut PairingTable,
+    pairing: &PairingRegistry,
     now: DateTime<Utc>,
 ) -> Result<SessionAuthority, TransportError> {
     stream
@@ -411,25 +443,19 @@ pub(crate) fn handle_session_loop(
     authority: SessionAuthority,
     now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
+    // No idle deadline: EOF is normal, and the first byte of a new frame may
+    // arrive arbitrarily late.  Once it arrives, `read_frame` applies the
+    // bounded per-frame read timeout.
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_read_timeout(None)
         .map_err(|_| TransportError::Io)?;
-    let mut frames = 1usize;
-    // The exact handshake payload is no longer retained after authentication;
-    // reserve its maximum framing budget for a conservative session cap.
-    let mut bytes = HANDSHAKE_MAX + 4;
-    while frames < SESSION_MAX_FRAMES && bytes < SESSION_MAX_BYTES {
-        let frame = match read_frame(stream, FRAME_MAX) {
+    let mut bucket = FrameBucket::new(Instant::now());
+    loop {
+        let frame = match read_frame(stream, FRAME_MAX, &mut bucket) {
             Ok(frame) => frame,
             Err(TransportError::Io) => return Ok(()),
             Err(error) => return Err(error),
         };
-        bytes = bytes
-            .checked_add(frame.len() + 4)
-            .ok_or(TransportError::Rejected)?;
-        if bytes > SESSION_MAX_BYTES {
-            return Err(TransportError::Rejected);
-        }
         let event = parse_ingress(&frame, &authority.slot_id, authority.epoch, authority.plan)?;
         submit_correlated_observation(
             store,
@@ -447,15 +473,30 @@ pub(crate) fn handle_session_loop(
             now,
         )
         .map_err(|_| TransportError::Rejected)?;
-        frames += 1;
     }
-    Ok(())
 }
 
-fn read_frame(stream: &mut UnixStream, max: usize) -> Result<Vec<u8>, TransportError> {
+fn read_frame(
+    stream: &mut UnixStream,
+    max: usize,
+    bucket: &mut FrameBucket,
+) -> Result<Vec<u8>, TransportError> {
     let mut length = [0u8; 4];
+    match stream.read(&mut length[..1]) {
+        Ok(0) => return Err(TransportError::Io),
+        Ok(_) => {}
+        Err(_) => return Err(TransportError::Io),
+    }
+    if !bucket.take(Instant::now()) {
+        return Err(TransportError::Rejected);
+    }
+    // The budget starts at the first frame byte and does not refresh while
+    // partial header/payload reads continue.
     stream
-        .read_exact(&mut length)
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| TransportError::Io)?;
+    stream
+        .read_exact(&mut length[1..])
         .map_err(|_| TransportError::Io)?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > max {
@@ -464,6 +505,9 @@ fn read_frame(stream: &mut UnixStream, max: usize) -> Result<Vec<u8>, TransportE
     let mut frame = vec![0; length];
     stream
         .read_exact(&mut frame)
+        .map_err(|_| TransportError::Io)?;
+    stream
+        .set_read_timeout(None)
         .map_err(|_| TransportError::Io)?;
     std::str::from_utf8(&frame).map_err(|_| TransportError::Rejected)?;
     Ok(frame)
@@ -781,7 +825,7 @@ fn canonical_time(value: &str) -> Result<DateTime<Utc>, TransportError> {
 #[cfg(test)]
 mod tests {
     use super::super::claude_snapshot::{ClaudeSnapshotStore, PlanMetadata};
-    use super::super::claude_validation_pairing::PairingTable;
+    use super::super::claude_validation_pairing::PairingRegistry;
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -869,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn reexecuted_synthetic_child_uses_bootstrap_fd_and_exact_peer_pid() {
+    fn reexecuted_synthetic_child_uses_private_inherited_fd() {
         if std::env::var_os(CHILD_ENV).is_some() {
             synthetic_child();
             return;
@@ -879,7 +923,7 @@ mod tests {
         let mut child = unsafe {
             Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("services::claude_validation_transport::tests::reexecuted_synthetic_child_uses_bootstrap_fd_and_exact_peer_pid")
+                .arg("services::claude_validation_transport::tests::reexecuted_synthetic_child_uses_private_inherited_fd")
                 .arg("--nocapture")
                 .env(CHILD_ENV, "1")
                 .pre_exec(move || {
@@ -892,16 +936,10 @@ mod tests {
         drop(child_bootstrap);
         let root = std::env::temp_dir().join(format!("quotabar-c3b1-r4-{}", Uuid::new_v4()));
         let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
-        let mut pairing = PairingTable::new();
+        let pairing = PairingRegistry::new();
         let now = chrono::Utc::now();
         let bootstrap = pairing
-            .register_or_rebind(
-                &store,
-                PlanMetadata::Paid,
-                unsafe { libc::geteuid() },
-                child.id(),
-                now,
-            )
+            .register_or_rebind(&store, PlanMetadata::Paid, now)
             .unwrap();
         let slot = bootstrap.slot_id().as_str().as_bytes();
         let token = bootstrap.token_bytes_for_synthetic_child();
@@ -911,7 +949,7 @@ mod tests {
         bytes.extend_from_slice(slot);
         bytes.extend_from_slice(token);
         write_frame(&mut parent_bootstrap, &bytes);
-        handle_authenticated_session(&mut parent_bootstrap, &store, &mut pairing, now).unwrap();
+        handle_authenticated_session(&mut parent_bootstrap, &store, &pairing, now).unwrap();
         assert!(child.wait().unwrap().success());
         std::fs::remove_dir_all(root).unwrap_or(());
     }

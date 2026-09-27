@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -162,7 +163,7 @@ impl fmt::Debug for Session {
 }
 
 /// In-memory table keyed by stable slot, not by user identity or provider data.
-pub(crate) struct PairingTable {
+struct PairingTable {
     sessions: HashMap<AccountSlotId, Session>,
 }
 
@@ -184,33 +185,6 @@ impl PairingTable {
     /// Issues a single-use in-memory transport session.  The child identity
     /// boundary is private FD delivery by the spawn owner; socket peer
     /// credentials are intentionally not treated as the later writer PID.
-    pub(crate) fn register_or_rebind(
-        &mut self,
-        store: &ClaudeSnapshotStore,
-        plan: PlanMetadata,
-        _expected_uid: u32,
-        expected_pid: u32,
-        now: DateTime<Utc>,
-    ) -> Result<PairingBootstrapV1, PairingError> {
-        if expected_pid == 0
-            || self.sessions.len() >= MAX_SLOTS
-                && !self.sessions.contains_key(&Self::stable_slot(plan))
-        {
-            return Err(PairingError::Rejected);
-        }
-        let slot_id = Self::stable_slot(plan);
-        let issuance = store.register_or_rebind_validation_slot(
-            slot_id.clone(),
-            match plan {
-                PlanMetadata::Paid => "paid".into(),
-                PlanMetadata::Free => "free".into(),
-            },
-            plan,
-            now,
-        )?;
-        self.insert(slot_id, issuance, plan, now)
-    }
-
     fn insert(
         &mut self,
         slot_id: AccountSlotId,
@@ -218,6 +192,9 @@ impl PairingTable {
         plan: PlanMetadata,
         now: DateTime<Utc>,
     ) -> Result<PairingBootstrapV1, PairingError> {
+        if self.sessions.len() >= MAX_SLOTS && !self.sessions.contains_key(&slot_id) {
+            return Err(PairingError::Rejected);
+        }
         let token = TransportSecret::generate()?;
         let expires_at = now + TOKEN_LIFETIME;
         let bootstrap = PairingBootstrapV1 {
@@ -239,9 +216,7 @@ impl PairingTable {
         Ok(bootstrap)
     }
 
-    /// Atomically consumes a session after the private inherited descriptor
-    /// has delivered its one-shot authority.  No peer PID claim is made.
-    pub(crate) fn consume(
+    fn consume(
         &mut self,
         slot_id: &AccountSlotId,
         token: &[u8],
@@ -268,9 +243,65 @@ impl PairingTable {
             plan: session.plan,
         })
     }
+}
 
-    pub(crate) fn clear(&mut self) {
-        self.sessions.clear();
+/// Owns the only pairing lock.  Its public crate API returns owned authority
+/// and never exposes a guard, table reference, or callback under the lock.
+pub(crate) struct PairingRegistry {
+    sessions: Mutex<PairingTable>,
+}
+
+impl PairingRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            sessions: Mutex::new(PairingTable::new()),
+        }
+    }
+
+    pub(crate) fn stable_slot(plan: PlanMetadata) -> AccountSlotId {
+        PairingTable::stable_slot(plan)
+    }
+
+    /// Durable store work deliberately precedes the brief in-memory insertion.
+    pub(crate) fn register_or_rebind(
+        &self,
+        store: &ClaudeSnapshotStore,
+        plan: PlanMetadata,
+        now: DateTime<Utc>,
+    ) -> Result<PairingBootstrapV1, PairingError> {
+        let slot_id = Self::stable_slot(plan);
+        let issuance = store.register_or_rebind_validation_slot(
+            slot_id.clone(),
+            match plan {
+                PlanMetadata::Paid => "paid".into(),
+                PlanMetadata::Free => "free".into(),
+            },
+            plan,
+            now,
+        )?;
+        self.sessions
+            .lock()
+            .map_err(|_| PairingError::Rejected)?
+            .insert(slot_id, issuance, plan, now)
+    }
+
+    /// Atomically consumes after parsing, with no stream or store I/O held.
+    pub(crate) fn consume(
+        &self,
+        slot_id: &AccountSlotId,
+        token: &[u8],
+        now: DateTime<Utc>,
+    ) -> PairingConsume {
+        self.sessions
+            .lock()
+            .map(|mut table| table.consume(slot_id, token, now))
+            .unwrap_or(PairingConsume::Rejected)
+    }
+
+    pub(crate) fn clear(&self) {
+        if let Ok(mut table) = self.sessions.lock() {
+            table.sessions.clear();
+        }
     }
 }
 
@@ -292,9 +323,9 @@ mod tests {
     #[test]
     fn token_is_canonical_single_use_and_bound_to_private_delivery() {
         let store = store();
-        let mut table = PairingTable::new();
+        let table = PairingRegistry::new();
         let bootstrap = table
-            .register_or_rebind(&store, PlanMetadata::Paid, 501, 77, now())
+            .register_or_rebind(&store, PlanMetadata::Paid, now())
             .unwrap();
         let token = bootstrap.token.decode().unwrap();
         assert_eq!(token.len(), TOKEN_BYTES);
@@ -313,9 +344,9 @@ mod tests {
     #[test]
     fn expiry_and_restart_fail_closed() {
         let store = store();
-        let mut table = PairingTable::new();
+        let table = PairingRegistry::new();
         let bootstrap = table
-            .register_or_rebind(&store, PlanMetadata::Free, 501, 88, now())
+            .register_or_rebind(&store, PlanMetadata::Free, now())
             .unwrap();
         let token = bootstrap.token.decode().unwrap();
         assert!(matches!(
@@ -337,9 +368,9 @@ mod tests {
     fn durable_rebind_after_restart_rejects_old_authority() {
         let root = std::env::temp_dir().join(format!("quotabar-c3b1-restart-{}", Uuid::new_v4()));
         let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
-        let mut first = PairingTable::new();
+        let first = PairingRegistry::new();
         let first_bootstrap = first
-            .register_or_rebind(&store, PlanMetadata::Paid, 501, 77, now())
+            .register_or_rebind(&store, PlanMetadata::Paid, now())
             .unwrap();
         let first_token = first_bootstrap.token.decode().unwrap();
         let old_authority = match first.consume(first_bootstrap.slot_id(), &first_token, now()) {
@@ -350,9 +381,9 @@ mod tests {
         drop(store);
 
         let resumed_store = ClaudeSnapshotStore::at_root(root).unwrap();
-        let mut resumed = PairingTable::new();
+        let resumed = PairingRegistry::new();
         let fresh_bootstrap = resumed
-            .register_or_rebind(&resumed_store, PlanMetadata::Paid, 501, 78, now())
+            .register_or_rebind(&resumed_store, PlanMetadata::Paid, now())
             .unwrap();
         assert!(fresh_bootstrap.epoch() > old_authority.epoch);
         assert!(matches!(
@@ -378,17 +409,15 @@ mod tests {
     #[test]
     fn paid_and_free_sessions_consume_independently() {
         let store = store();
-        let table = std::sync::Arc::new(std::sync::Mutex::new(PairingTable::new()));
+        let table = std::sync::Arc::new(PairingRegistry::new());
         let paid = {
-            let mut table = table.lock().unwrap();
             table
-                .register_or_rebind(&store, PlanMetadata::Paid, 501, 77, now())
+                .register_or_rebind(&store, PlanMetadata::Paid, now())
                 .unwrap()
         };
         let free = {
-            let mut table = table.lock().unwrap();
             table
-                .register_or_rebind(&store, PlanMetadata::Free, 501, 78, now())
+                .register_or_rebind(&store, PlanMetadata::Free, now())
                 .unwrap()
         };
         let paid_slot = paid.slot_id().clone();
@@ -399,11 +428,7 @@ mod tests {
         let paid_table = table.clone();
         let paid_barrier = barrier.clone();
         let paid_worker = std::thread::spawn(move || {
-            let authority = match paid_table
-                .lock()
-                .unwrap()
-                .consume(&paid_slot, &paid_token, now())
-            {
+            let authority = match paid_table.consume(&paid_slot, &paid_token, now()) {
                 PairingConsume::Accepted(authority) => authority,
                 _ => panic!("paid pairing must be independent"),
             };
@@ -413,11 +438,7 @@ mod tests {
         let free_table = table.clone();
         let free_barrier = barrier.clone();
         let free_worker = std::thread::spawn(move || {
-            let authority = match free_table
-                .lock()
-                .unwrap()
-                .consume(&free_slot, &free_token, now())
-            {
+            let authority = match free_table.consume(&free_slot, &free_token, now()) {
                 PairingConsume::Accepted(authority) => authority,
                 _ => panic!("free pairing must be independent"),
             };
