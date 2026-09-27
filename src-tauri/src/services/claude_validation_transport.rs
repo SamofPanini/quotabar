@@ -16,6 +16,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::process::Child;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -36,6 +37,49 @@ pub(crate) enum TransportError {
 struct FrameBucket {
     tokens: u8,
     last_refill: Instant,
+}
+
+/// Redacted, non-serializable ownership record for a synthetic child session.
+/// It deliberately owns the child and the sole parent endpoint; neither a path
+/// nor peer PID is accepted as an authentication substitute.
+struct SpawnOwnedSession {
+    child: Child,
+    parent: UnixStream,
+    revoke: UnixStream,
+    slot: AccountSlotId,
+    generation: u64,
+}
+
+impl std::fmt::Debug for SpawnOwnedSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SpawnOwnedSession(<redacted>)")
+    }
+}
+
+impl SpawnOwnedSession {
+    fn revoke_and_reap(&mut self, pairing: &PairingRegistry) {
+        pairing.revoke(&self.slot, self.generation);
+        // This control endpoint is intentionally private to the spawn owner.
+        // A best-effort byte wakes a cooperating child; failure is harmless
+        // because the owned child is subsequently terminated and reaped.
+        let _ = self.revoke.write_all(b"revoke");
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn run_spawn_owned_session(
+    owner: &mut SpawnOwnedSession,
+    store: &ClaudeSnapshotStore,
+    pairing: &PairingRegistry,
+) -> Result<(), TransportError> {
+    let result = handle_authenticated_session(&mut owner.parent, store, pairing);
+    if result.is_err() {
+        owner.revoke_and_reap(pairing);
+    }
+    result
 }
 
 impl FrameBucket {
@@ -62,334 +106,6 @@ impl FrameBucket {
     }
 }
 
-/*
-    pub(crate) fn for_synthetic(root: PathBuf) -> Result<Self, TransportError> {
-        let expected_name = format!("quotabar-c3b1-{}", unsafe { libc::geteuid() });
-        if root.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
-            return Err(TransportError::Rejected);
-        }
-        let encoded = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())
-            .map_err(|_| TransportError::Rejected)?;
-        let fd = unsafe {
-            libc::open(
-                encoded.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(TransportError::Rejected);
-        }
-        let descriptor = unsafe { fs::File::from_raw_fd(fd) };
-        let metadata = descriptor
-            .metadata()
-            .map_err(|_| TransportError::Rejected)?;
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || (metadata.mode() & 0o777) != 0o700
-        {
-            return Err(TransportError::Rejected);
-        }
-        let socket_root = Self {
-            root,
-            descriptor,
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        };
-        socket_root.initialize_owner_markers()?;
-        Ok(socket_root)
-    }
-
-    pub(crate) fn socket_path(&self) -> Result<PathBuf, TransportError> {
-        self.assert_pinned()?;
-        let candidate = self.root.join(SOCKET_NAME);
-        // macOS sockaddr_un accepts at most 104 bytes; reject rather than
-        // relying on truncation or a fallback path.
-        if candidate.as_os_str().as_encoded_bytes().len() >= 104 {
-            return Err(TransportError::Rejected);
-        }
-        if candidate.exists() || fs::symlink_metadata(&candidate).is_ok() {
-            return Err(TransportError::Rejected);
-        }
-        Ok(candidate)
-    }
-
-    pub(crate) fn bind(&self) -> Result<UnixListener, TransportError> {
-        self.classify_existing_endpoint()?;
-        let path = self.socket_path()?;
-        let listener = UnixListener::bind(&path).map_err(|_| TransportError::Rejected)?;
-        let created = fs::symlink_metadata(&path).map_err(|_| TransportError::Rejected)?;
-        if !created.file_type().is_socket() || created.file_type().is_symlink() {
-            return Err(TransportError::Rejected);
-        }
-        let socket = CStringName::new(SOCKET_NAME)?;
-        if unsafe { libc::fchmodat(self.descriptor.as_raw_fd(), socket.as_ptr(), 0o600, 0) } != 0 {
-            return Err(TransportError::Io);
-        }
-        if self.assert_pinned().is_err() {
-            // Only remove the exact inode created by this attempt; a
-            // replacement at the pathname is left untouched.
-            if let Ok(current) = fs::symlink_metadata(&path) {
-                if current.dev() == created.dev() && current.ino() == created.ino() {
-                    let _ = fs::remove_file(&path);
-                }
-            }
-            return Err(TransportError::Rejected);
-        }
-        let metadata =
-            stat_at(self.descriptor.as_raw_fd(), &socket)?.ok_or(TransportError::Rejected)?;
-        if (metadata.st_mode & libc::S_IFMT) != libc::S_IFSOCK
-            || metadata.st_uid != unsafe { libc::geteuid() }
-            || (metadata.st_mode as u32 & 0o777) != 0o600
-        {
-            return Err(TransportError::Rejected);
-        }
-        Ok(listener)
-    }
-
-    fn initialize_owner_markers(&self) -> Result<(), TransportError> {
-        self.assert_pinned()?;
-        let manifest = CStringName::new(SOCKET_MANIFEST)?;
-        let pid = CStringName::new(SOCKET_PID)?;
-        if stat_at(self.descriptor.as_raw_fd(), &manifest)?.is_some()
-            || stat_at(self.descriptor.as_raw_fd(), &pid)?.is_some()
-        {
-            return self.validate_owner_markers();
-        }
-        if stat_at(self.descriptor.as_raw_fd(), &CStringName::new(SOCKET_NAME)?)?.is_some() {
-            return Err(TransportError::Rejected);
-        }
-        write_private_at(
-            self.descriptor.as_raw_fd(),
-            &manifest,
-            SOCKET_MANIFEST_BYTES,
-        )?;
-        write_private_at(
-            self.descriptor.as_raw_fd(),
-            &pid,
-            std::process::id().to_string().as_bytes(),
-        )?;
-        self.validate_owner_markers()
-    }
-
-    fn validate_owner_markers(&self) -> Result<(), TransportError> {
-        self.assert_pinned()?;
-        let manifest = CStringName::new(SOCKET_MANIFEST)?;
-        let pid = CStringName::new(SOCKET_PID)?;
-        for name in [&manifest, &pid] {
-            let metadata =
-                stat_at(self.descriptor.as_raw_fd(), name)?.ok_or(TransportError::Rejected)?;
-            if (metadata.st_mode & libc::S_IFMT) != libc::S_IFREG
-                || metadata.st_uid != unsafe { libc::geteuid() }
-                || (metadata.st_mode as u32 & 0o777) != 0o600
-            {
-                return Err(TransportError::Rejected);
-            }
-        }
-        if read_private_at(self.descriptor.as_raw_fd(), &manifest)? != SOCKET_MANIFEST_BYTES {
-            return Err(TransportError::Rejected);
-        }
-        let pid = String::from_utf8(read_private_at(self.descriptor.as_raw_fd(), &pid)?)
-            .map_err(|_| TransportError::Rejected)?;
-        let parsed = pid.parse::<u32>().map_err(|_| TransportError::Rejected)?;
-        if parsed == 0 {
-            return Err(TransportError::Rejected);
-        }
-        Ok(())
-    }
-
-    fn classify_existing_endpoint(&self) -> Result<(), TransportError> {
-        self.validate_owner_markers()?;
-        let socket = CStringName::new(SOCKET_NAME)?;
-        let metadata = match stat_at(self.descriptor.as_raw_fd(), &socket)? {
-            Some(metadata) => metadata,
-            None => return Ok(()),
-        };
-        if (metadata.st_mode & libc::S_IFMT) != libc::S_IFSOCK
-            || metadata.st_uid != unsafe { libc::geteuid() }
-            || (metadata.st_mode as u32 & 0o777) != 0o600
-        {
-            return Err(TransportError::Rejected);
-        }
-        let endpoint = self.root.join(SOCKET_NAME);
-        if UnixStream::connect(&endpoint).is_ok() {
-            return Err(TransportError::Rejected);
-        }
-        let pid = String::from_utf8(read_private_at(
-            self.descriptor.as_raw_fd(),
-            &CStringName::new(SOCKET_PID)?,
-        )?)
-        .map_err(|_| TransportError::Rejected)?
-        .parse::<i32>()
-        .map_err(|_| TransportError::Rejected)?;
-        let dead = unsafe { libc::kill(pid, 0) } != 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if !dead {
-            return Err(TransportError::Rejected);
-        }
-        self.assert_pinned()?;
-        let current =
-            stat_at(self.descriptor.as_raw_fd(), &socket)?.ok_or(TransportError::Rejected)?;
-        if current.st_dev != metadata.st_dev
-            || current.st_ino != metadata.st_ino
-            || current.st_mode != metadata.st_mode
-        {
-            return Err(TransportError::Rejected);
-        }
-        if unsafe { libc::unlinkat(self.descriptor.as_raw_fd(), socket.as_ptr(), 0) } == 0 {
-            Ok(())
-        } else {
-            Err(TransportError::Rejected)
-        }
-    }
-
-    fn assert_pinned(&self) -> Result<(), TransportError> {
-        let descriptor = self
-            .descriptor
-            .metadata()
-            .map_err(|_| TransportError::Rejected)?;
-        let path = fs::symlink_metadata(&self.root).map_err(|_| TransportError::Rejected)?;
-        if !descriptor.is_dir()
-            || !path.is_dir()
-            || path.file_type().is_symlink()
-            || descriptor.uid() != unsafe { libc::geteuid() }
-            || (descriptor.mode() & 0o777) != 0o700
-            || descriptor.dev() != self.dev
-            || descriptor.ino() != self.ino
-            || path.dev() != self.dev
-            || path.ino() != self.ino
-        {
-            return Err(TransportError::Rejected);
-        }
-        Ok(())
-    }
-}
-
-struct CStringName(std::ffi::CString);
-
-impl CStringName {
-    fn new(name: &str) -> Result<Self, TransportError> {
-        if name.is_empty() || name.contains('/') {
-            return Err(TransportError::Rejected);
-        }
-        std::ffi::CString::new(name)
-            .map(Self)
-            .map_err(|_| TransportError::Rejected)
-    }
-
-    fn as_ptr(&self) -> *const libc::c_char {
-        self.0.as_ptr()
-    }
-}
-
-fn stat_at(dirfd: i32, name: &CStringName) -> Result<Option<libc::stat>, TransportError> {
-    let mut stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
-        Ok(Some(stat))
-    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-        Ok(None)
-    } else {
-        Err(TransportError::Rejected)
-    }
-}
-
-fn write_private_at(dirfd: i32, name: &CStringName, bytes: &[u8]) -> Result<(), TransportError> {
-    let fd = unsafe {
-        libc::openat(
-            dirfd,
-            name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(TransportError::Rejected);
-    }
-    let mut file = unsafe { fs::File::from_raw_fd(fd) };
-    file.write_all(bytes).map_err(|_| TransportError::Io)?;
-    file.sync_all().map_err(|_| TransportError::Io)
-}
-
-fn read_private_at(dirfd: i32, name: &CStringName) -> Result<Vec<u8>, TransportError> {
-    let fd = unsafe {
-        libc::openat(
-            dirfd,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(TransportError::Rejected);
-    }
-    let mut file = unsafe { fs::File::from_raw_fd(fd) };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|_| TransportError::Io)?;
-    Ok(bytes)
-}
-
-/// Returns both credentials required by the contract. Absence of either is a
-/// reject; there is deliberately no same-UID-only fallback.
-pub(crate) fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials, TransportError> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let fd = stream.as_raw_fd();
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        if libc::getpeereid(fd, &mut uid, &mut gid) != 0 {
-            return Err(TransportError::Rejected);
-        }
-        // LOCAL_PEERPID is the Darwin local-domain peer PID option. It is not
-        // supplied by libc's portable constants, so keep the ABI value local.
-        const SOL_LOCAL: libc::c_int = 0;
-        const LOCAL_PEERPID: libc::c_int = 0x002;
-        let mut pid: libc::pid_t = 0;
-        let mut size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-        if libc::getsockopt(
-            fd,
-            SOL_LOCAL,
-            LOCAL_PEERPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut size,
-        ) != 0
-            || size != std::mem::size_of::<libc::pid_t>() as libc::socklen_t
-            || pid <= 0
-        {
-            return Err(TransportError::Rejected);
-        }
-        Ok(PeerCredentials {
-            uid,
-            pid: pid as u32,
-        })
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mut credentials: libc::ucred = std::mem::zeroed();
-        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        if libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut size,
-        ) != 0
-            || size != std::mem::size_of::<libc::ucred>() as libc::socklen_t
-            || credentials.pid <= 0
-        {
-            return Err(TransportError::Rejected);
-        }
-        Ok(PeerCredentials {
-            uid: credentials.uid,
-            pid: credentials.pid as u32,
-        })
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = stream;
-        Err(TransportError::Rejected)
-    }
-}
-*/
-
 /// Handles an owned parent end of a private inherited socketpair. The spawn
 /// owner proves delivery by retaining the sole parent end; no socket peer PID
 /// is claimed to identify the eventual child writer.
@@ -397,10 +113,9 @@ pub(crate) fn handle_authenticated_session(
     stream: &mut UnixStream,
     store: &ClaudeSnapshotStore,
     pairing: &PairingRegistry,
-    now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
-    let authority = authenticate_session(stream, pairing, now)?;
-    handle_session_loop(stream, store, authority, now)
+    let authority = authenticate_session(stream, pairing)?;
+    handle_session_loop(stream, store, authority)
 }
 
 /// Authentication is the only phase that borrows the shared pairing table.
@@ -409,27 +124,20 @@ pub(crate) fn handle_authenticated_session(
 pub(crate) fn authenticate_session(
     stream: &mut UnixStream,
     pairing: &PairingRegistry,
-    now: DateTime<Utc>,
 ) -> Result<SessionAuthority, TransportError> {
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-        .map_err(|_| TransportError::Io)?;
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|_| TransportError::Io)?;
-    let handshake = read_secret_frame(stream, HANDSHAKE_MAX)?;
+    let handshake = read_secret_frame(stream, HANDSHAKE_MAX, Duration::from_secs(3))?;
     let (slot, token) = parse_handshake(&handshake)?;
-    match pairing.consume(&slot, &token, now) {
+    match pairing.consume(&slot, &token) {
         PairingConsume::Accepted(authority) => {
-            write_fixed_result(stream, "accepted")?;
+            write_fixed_result(stream, "accepted", Duration::from_secs(5))?;
             Ok(authority)
         }
         PairingConsume::Expired => {
-            write_fixed_result(stream, "expired")?;
+            write_fixed_result(stream, "expired", Duration::from_secs(5))?;
             return Err(TransportError::Expired);
         }
         PairingConsume::Rejected => {
-            write_fixed_result(stream, "rejected")?;
+            write_fixed_result(stream, "rejected", Duration::from_secs(5))?;
             return Err(TransportError::Rejected);
         }
     }
@@ -441,15 +149,13 @@ pub(crate) fn handle_session_loop(
     stream: &mut UnixStream,
     store: &ClaudeSnapshotStore,
     authority: SessionAuthority,
-    now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
-    // No idle deadline: EOF is normal, and the first byte of a new frame may
-    // arrive arbitrarily late.  Once it arrives, `read_frame` applies the
-    // bounded per-frame read timeout.
+    // No idle deadline: EOF is normal and a new frame may arrive arbitrarily late.
     stream
         .set_read_timeout(None)
         .map_err(|_| TransportError::Io)?;
     let mut bucket = FrameBucket::new(Instant::now());
+    let mut next_sequence = 1u64;
     loop {
         let frame = match read_frame(stream, FRAME_MAX, &mut bucket) {
             Ok(frame) => frame,
@@ -457,6 +163,11 @@ pub(crate) fn handle_session_loop(
             Err(error) => return Err(error),
         };
         let event = parse_ingress(&frame, &authority.slot_id, authority.epoch, authority.plan)?;
+        if event.sequence != next_sequence {
+            return Err(TransportError::Rejected);
+        }
+        // Sampling at each commit boundary avoids a session-wide frozen UTC
+        // observation timestamp; deadlines remain entirely monotonic above.
         submit_correlated_observation(
             store,
             CorrelatedObservation {
@@ -470,9 +181,12 @@ pub(crate) fn handle_session_loop(
                 plan: None,
                 disposition: event.disposition,
             },
-            now,
+            Utc::now(),
         )
         .map_err(|_| TransportError::Rejected)?;
+        next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or(TransportError::Rejected)?;
     }
 }
 
@@ -490,22 +204,14 @@ fn read_frame(
     if !bucket.take(Instant::now()) {
         return Err(TransportError::Rejected);
     }
-    // The budget starts at the first frame byte and does not refresh while
-    // partial header/payload reads continue.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| TransportError::Io)?;
-    stream
-        .read_exact(&mut length[1..])
-        .map_err(|_| TransportError::Io)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    read_exact_until(stream, &mut length[1..], deadline)?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > max {
         return Err(TransportError::Rejected);
     }
     let mut frame = vec![0; length];
-    stream
-        .read_exact(&mut frame)
-        .map_err(|_| TransportError::Io)?;
+    read_exact_until(stream, &mut frame, deadline)?;
     stream
         .set_read_timeout(None)
         .map_err(|_| TransportError::Io)?;
@@ -519,28 +225,77 @@ fn read_frame(
 fn read_secret_frame(
     stream: &mut UnixStream,
     max: usize,
+    budget: Duration,
 ) -> Result<Zeroizing<Vec<u8>>, TransportError> {
     let mut length = [0u8; 4];
     stream
-        .read_exact(&mut length)
+        .set_read_timeout(None)
         .map_err(|_| TransportError::Io)?;
+    stream
+        .read_exact(&mut length[..1])
+        .map_err(|_| TransportError::Io)?;
+    let deadline = Instant::now() + budget;
+    read_exact_until(stream, &mut length[1..], deadline)?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > max {
         return Err(TransportError::Rejected);
     }
     let mut frame = Zeroizing::new(vec![0; length]);
-    stream
-        .read_exact(&mut frame)
-        .map_err(|_| TransportError::Io)?;
+    read_exact_until(stream, &mut frame, deadline)?;
     Ok(frame)
 }
 
-fn write_fixed_result(stream: &mut UnixStream, result: &str) -> Result<(), TransportError> {
+fn read_exact_until(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<(), TransportError> {
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(TransportError::Io)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| TransportError::Io)?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(TransportError::Io),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(_) => return Err(TransportError::Io),
+        }
+    }
+    Ok(())
+}
+
+fn write_fixed_result(
+    stream: &mut UnixStream,
+    result: &str,
+    budget: Duration,
+) -> Result<(), TransportError> {
     let bytes = format!("{{\"result\":\"{result}\"}}").into_bytes();
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .map_err(|_| TransportError::Io)?;
-    stream.write_all(&bytes).map_err(|_| TransportError::Io)
+    let deadline = Instant::now() + budget;
+    write_all_until(stream, &(bytes.len() as u32).to_be_bytes(), deadline)?;
+    write_all_until(stream, &bytes, deadline)
+}
+
+fn write_all_until(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), TransportError> {
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(TransportError::Io)?;
+        stream
+            .set_write_timeout(Some(remaining))
+            .map_err(|_| TransportError::Io)?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(TransportError::Io),
+            Ok(written) => bytes = &bytes[written..],
+            Err(_) => return Err(TransportError::Io),
+        }
+    }
+    Ok(())
 }
 
 fn parse_handshake(bytes: &[u8]) -> Result<(AccountSlotId, Zeroizing<Vec<u8>>), TransportError> {
@@ -722,6 +477,14 @@ fn parse_observation(object: &Map<String, Value>) -> Result<CorrelatedDispositio
 // preflight rejects duplicate object keys before serde parsing, including
 // nested objects, then serde validates UTF-8 and number grammar.
 fn strict_value(bytes: &[u8]) -> Result<Value, TransportError> {
+    // The framed protocol transports exactly one object. Whitespace is data
+    // here, not a JSON transport convenience, so it is rejected at either
+    // boundary rather than accepted by serde's permissive top-level parser.
+    if bytes.first().is_some_and(u8::is_ascii_whitespace)
+        || bytes.last().is_some_and(u8::is_ascii_whitespace)
+    {
+        return Err(TransportError::Rejected);
+    }
     reject_duplicate_object_keys(bytes)?;
     serde_json::from_slice(bytes).map_err(|_| TransportError::Rejected)
 }
@@ -828,64 +591,13 @@ mod tests {
     use super::super::claude_validation_pairing::PairingRegistry;
     use super::*;
     use std::io::{Read, Write};
+    use std::net::Shutdown;
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
     use uuid::Uuid;
 
-    const CHILD_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD";
-
-    /*fn socket_root(label: &str) -> PathBuf {
-        let parent =
-            PathBuf::from("/private/tmp").join(format!("qt-c3b1-{label}-{}", Uuid::new_v4()));
-        std::fs::create_dir(&parent).unwrap();
-        let root = parent.join(format!("quotabar-c3b1-{}", unsafe { libc::geteuid() }));
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        root
-    }
-
-    #[test]
-    fn pinned_socket_root_rejects_path_substitution() {
-        let root = socket_root("substitute");
-        let socket_root = SocketRoot::for_synthetic(root.clone()).unwrap();
-        let moved = root.with_extension("moved");
-        let substituted = root.parent().unwrap().join("substituted");
-        std::fs::create_dir(&substituted).unwrap();
-        std::fs::rename(&root, &moved).unwrap();
-        std::os::unix::fs::symlink(&substituted, &root).unwrap();
-        assert_eq!(
-            socket_root.socket_path().unwrap_err(),
-            TransportError::Rejected
-        );
-        assert!(!substituted.join(SOCKET_NAME).exists());
-        std::fs::remove_file(&root).unwrap();
-        std::fs::remove_dir_all(moved.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn fixed_root_classifies_live_stale_and_collision_endpoints() {
-        let root = socket_root("lifecycle");
-        let socket_root = SocketRoot::for_synthetic(root.clone()).unwrap();
-        let live = socket_root.bind().unwrap();
-        assert_eq!(socket_root.bind().unwrap_err(), TransportError::Rejected);
-        drop(live);
-        let mut exited = Command::new("/usr/bin/true").spawn().unwrap();
-        let dead_pid = exited.id();
-        assert!(exited.wait().unwrap().success());
-        std::fs::write(root.join(SOCKET_PID), dead_pid.to_string()).unwrap();
-        std::fs::set_permissions(
-            root.join(SOCKET_PID),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        let stale_reclaimed = socket_root.bind().unwrap();
-        drop(stale_reclaimed);
-        std::fs::remove_file(root.join(SOCKET_NAME)).unwrap();
-        std::fs::write(root.join(SOCKET_NAME), b"ordinary").unwrap();
-        assert_eq!(socket_root.bind().unwrap_err(), TransportError::Rejected);
-        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
-    }*/
+    const CHILD_STAGE_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD_STAGE";
 
     fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
         stream
@@ -912,28 +624,107 @@ mod tests {
         bytes
     }
 
+    fn has_cloexec(fd: i32) -> bool {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    fn run_production_transport_frames(
+        plan: PlanMetadata,
+        frames: Vec<Vec<u8>>,
+    ) -> Result<(), TransportError> {
+        let root = std::env::temp_dir().join(format!("quotabar-c3b1-seam-{}", Uuid::new_v4()));
+        let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
+        let pairing = PairingRegistry::new();
+        let bootstrap = pairing
+            .register_or_rebind(&store, plan, chrono::Utc::now())
+            .unwrap();
+        let handshake = synthetic_handshake(
+            bootstrap.slot_id().as_str().as_bytes(),
+            bootstrap.token_bytes_for_synthetic_child(),
+        );
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let client_worker = std::thread::spawn(move || {
+            write_frame(&mut client, &handshake);
+            assert_eq!(
+                read_frame_for_test(&mut client),
+                br#"{"result":"accepted"}"#
+            );
+            for frame in frames {
+                write_frame(&mut client, &frame);
+            }
+            // Keep the writer endpoint alive until the server has a chance to
+            // enter its post-auth frame loop; EOF is a distinct normal case.
+            std::thread::sleep(Duration::from_millis(20));
+            client.shutdown(Shutdown::Write).unwrap();
+        });
+        let result = handle_authenticated_session(&mut server, &store, &pairing);
+        client_worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
+    fn ingress(slot: &str, epoch: u64, sequence: u64, event: &str) -> Vec<u8> {
+        format!(
+            "{{\"event\":\"{event}\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"{sequence}\",\"observedAt\":\"2024-01-01T00:00:00Z\"}}"
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn reexecuted_synthetic_child_uses_private_inherited_fd() {
-        if std::env::var_os(CHILD_ENV).is_some() {
-            synthetic_child();
-            return;
+        match std::env::var(CHILD_STAGE_ENV).ok().as_deref() {
+            Some("bootstrap") => {
+                synthetic_child();
+                return;
+            }
+            Some("second-exec") => {
+                assert_eq!(
+                    unsafe { libc::fcntl(3, libc::F_GETFD) },
+                    -1,
+                    "CLOEXEC must close the bootstrap mapping before a second exec"
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF)
+                );
+                return;
+            }
+            _ => {}
         }
-        let (mut parent_bootstrap, child_bootstrap) = UnixStream::pair().unwrap();
+        for _ in 0..25 {
+            run_reexecuted_synthetic_child_once();
+        }
+    }
+
+    fn run_reexecuted_synthetic_child_once() {
+        let (parent_bootstrap, child_bootstrap) = UnixStream::pair().unwrap();
+        let (parent_revoke, child_revoke) = UnixStream::pair().unwrap();
         let child_fd = child_bootstrap.as_raw_fd();
-        let mut child = unsafe {
+        let revoke_fd = child_revoke.as_raw_fd();
+        assert!(has_cloexec(parent_bootstrap.as_raw_fd()));
+        assert!(has_cloexec(child_fd));
+        assert!(has_cloexec(parent_revoke.as_raw_fd()));
+        assert!(has_cloexec(revoke_fd));
+        let child = unsafe {
             Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("services::claude_validation_transport::tests::reexecuted_synthetic_child_uses_private_inherited_fd")
                 .arg("--nocapture")
-                .env(CHILD_ENV, "1")
+                .env(CHILD_STAGE_ENV, "bootstrap")
                 .pre_exec(move || {
-                    if libc::dup2(child_fd, 3) < 0 { return Err(std::io::Error::last_os_error()); }
+                    if libc::dup2(child_fd, 3) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(revoke_fd, 4) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     Ok(())
                 })
                 .spawn()
                 .unwrap()
         };
         drop(child_bootstrap);
+        drop(child_revoke);
         let root = std::env::temp_dir().join(format!("quotabar-c3b1-r4-{}", Uuid::new_v4()));
         let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
         let pairing = PairingRegistry::new();
@@ -941,6 +732,13 @@ mod tests {
         let bootstrap = pairing
             .register_or_rebind(&store, PlanMetadata::Paid, now)
             .unwrap();
+        let mut owner = SpawnOwnedSession {
+            child,
+            parent: parent_bootstrap,
+            revoke: parent_revoke,
+            slot: bootstrap.slot_id().clone(),
+            generation: bootstrap.epoch(),
+        };
         let slot = bootstrap.slot_id().as_str().as_bytes();
         let token = bootstrap.token_bytes_for_synthetic_child();
         let probe = synthetic_handshake(slot, token);
@@ -948,14 +746,37 @@ mod tests {
         let mut bytes = Zeroizing::new(Vec::with_capacity(slot.len() + token.len()));
         bytes.extend_from_slice(slot);
         bytes.extend_from_slice(token);
-        write_frame(&mut parent_bootstrap, &bytes);
-        handle_authenticated_session(&mut parent_bootstrap, &store, &pairing, now).unwrap();
-        assert!(child.wait().unwrap().success());
+        write_frame(&mut owner.parent, &bytes);
+        run_spawn_owned_session(&mut owner, &store, &pairing).unwrap();
+        assert_eq!(owner.slot, *bootstrap.slot_id());
+        assert_eq!(owner.generation, bootstrap.epoch());
+        assert!(owner.child.wait().unwrap().success());
         std::fs::remove_dir_all(root).unwrap_or(());
     }
 
     fn synthetic_child() {
         let mut bootstrap = unsafe { UnixStream::from_raw_fd(3) };
+        let revoke = unsafe { UnixStream::from_raw_fd(4) };
+        assert!(!has_cloexec(bootstrap.as_raw_fd()));
+        assert!(!has_cloexec(revoke.as_raw_fd()));
+        assert_eq!(
+            unsafe { libc::fcntl(bootstrap.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+        assert!(has_cloexec(bootstrap.as_raw_fd()));
+        assert_eq!(
+            unsafe { libc::fcntl(revoke.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+        assert!(has_cloexec(revoke.as_raw_fd()));
+        let second = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("services::claude_validation_transport::tests::reexecuted_synthetic_child_uses_private_inherited_fd")
+            .arg("--nocapture")
+            .env(CHILD_STAGE_ENV, "second-exec")
+            .status()
+            .unwrap();
+        assert!(second.success());
         let payload = Zeroizing::new(read_frame_for_test(&mut bootstrap));
         let slot_end = 36;
         let slot = &payload[..slot_end];
@@ -972,9 +793,142 @@ mod tests {
     #[test]
     fn strict_wire_rejects_duplicate_unknown_and_noncanonical_fields() {
         assert!(strict_value(br#"{"a":1,"a":2}"#).is_err());
+        assert!(strict_value(br#" {"a":1}"#).is_err());
+        assert!(strict_value(b"{\"a\":1}\n").is_err());
+        assert!(strict_value(br#"{"a":1}{"b":2}"#).is_err());
         assert!(parse_handshake(br#"{"kind":"pair","slot":"11111111-1111-4111-8111-111111111111","token":"bad","extra":1}"#).is_err());
         assert!(canonical_u64("01").is_err());
         assert!(canonical_time("2024-01-01T00:00:00+00:00").is_err());
+    }
+
+    #[test]
+    fn per_session_bucket_has_fixed_burst_and_monotonic_refill_boundaries() {
+        let start = Instant::now();
+        let mut bucket = FrameBucket::new(start);
+        for _ in 0..4 {
+            assert!(bucket.take(start));
+        }
+        assert!(!bucket.take(start));
+        assert!(!bucket.take(start + Duration::from_millis(14_999)));
+        assert!(bucket.take(start + Duration::from_secs(15)));
+        assert!(!bucket.take(start + Duration::from_secs(15)));
+        assert!(bucket.take(start + Duration::from_secs(30)));
+        let mut sustained = FrameBucket::new(start);
+        for index in 0..100u64 {
+            assert!(sustained.take(start + Duration::from_secs(index * 15)));
+        }
+    }
+
+    #[test]
+    fn blocked_handshake_does_not_hold_pairing_lock_or_block_second_session() {
+        let root = std::env::temp_dir().join(format!("quotabar-c3b1-lock-{}", Uuid::new_v4()));
+        let store = std::sync::Arc::new(ClaudeSnapshotStore::at_root(root.clone()).unwrap());
+        let pairing = std::sync::Arc::new(PairingRegistry::new());
+        let first = pairing
+            .register_or_rebind(&store, PlanMetadata::Paid, chrono::Utc::now())
+            .unwrap();
+        let second = pairing
+            .register_or_rebind(&store, PlanMetadata::Free, chrono::Utc::now())
+            .unwrap();
+        let (mut first_server, mut first_client) = UnixStream::pair().unwrap();
+        first_client.write_all(&[0]).unwrap();
+        let first_store = store.clone();
+        let first_pairing = pairing.clone();
+        let blocked = std::thread::spawn(move || {
+            handle_authenticated_session(&mut first_server, &first_store, &first_pairing)
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(pairing.try_lock_available_for_test());
+
+        let (mut second_server, mut second_client) = UnixStream::pair().unwrap();
+        let second_handshake = synthetic_handshake(
+            second.slot_id().as_str().as_bytes(),
+            second.token_bytes_for_synthetic_child(),
+        );
+        write_frame(&mut second_client, &second_handshake);
+        second_client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(
+            handle_authenticated_session(&mut second_server, &store, &pairing),
+            Ok(())
+        );
+        first_client.shutdown(Shutdown::Both).unwrap();
+        assert!(matches!(blocked.join().unwrap(), Err(TransportError::Io)));
+        // The blocked first handshake has not reached the consume point; the
+        // available try-lock above is the lock-boundary evidence.
+        assert_eq!(
+            first.slot_id().as_str(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_owner_session_revokes_exact_generation_and_reaps_child() {
+        let root = std::env::temp_dir().join(format!("quotabar-c3b1-revoke-{}", Uuid::new_v4()));
+        let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
+        let pairing = PairingRegistry::new();
+        let bootstrap = pairing
+            .register_or_rebind(&store, PlanMetadata::Paid, chrono::Utc::now())
+            .unwrap();
+        let token = bootstrap.decoded_token_for_test();
+        let (parent, mut child_end) = UnixStream::pair().unwrap();
+        let (revoke, _child_revoke) = UnixStream::pair().unwrap();
+        let child = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut owner = SpawnOwnedSession {
+            child,
+            parent,
+            revoke,
+            slot: bootstrap.slot_id().clone(),
+            generation: bootstrap.epoch(),
+        };
+        // A malformed one-byte header fails before consume, then the owner
+        // must revoke its still-pending authority and reap its exact child.
+        child_end.write_all(&[0]).unwrap();
+        child_end.shutdown(Shutdown::Write).unwrap();
+        assert!(matches!(
+            run_spawn_owned_session(&mut owner, &store, &pairing),
+            Err(TransportError::Io)
+        ));
+        assert!(owner.child.try_wait().unwrap().is_some());
+        assert!(matches!(
+            pairing.consume(bootstrap.slot_id(), &token),
+            PairingConsume::Rejected
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_transport_seam_accepts_lifecycle_and_unavailable_routes() {
+        let slot = "11111111-1111-4111-8111-111111111111";
+        let unavailable = format!(
+            "{{\"event\":\"observation\",\"slot\":\"{slot}\",\"epoch\":\"1\",\"sequence\":\"1\",\"observedAt\":\"2024-01-01T00:00:00Z\",\"status\":\"unavailable\",\"errorCode\":\"unavailable\"}}"
+        )
+        .into_bytes();
+        let lifecycle = ingress(slot, 1, 2, "continuity_uncertain");
+        assert_eq!(
+            run_production_transport_frames(PlanMetadata::Paid, vec![unavailable, lifecycle]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn production_transport_seam_rejects_wrong_slot_and_sequence_skip() {
+        let paid = "11111111-1111-4111-8111-111111111111";
+        let free = "22222222-2222-4222-8222-222222222222";
+        assert_eq!(
+            run_production_transport_frames(
+                PlanMetadata::Paid,
+                vec![ingress(free, 1, 1, "identity_changed")]
+            ),
+            Err(TransportError::Rejected)
+        );
+        assert_eq!(
+            run_production_transport_frames(
+                PlanMetadata::Paid,
+                vec![ingress(paid, 1, 2, "identity_changed")]
+            ),
+            Err(TransportError::Rejected)
+        );
     }
 
     #[test]

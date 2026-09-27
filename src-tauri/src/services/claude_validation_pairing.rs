@@ -9,10 +9,11 @@ use super::claude_snapshot::{
     ValidationBindingIssuance,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
+use std::time::{Duration as MonotonicDuration, Instant};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -20,7 +21,7 @@ const PAID_SLOT: &str = "11111111-1111-4111-8111-111111111111";
 const FREE_SLOT: &str = "22222222-2222-4222-8222-222222222222";
 const TOKEN_BYTES: usize = 32;
 const TOKEN_BASE64_BYTES: usize = 43;
-const TOKEN_LIFETIME: Duration = Duration::minutes(15);
+const TOKEN_LIFETIME: MonotonicDuration = MonotonicDuration::from_secs(15 * 60);
 const MAX_SLOTS: usize = 2;
 
 /// Owned authority detached from the shared pairing table after a successful
@@ -121,7 +122,6 @@ pub(crate) struct PairingBootstrapV1 {
     token: BootstrapToken,
     slot_id: AccountSlotId,
     epoch: u64,
-    expires_at: DateTime<Utc>,
 }
 
 impl fmt::Debug for PairingBootstrapV1 {
@@ -131,8 +131,16 @@ impl fmt::Debug for PairingBootstrapV1 {
 }
 
 impl PairingBootstrapV1 {
+    #[cfg(test)]
     pub(crate) fn token_bytes_for_synthetic_child(&self) -> &[u8] {
         self.token.as_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decoded_token_for_test(&self) -> Zeroizing<Vec<u8>> {
+        self.token
+            .decode()
+            .expect("generated bootstrap token is canonical")
     }
 
     pub(crate) fn slot_id(&self) -> &AccountSlotId {
@@ -142,10 +150,6 @@ impl PairingBootstrapV1 {
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
-
-    pub(crate) fn expires_at(&self) -> DateTime<Utc> {
-        self.expires_at
-    }
 }
 
 struct Session {
@@ -153,7 +157,7 @@ struct Session {
     epoch: u64,
     capability: BindingCapability,
     plan: PlanMetadata,
-    expires_at: DateTime<Utc>,
+    expires_at: Instant,
 }
 
 impl fmt::Debug for Session {
@@ -196,12 +200,11 @@ impl PairingTable {
             return Err(PairingError::Rejected);
         }
         let token = TransportSecret::generate()?;
-        let expires_at = now + TOKEN_LIFETIME;
+        let _ = now;
         let bootstrap = PairingBootstrapV1 {
             token: token.canonical_bootstrap()?,
             slot_id: slot_id.clone(),
             epoch: issuance.epoch(),
-            expires_at,
         };
         self.sessions.insert(
             slot_id.clone(),
@@ -210,22 +213,17 @@ impl PairingTable {
                 epoch: issuance.epoch(),
                 capability: issuance.capability(),
                 plan,
-                expires_at,
+                expires_at: Instant::now() + TOKEN_LIFETIME,
             },
         );
         Ok(bootstrap)
     }
 
-    fn consume(
-        &mut self,
-        slot_id: &AccountSlotId,
-        token: &[u8],
-        now: DateTime<Utc>,
-    ) -> PairingConsume {
+    fn consume(&mut self, slot_id: &AccountSlotId, token: &[u8]) -> PairingConsume {
         let Some(session) = self.sessions.get(slot_id) else {
             return PairingConsume::Rejected;
         };
-        if now > session.expires_at {
+        if Instant::now() > session.expires_at {
             self.sessions.remove(slot_id);
             return PairingConsume::Expired;
         }
@@ -286,21 +284,44 @@ impl PairingRegistry {
     }
 
     /// Atomically consumes after parsing, with no stream or store I/O held.
-    pub(crate) fn consume(
-        &self,
-        slot_id: &AccountSlotId,
-        token: &[u8],
-        now: DateTime<Utc>,
-    ) -> PairingConsume {
+    pub(crate) fn consume(&self, slot_id: &AccountSlotId, token: &[u8]) -> PairingConsume {
         self.sessions
             .lock()
-            .map(|mut table| table.consume(slot_id, token, now))
+            .map(|mut table| table.consume(slot_id, token))
             .unwrap_or(PairingConsume::Rejected)
     }
 
     pub(crate) fn clear(&self) {
         if let Ok(mut table) = self.sessions.lock() {
             table.sessions.clear();
+        }
+    }
+
+    /// Revokes only the generation held by a failed spawn owner. A newer
+    /// foreground rebind for the same stable slot must remain untouched.
+    pub(crate) fn revoke(&self, slot_id: &AccountSlotId, epoch: u64) {
+        if let Ok(mut table) = self.sessions.lock() {
+            if table
+                .sessions
+                .get(slot_id)
+                .is_some_and(|session| session.epoch == epoch)
+            {
+                table.sessions.remove(slot_id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_lock_available_for_test(&self) -> bool {
+        self.sessions.try_lock().is_ok()
+    }
+
+    #[cfg(test)]
+    fn expire_for_test(&self, slot_id: &AccountSlotId) {
+        if let Ok(mut table) = self.sessions.lock() {
+            if let Some(session) = table.sessions.get_mut(slot_id) {
+                session.expires_at = Instant::now() - MonotonicDuration::from_secs(1);
+            }
         }
     }
 }
@@ -331,11 +352,11 @@ mod tests {
         assert_eq!(token.len(), TOKEN_BYTES);
         let wrong = [0u8; TOKEN_BYTES];
         assert!(matches!(
-            table.consume(bootstrap.slot_id(), &wrong, now()),
+            table.consume(bootstrap.slot_id(), &wrong),
             PairingConsume::Rejected
         ));
         assert!(matches!(
-            table.consume(bootstrap.slot_id(), &token, now()),
+            table.consume(bootstrap.slot_id(), &token),
             PairingConsume::Accepted(_)
         ));
         assert!(!format!("{bootstrap:?}").contains("token"));
@@ -349,17 +370,14 @@ mod tests {
             .register_or_rebind(&store, PlanMetadata::Free, now())
             .unwrap();
         let token = bootstrap.token.decode().unwrap();
+        table.expire_for_test(bootstrap.slot_id());
         assert!(matches!(
-            table.consume(
-                bootstrap.slot_id(),
-                &token,
-                bootstrap.expires_at() + Duration::seconds(1)
-            ),
+            table.consume(bootstrap.slot_id(), &token),
             PairingConsume::Expired
         ));
         table.clear();
         assert!(matches!(
-            table.consume(bootstrap.slot_id(), &token, now()),
+            table.consume(bootstrap.slot_id(), &token),
             PairingConsume::Rejected
         ));
     }
@@ -373,7 +391,7 @@ mod tests {
             .register_or_rebind(&store, PlanMetadata::Paid, now())
             .unwrap();
         let first_token = first_bootstrap.token.decode().unwrap();
-        let old_authority = match first.consume(first_bootstrap.slot_id(), &first_token, now()) {
+        let old_authority = match first.consume(first_bootstrap.slot_id(), &first_token) {
             PairingConsume::Accepted(authority) => authority,
             _ => panic!("first authority must be accepted"),
         };
@@ -387,12 +405,12 @@ mod tests {
             .unwrap();
         assert!(fresh_bootstrap.epoch() > old_authority.epoch);
         assert!(matches!(
-            resumed.consume(first_bootstrap.slot_id(), &first_token, now()),
+            resumed.consume(first_bootstrap.slot_id(), &first_token),
             PairingConsume::Rejected
         ));
         let fresh_token = fresh_bootstrap.token.decode().unwrap();
         assert!(matches!(
-            resumed.consume(fresh_bootstrap.slot_id(), &fresh_token, now()),
+            resumed.consume(fresh_bootstrap.slot_id(), &fresh_token),
             PairingConsume::Accepted(_)
         ));
         assert!(resumed_store
@@ -428,7 +446,7 @@ mod tests {
         let paid_table = table.clone();
         let paid_barrier = barrier.clone();
         let paid_worker = std::thread::spawn(move || {
-            let authority = match paid_table.consume(&paid_slot, &paid_token, now()) {
+            let authority = match paid_table.consume(&paid_slot, &paid_token) {
                 PairingConsume::Accepted(authority) => authority,
                 _ => panic!("paid pairing must be independent"),
             };
@@ -438,7 +456,7 @@ mod tests {
         let free_table = table.clone();
         let free_barrier = barrier.clone();
         let free_worker = std::thread::spawn(move || {
-            let authority = match free_table.consume(&free_slot, &free_token, now()) {
+            let authority = match free_table.consume(&free_slot, &free_token) {
                 PairingConsume::Accepted(authority) => authority,
                 _ => panic!("free pairing must be independent"),
             };
@@ -451,5 +469,23 @@ mod tests {
         assert_ne!(paid.slot_id, free.slot_id);
         assert_ne!(paid.epoch, 0);
         assert_ne!(free.epoch, 0);
+    }
+
+    #[test]
+    fn revocation_is_exact_to_the_failed_generation() {
+        let store = store();
+        let registry = PairingRegistry::new();
+        let old = registry
+            .register_or_rebind(&store, PlanMetadata::Paid, now())
+            .unwrap();
+        let fresh = registry
+            .register_or_rebind(&store, PlanMetadata::Paid, now())
+            .unwrap();
+        assert!(fresh.epoch() > old.epoch());
+        registry.revoke(old.slot_id(), old.epoch());
+        assert!(matches!(
+            registry.consume(fresh.slot_id(), &fresh.decoded_token_for_test()),
+            PairingConsume::Accepted(_)
+        ));
     }
 }
