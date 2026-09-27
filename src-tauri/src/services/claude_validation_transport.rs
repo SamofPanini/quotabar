@@ -691,9 +691,11 @@ mod tests {
             }
             _ => {}
         }
-        for _ in 0..25 {
-            run_reexecuted_synthetic_child_once();
-        }
+        // A real re-exec is intentionally exercised once. Repeating process
+        // creation here makes CI depend on host scheduling rather than the FD
+        // provenance invariant being proved; sustained-rate repetition stays
+        // in the deterministic in-process bucket test below.
+        run_reexecuted_synthetic_child_once();
     }
 
     fn run_reexecuted_synthetic_child_once() {
