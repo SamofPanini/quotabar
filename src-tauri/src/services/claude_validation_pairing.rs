@@ -152,8 +152,6 @@ struct Session {
     epoch: u64,
     capability: BindingCapability,
     plan: PlanMetadata,
-    expected_uid: u32,
-    expected_pid: u32,
     expires_at: DateTime<Utc>,
 }
 
@@ -183,13 +181,14 @@ impl PairingTable {
         AccountSlotId::parse(value).expect("fixed C3-B1A slot UUID")
     }
 
-    /// Issues a single-use in-memory transport session after the caller's
-    /// foreground action has supplied the exact synthetic child PID.
+    /// Issues a single-use in-memory transport session.  The child identity
+    /// boundary is private FD delivery by the spawn owner; socket peer
+    /// credentials are intentionally not treated as the later writer PID.
     pub(crate) fn register_or_rebind(
         &mut self,
         store: &ClaudeSnapshotStore,
         plan: PlanMetadata,
-        expected_uid: u32,
+        _expected_uid: u32,
         expected_pid: u32,
         now: DateTime<Utc>,
     ) -> Result<PairingBootstrapV1, PairingError> {
@@ -209,7 +208,7 @@ impl PairingTable {
             plan,
             now,
         )?;
-        self.insert(slot_id, issuance, plan, expected_uid, expected_pid, now)
+        self.insert(slot_id, issuance, plan, now)
     }
 
     fn insert(
@@ -217,8 +216,6 @@ impl PairingTable {
         slot_id: AccountSlotId,
         issuance: ValidationBindingIssuance,
         plan: PlanMetadata,
-        expected_uid: u32,
-        expected_pid: u32,
         now: DateTime<Utc>,
     ) -> Result<PairingBootstrapV1, PairingError> {
         let token = TransportSecret::generate()?;
@@ -236,21 +233,18 @@ impl PairingTable {
                 epoch: issuance.epoch(),
                 capability: issuance.capability(),
                 plan,
-                expected_uid,
-                expected_pid,
                 expires_at,
             },
         );
         Ok(bootstrap)
     }
 
-    /// Atomically consumes a session only after transport peer checks pass.
+    /// Atomically consumes a session after the private inherited descriptor
+    /// has delivered its one-shot authority.  No peer PID claim is made.
     pub(crate) fn consume(
         &mut self,
         slot_id: &AccountSlotId,
         token: &[u8],
-        peer_uid: u32,
-        peer_pid: u32,
         now: DateTime<Utc>,
     ) -> PairingConsume {
         let Some(session) = self.sessions.get(slot_id) else {
@@ -260,10 +254,7 @@ impl PairingTable {
             self.sessions.remove(slot_id);
             return PairingConsume::Expired;
         }
-        if peer_uid != session.expected_uid
-            || peer_pid != session.expected_pid
-            || !session.token.matches(token)
-        {
+        if !session.token.matches(token) {
             return PairingConsume::Rejected;
         }
         let session = self
@@ -299,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn token_is_canonical_single_use_and_bound_to_peer() {
+    fn token_is_canonical_single_use_and_bound_to_private_delivery() {
         let store = store();
         let mut table = PairingTable::new();
         let bootstrap = table
@@ -307,12 +298,13 @@ mod tests {
             .unwrap();
         let token = bootstrap.token.decode().unwrap();
         assert_eq!(token.len(), TOKEN_BYTES);
+        let wrong = [0u8; TOKEN_BYTES];
         assert!(matches!(
-            table.consume(bootstrap.slot_id(), &token, 501, 78, now()),
+            table.consume(bootstrap.slot_id(), &wrong, now()),
             PairingConsume::Rejected
         ));
         assert!(matches!(
-            table.consume(bootstrap.slot_id(), &token, 501, 77, now()),
+            table.consume(bootstrap.slot_id(), &token, now()),
             PairingConsume::Accepted(_)
         ));
         assert!(!format!("{bootstrap:?}").contains("token"));
@@ -330,15 +322,13 @@ mod tests {
             table.consume(
                 bootstrap.slot_id(),
                 &token,
-                501,
-                88,
                 bootstrap.expires_at() + Duration::seconds(1)
             ),
             PairingConsume::Expired
         ));
         table.clear();
         assert!(matches!(
-            table.consume(bootstrap.slot_id(), &token, 501, 88, now()),
+            table.consume(bootstrap.slot_id(), &token, now()),
             PairingConsume::Rejected
         ));
     }
@@ -352,11 +342,10 @@ mod tests {
             .register_or_rebind(&store, PlanMetadata::Paid, 501, 77, now())
             .unwrap();
         let first_token = first_bootstrap.token.decode().unwrap();
-        let old_authority =
-            match first.consume(first_bootstrap.slot_id(), &first_token, 501, 77, now()) {
-                PairingConsume::Accepted(authority) => authority,
-                _ => panic!("first authority must be accepted"),
-            };
+        let old_authority = match first.consume(first_bootstrap.slot_id(), &first_token, now()) {
+            PairingConsume::Accepted(authority) => authority,
+            _ => panic!("first authority must be accepted"),
+        };
         drop(first);
         drop(store);
 
@@ -367,12 +356,12 @@ mod tests {
             .unwrap();
         assert!(fresh_bootstrap.epoch() > old_authority.epoch);
         assert!(matches!(
-            resumed.consume(first_bootstrap.slot_id(), &first_token, 501, 77, now()),
+            resumed.consume(first_bootstrap.slot_id(), &first_token, now()),
             PairingConsume::Rejected
         ));
         let fresh_token = fresh_bootstrap.token.decode().unwrap();
         assert!(matches!(
-            resumed.consume(fresh_bootstrap.slot_id(), &fresh_token, 501, 78, now()),
+            resumed.consume(fresh_bootstrap.slot_id(), &fresh_token, now()),
             PairingConsume::Accepted(_)
         ));
         assert!(resumed_store
@@ -410,30 +399,28 @@ mod tests {
         let paid_table = table.clone();
         let paid_barrier = barrier.clone();
         let paid_worker = std::thread::spawn(move || {
-            let authority =
-                match paid_table
-                    .lock()
-                    .unwrap()
-                    .consume(&paid_slot, &paid_token, 501, 77, now())
-                {
-                    PairingConsume::Accepted(authority) => authority,
-                    _ => panic!("paid pairing must be independent"),
-                };
+            let authority = match paid_table
+                .lock()
+                .unwrap()
+                .consume(&paid_slot, &paid_token, now())
+            {
+                PairingConsume::Accepted(authority) => authority,
+                _ => panic!("paid pairing must be independent"),
+            };
             paid_barrier.wait();
             authority
         });
         let free_table = table.clone();
         let free_barrier = barrier.clone();
         let free_worker = std::thread::spawn(move || {
-            let authority =
-                match free_table
-                    .lock()
-                    .unwrap()
-                    .consume(&free_slot, &free_token, 501, 78, now())
-                {
-                    PairingConsume::Accepted(authority) => authority,
-                    _ => panic!("free pairing must be independent"),
-                };
+            let authority = match free_table
+                .lock()
+                .unwrap()
+                .consume(&free_slot, &free_token, now())
+            {
+                PairingConsume::Accepted(authority) => authority,
+                _ => panic!("free pairing must be independent"),
+            };
             free_barrier.wait();
             authority
         });

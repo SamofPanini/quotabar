@@ -126,61 +126,70 @@ impl ValidationNamespace {
     /// unknown object is removed; the final root removal is `unlinkat` against
     /// the pinned parent descriptor rather than a path-based recursive API.
     pub(crate) fn cleanup(self) -> Result<(), NamespaceError> {
-        let root_stat = stat_fd(&self.root)?;
-        if !self.root_entry.matches(&root_stat) {
-            return Err(NamespaceError::Mismatch);
-        }
-        let parent_root =
-            stat_at(self.parent.as_raw_fd(), &self.root_name)?.ok_or(NamespaceError::Mismatch)?;
-        if !self.root_entry.matches(&parent_root) {
-            return Err(NamespaceError::Mismatch);
-        }
-        let manifest = self
-            .entries
-            .iter()
-            .find(|entry| entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes())
-            .ok_or(NamespaceError::Mismatch)?;
-        if parse_inventory(&read_file_at(self.root.as_raw_fd(), &manifest.name)?)?
-            != self
-                .entries
-                .iter()
-                .filter(|entry| entry.name.as_c_str().to_bytes() != MANIFEST.as_bytes())
-                .cloned()
-                .collect::<Vec<_>>()
+        // R4 supersedes automatic namespace cleanup.  Durable inventory is
+        // diagnostic evidence only; it is not deletion authority after a
+        // crash, replacement, or ambiguity.  Leave all disk evidence intact
+        // for a separately authorized manual procedure.
+        let _ = self;
+        return Err(NamespaceError::Mismatch);
+        #[allow(unreachable_code)]
         {
-            return Err(NamespaceError::Mismatch);
-        }
-        // Preflight the full manifest before unlinking anything.  In
-        // particular, an attacker-added or replaced entry cannot leave a
-        // partially cleaned namespace behind.
-        let actual = direct_names(&self.root)?;
-        let expected: BTreeSet<Vec<u8>> = self
-            .entries
-            .iter()
-            .map(|entry| entry.name.as_bytes().to_vec())
-            .collect();
-        if actual != expected {
-            return Err(NamespaceError::Mismatch);
-        }
-        // All entry identities must be checked before deletion begins.  The
-        // subsequent loop is mutation-only, preventing reverse-order partial
-        // cleanup when an earlier entry has been replaced in place.
-        for entry in &self.entries {
-            let stat =
-                stat_at(self.root.as_raw_fd(), &entry.name)?.ok_or(NamespaceError::Mismatch)?;
-            if !entry.matches(&stat) {
+            let root_stat = stat_fd(&self.root)?;
+            if !self.root_entry.matches(&root_stat) {
                 return Err(NamespaceError::Mismatch);
             }
+            let parent_root = stat_at(self.parent.as_raw_fd(), &self.root_name)?
+                .ok_or(NamespaceError::Mismatch)?;
+            if !self.root_entry.matches(&parent_root) {
+                return Err(NamespaceError::Mismatch);
+            }
+            let manifest = self
+                .entries
+                .iter()
+                .find(|entry| entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes())
+                .ok_or(NamespaceError::Mismatch)?;
+            if parse_inventory(&read_file_at(self.root.as_raw_fd(), &manifest.name)?)?
+                != self
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.name.as_c_str().to_bytes() != MANIFEST.as_bytes())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            {
+                return Err(NamespaceError::Mismatch);
+            }
+            // Preflight the full manifest before unlinking anything.  In
+            // particular, an attacker-added or replaced entry cannot leave a
+            // partially cleaned namespace behind.
+            let actual = direct_names(&self.root)?;
+            let expected: BTreeSet<Vec<u8>> = self
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_bytes().to_vec())
+                .collect();
+            if actual != expected {
+                return Err(NamespaceError::Mismatch);
+            }
+            // All entry identities must be checked before deletion begins.  The
+            // subsequent loop is mutation-only, preventing reverse-order partial
+            // cleanup when an earlier entry has been replaced in place.
+            for entry in &self.entries {
+                let stat =
+                    stat_at(self.root.as_raw_fd(), &entry.name)?.ok_or(NamespaceError::Mismatch)?;
+                if !entry.matches(&stat) {
+                    return Err(NamespaceError::Mismatch);
+                }
+            }
+            for entry in self.entries.iter().rev() {
+                let is_manifest = entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes();
+                unlink_at(
+                    self.root.as_raw_fd(),
+                    &entry.name,
+                    if is_manifest { 0 } else { libc::AT_REMOVEDIR },
+                )?;
+            }
+            unlink_at(self.parent.as_raw_fd(), &self.root_name, libc::AT_REMOVEDIR)
         }
-        for entry in self.entries.iter().rev() {
-            let is_manifest = entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes();
-            unlink_at(
-                self.root.as_raw_fd(),
-                &entry.name,
-                if is_manifest { 0 } else { libc::AT_REMOVEDIR },
-            )?;
-        }
-        unlink_at(self.parent.as_raw_fd(), &self.root_name, libc::AT_REMOVEDIR)
     }
 
     fn persist_inventory(&mut self) -> Result<(), NamespaceError> {
@@ -453,13 +462,19 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_cleanup_is_bounded() {
+    fn cleanup_preserves_inventory_for_manual_handling() {
         let root = root();
         let mut namespace = ValidationNamespace::prepare(root.clone()).unwrap();
         namespace.create_private_dir("slots").unwrap();
         namespace.create_private_dir("observer").unwrap();
-        namespace.cleanup().unwrap();
-        assert!(!root.exists());
+        assert_eq!(namespace.cleanup().unwrap_err(), NamespaceError::Mismatch);
+        assert!(root.join(MANIFEST).exists());
+        assert!(root.join("slots").exists());
+        assert!(root.join("observer").exists());
+        let _ = fs::remove_dir(root.join("slots"));
+        let _ = fs::remove_dir(root.join("observer"));
+        let _ = fs::remove_file(root.join(MANIFEST));
+        let _ = fs::remove_dir(root);
     }
 
     #[test]

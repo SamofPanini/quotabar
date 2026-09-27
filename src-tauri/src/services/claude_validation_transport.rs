@@ -1,8 +1,8 @@
-//! Bounded Unix-domain ingress for the synthetic C3-B1A process boundary.
+//! Bounded inherited Unix socketpair transport for the synthetic C3-B1A boundary.
 //!
 //! There is intentionally no production listener constructor or Tauri wiring.
-//! Tests create a task-owned socket root and pass an already accepted stream to
-//! the crate-private session handler.
+//! Tests create a private anonymous socketpair and pass its owned parent end to
+//! the crate-private session handler. There is no filesystem endpoint.
 
 use super::claude_snapshot::{
     AccountSlotId, ClaudeSnapshotStore, PlanMetadata, SafeErrorCode, SourceClass, WindowKind,
@@ -14,22 +14,14 @@ use super::claude_validation_pairing::{PairingConsume, PairingTable, SessionAuth
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
-use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
 use zeroize::Zeroizing;
 
 const HANDSHAKE_MAX: usize = 1024;
 const FRAME_MAX: usize = 16 * 1024;
 const SESSION_MAX_FRAMES: usize = 8;
 const SESSION_MAX_BYTES: usize = 128 * 1024;
-const SOCKET_NAME: &str = "v1.sock";
-const SOCKET_MANIFEST: &str = ".quotabar-c3b1-socket-owner";
-const SOCKET_PID: &str = ".quotabar-c3b1-socket-pid";
-const SOCKET_MANIFEST_BYTES: &[u8] = b"quotabar-c3b1-socket-owner-v1\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportError {
@@ -38,22 +30,7 @@ pub(crate) enum TransportError {
     Io,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PeerCredentials {
-    pub(crate) uid: u32,
-    pub(crate) pid: u32,
-}
-
-/// A task-owned fixed root whose mode/owner are checked before a socket name
-/// is admitted.  Listener construction remains crate-private and unwired.
-pub(crate) struct SocketRoot {
-    root: PathBuf,
-    descriptor: fs::File,
-    dev: u64,
-    ino: u64,
-}
-
-impl SocketRoot {
+/*
     pub(crate) fn for_synthetic(root: PathBuf) -> Result<Self, TransportError> {
         let expected_name = format!("quotabar-c3b1-{}", unsafe { libc::geteuid() });
         if root.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
@@ -379,19 +356,18 @@ pub(crate) fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials, T
         Err(TransportError::Rejected)
     }
 }
+*/
 
-/// Handles one already accepted, UID/PID-authenticated synthetic stream. The
-/// caller must obtain peer credentials before this function; lack of that
-/// proof is a terminal reject and this function has no bypass argument.
+/// Handles an owned parent end of a private inherited socketpair. The spawn
+/// owner proves delivery by retaining the sole parent end; no socket peer PID
+/// is claimed to identify the eventual child writer.
 pub(crate) fn handle_authenticated_session(
     stream: &mut UnixStream,
     store: &ClaudeSnapshotStore,
     pairing: &mut PairingTable,
-    peer_uid: u32,
-    peer_pid: u32,
     now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
-    let authority = authenticate_session(stream, pairing, peer_uid, peer_pid, now)?;
+    let authority = authenticate_session(stream, pairing, now)?;
     handle_session_loop(stream, store, authority, now)
 }
 
@@ -401,8 +377,6 @@ pub(crate) fn handle_authenticated_session(
 pub(crate) fn authenticate_session(
     stream: &mut UnixStream,
     pairing: &mut PairingTable,
-    peer_uid: u32,
-    peer_pid: u32,
     now: DateTime<Utc>,
 ) -> Result<SessionAuthority, TransportError> {
     stream
@@ -413,7 +387,7 @@ pub(crate) fn authenticate_session(
         .map_err(|_| TransportError::Io)?;
     let handshake = read_secret_frame(stream, HANDSHAKE_MAX)?;
     let (slot, token) = parse_handshake(&handshake)?;
-    match pairing.consume(&slot, &token, peer_uid, peer_pid, now) {
+    match pairing.consume(&slot, &token, now) {
         PairingConsume::Accepted(authority) => {
             write_fixed_result(stream, "accepted")?;
             Ok(authority)
@@ -810,15 +784,14 @@ mod tests {
     use super::super::claude_validation_pairing::PairingTable;
     use super::*;
     use std::io::{Read, Write};
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
     use uuid::Uuid;
 
     const CHILD_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD";
 
-    fn socket_root(label: &str) -> PathBuf {
+    /*fn socket_root(label: &str) -> PathBuf {
         let parent =
             PathBuf::from("/private/tmp").join(format!("qt-c3b1-{label}-{}", Uuid::new_v4()));
         std::fs::create_dir(&parent).unwrap();
@@ -868,7 +841,7 @@ mod tests {
         std::fs::write(root.join(SOCKET_NAME), b"ordinary").unwrap();
         assert_eq!(socket_root.bind().unwrap_err(), TransportError::Rejected);
         std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
-    }
+    }*/
 
     fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
         stream
@@ -901,10 +874,6 @@ mod tests {
             synthetic_child();
             return;
         }
-        let root = socket_root("reexec");
-        let socket_root = SocketRoot::for_synthetic(root.clone()).unwrap();
-        let endpoint = socket_root.socket_path().unwrap();
-        let listener = socket_root.bind().unwrap();
         let (mut parent_bootstrap, child_bootstrap) = UnixStream::pair().unwrap();
         let child_fd = child_bootstrap.as_raw_fd();
         let mut child = unsafe {
@@ -921,7 +890,8 @@ mod tests {
                 .unwrap()
         };
         drop(child_bootstrap);
-        let store = ClaudeSnapshotStore::at_root(root.join("state")).unwrap();
+        let root = std::env::temp_dir().join(format!("quotabar-c3b1-r4-{}", Uuid::new_v4()));
+        let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
         let mut pairing = PairingTable::new();
         let now = chrono::Utc::now();
         let bootstrap = pairing
@@ -933,42 +903,26 @@ mod tests {
                 now,
             )
             .unwrap();
-        let endpoint = endpoint.as_os_str().as_encoded_bytes();
         let slot = bootstrap.slot_id().as_str().as_bytes();
         let token = bootstrap.token_bytes_for_synthetic_child();
         let probe = synthetic_handshake(slot, token);
         assert!(parse_handshake(&probe).is_ok());
-        let mut bytes = Zeroizing::new(Vec::with_capacity(
-            2 + endpoint.len() + slot.len() + token.len(),
-        ));
-        bytes.extend_from_slice(&(endpoint.len() as u16).to_be_bytes());
-        bytes.extend_from_slice(endpoint);
+        let mut bytes = Zeroizing::new(Vec::with_capacity(slot.len() + token.len()));
         bytes.extend_from_slice(slot);
         bytes.extend_from_slice(token);
         write_frame(&mut parent_bootstrap, &bytes);
-        drop(parent_bootstrap);
-        let (mut accepted, _) = listener.accept().unwrap();
-        let peer = peer_credentials(&accepted).unwrap();
-        assert_eq!(peer.uid, unsafe { libc::geteuid() });
-        assert_eq!(peer.pid, child.id());
-        handle_authenticated_session(&mut accepted, &store, &mut pairing, peer.uid, peer.pid, now)
-            .unwrap();
+        handle_authenticated_session(&mut parent_bootstrap, &store, &mut pairing, now).unwrap();
         assert!(child.wait().unwrap().success());
-        std::fs::remove_file(socket_root.root.join(SOCKET_NAME)).unwrap();
-        std::fs::remove_dir(root.join("state")).unwrap_or(());
-        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(root).unwrap_or(());
     }
 
     fn synthetic_child() {
         let mut bootstrap = unsafe { UnixStream::from_raw_fd(3) };
         let payload = Zeroizing::new(read_frame_for_test(&mut bootstrap));
-        let endpoint_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-        let endpoint_end = 2 + endpoint_len;
-        let slot_end = endpoint_end + 36;
-        let endpoint = std::str::from_utf8(&payload[2..endpoint_end]).unwrap();
-        let slot = &payload[endpoint_end..slot_end];
+        let slot_end = 36;
+        let slot = &payload[..slot_end];
         let token = &payload[slot_end..];
-        let mut stream = UnixStream::connect(endpoint).unwrap();
+        let mut stream = bootstrap;
         let handshake = synthetic_handshake(slot, token);
         write_frame(&mut stream, &handshake);
         assert_eq!(
