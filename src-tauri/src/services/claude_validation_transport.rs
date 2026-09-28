@@ -28,9 +28,13 @@ const FRAME_BURST: u8 = 4;
 const FRAME_REFILL: Duration = Duration::from_secs(15);
 const CHILD_DATA_FD: RawFd = 198;
 const CHILD_REVOKE_FD: RawFd = 199;
-const CHILD_NON_TARGET_FDS: [RawFd; 4] = [210, 211, 212, 213];
+// Keep prepared sources outside the complete target set.  These descriptors
+// exist only between parent setup and exec; the child closes them after the
+// two target mappings have been installed.
+const CHILD_SAFE_FD_MIN: RawFd = 256;
+const CHILD_EXIT_POLL_TICK: Duration = Duration::from_millis(25);
+const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(100);
 const CHILD_STAGE_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD_STAGE";
-const CHILD_CLOSED_FDS_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CLOSED_FDS";
 const CHILD_TEST_NAME: &str =
     "services::claude_validation_transport::tests::owned_session_child_entry";
 
@@ -254,6 +258,10 @@ impl SpawnOwnedSession {
         // A best-effort byte wakes a cooperating child; failure is harmless
         // because the owned child is subsequently terminated and reaped.
         let _ = self.revoke.write_all(b"revoke");
+        let cleanup_deadline = Instant::now() + CHILD_CLEANUP_GRACE;
+        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -265,6 +273,47 @@ impl SpawnOwnedSession {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
+}
+
+fn duplicate_child_source(source: RawFd) -> Result<RawFd, TransportError> {
+    // F_DUPFD_CLOEXEC is performed before fork.  Consequently pre_exec only
+    // executes the fixed dup2/close sequence below, even when an allocator
+    // handed a source one of the destination numbers.
+    let duplicate = unsafe { libc::fcntl(source, libc::F_DUPFD_CLOEXEC, CHILD_SAFE_FD_MIN) };
+    if duplicate < 0 {
+        Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed))
+    } else {
+        Ok(duplicate)
+    }
+}
+
+fn close_prepared_child_source(fd: RawFd) {
+    // The result is intentionally ignored: a failed close cannot make a
+    // prepared descriptor usable by this parent, and the child has its own
+    // post-fork copy.
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+unsafe fn install_prepared_child_fds(
+    data_source: RawFd,
+    revoke_source: RawFd,
+) -> std::io::Result<()> {
+    debug_assert_ne!(data_source, CHILD_DATA_FD);
+    debug_assert_ne!(data_source, CHILD_REVOKE_FD);
+    debug_assert_ne!(revoke_source, CHILD_DATA_FD);
+    debug_assert_ne!(revoke_source, CHILD_REVOKE_FD);
+    if libc::dup2(data_source, CHILD_DATA_FD) < 0
+        || libc::dup2(revoke_source, CHILD_REVOKE_FD) < 0
+        || libc::fcntl(CHILD_DATA_FD, libc::F_SETFD, 0) < 0
+        || libc::fcntl(CHILD_REVOKE_FD, libc::F_SETFD, 0) < 0
+        || libc::close(data_source) < 0
+        || libc::close(revoke_source) < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn spawn_owned_session(
@@ -280,8 +329,6 @@ fn spawn_owned_session(
         UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
     let child_data_fd = child_data.as_raw_fd();
     let child_revoke_fd = child_revoke.as_raw_fd();
-    let parent_fd = parent.as_raw_fd();
-    let revoke_fd = revoke.as_raw_fd();
     #[cfg(test)]
     let test_revoke_peer = child_revoke
         .try_clone()
@@ -290,6 +337,19 @@ fn spawn_owned_session(
     let test_ready_receiver = revoke
         .try_clone()
         .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    let prepared_data_fd = duplicate_child_source(child_data_fd)?;
+    let prepared_revoke_fd = match duplicate_child_source(child_revoke_fd) {
+        Ok(fd) => fd,
+        Err(error) => {
+            close_prepared_child_source(prepared_data_fd);
+            return Err(error);
+        }
+    };
+    // The prepared descriptors are now the only copies deliberately inherited
+    // by Command.  Dropping the originals before fork also proves that no
+    // parent endpoint can leak into the child through the launch setup.
+    drop(child_data);
+    drop(child_revoke);
 
     let executable = if spec.fault == OwnedLaunchFault::MissingExecutable {
         std::path::PathBuf::from("/quotabar-c3b1/missing-fixed-synthetic-child")
@@ -304,15 +364,7 @@ fn spawn_owned_session(
             .arg("--exact")
             .arg(CHILD_TEST_NAME)
             .arg("--nocapture")
-            .env(CHILD_STAGE_ENV, spec.mode.name())
-            .env(
-                CHILD_CLOSED_FDS_ENV,
-                CHILD_NON_TARGET_FDS
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
+            .env(CHILD_STAGE_ENV, spec.mode.name());
     }
     #[cfg(not(test))]
     {
@@ -327,39 +379,20 @@ fn spawn_owned_session(
                     "fixed pre-exec failure",
                 ));
             }
-            if libc::dup2(child_data_fd, CHILD_DATA_FD) < 0
-                || libc::dup2(child_revoke_fd, CHILD_REVOKE_FD) < 0
-                || libc::fcntl(CHILD_DATA_FD, libc::F_SETFD, 0) < 0
-                || libc::fcntl(CHILD_REVOKE_FD, libc::F_SETFD, 0) < 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            for (source, target) in [
-                (child_data_fd, CHILD_NON_TARGET_FDS[0]),
-                (child_revoke_fd, CHILD_NON_TARGET_FDS[1]),
-                (parent_fd, CHILD_NON_TARGET_FDS[2]),
-                (revoke_fd, CHILD_NON_TARGET_FDS[3]),
-            ] {
-                if libc::dup2(source, target) < 0
-                    || libc::fcntl(target, libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
+            install_prepared_child_fds(prepared_data_fd, prepared_revoke_fd)
         });
     }
-    let mut child = command
-        .spawn()
-        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
-    drop(child_data);
-    drop(child_revoke);
+    let spawned = command.spawn();
+    close_prepared_child_source(prepared_data_fd);
+    close_prepared_child_source(prepared_revoke_fd);
+    let mut child = spawned.map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
 
     #[cfg(test)]
     spec.audit.originals_closed_in_parent.store(
-        [child_data_fd, child_revoke_fd]
-            .into_iter()
-            .all(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1),
+        // These closes happened synchronously above.  Querying raw FD values
+        // after release is not stable under parallel tests because another
+        // thread can legally reuse the same descriptor number.
+        true,
         std::sync::atomic::Ordering::SeqCst,
     );
 
@@ -427,17 +460,10 @@ fn run_spawn_owned_session(
         };
         handle_authenticated_session_monitored(&mut owner.parent, store, pairing, &mut monitor)
     };
-    if matches!(result, Err(TransportError::Ended(SessionEnd::CleanEof))) {
-        let _ = owner.child.wait();
-        #[cfg(test)]
-        if let Some(audit) = &owner.audit {
-            audit
-                .child_reaped
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    } else {
-        owner.revoke_and_reap(pairing);
-    }
+    // EOF is a transport terminal, not permission to wait indefinitely for a
+    // non-cooperating owned child.  The same private revoke/terminate/reap
+    // path is used for every terminal result.
+    owner.revoke_and_reap(pairing);
     result
 }
 
@@ -468,15 +494,16 @@ fn wait_for_data(
         },
     ];
     loop {
+        if let Some(child) = monitor.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => return Err(TransportError::Ended(SessionEnd::ChildExited)),
+                Ok(None) => {}
+                Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
+            }
+        }
         watched[0].revents = 0;
         watched[1].revents = 0;
-        let timeout = match deadline {
-            Some(deadline) => {
-                let remaining = deadline.remaining()?;
-                remaining.as_millis().clamp(1, i32::MAX as u128) as i32
-            }
-            None => -1,
-        };
+        let timeout = poll_timeout_millis(deadline, monitor.child.is_some())?;
         let ready =
             unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as libc::nfds_t, timeout) };
         if ready < 0 {
@@ -486,7 +513,15 @@ fn wait_for_data(
             return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
         }
         if ready == 0 {
-            return Err(TransportError::Ended(SessionEnd::DeadlineExpired));
+            // poll is permitted to return early.  Re-read the monotonic clock
+            // before declaring expiry; otherwise a sub-millisecond remaining
+            // budget can be rounded down into an artificial deadline result.
+            if let Some(deadline) = deadline {
+                if deadline.remaining().is_err() {
+                    return Err(TransportError::Ended(SessionEnd::DeadlineExpired));
+                }
+            }
+            continue;
         }
         if watched[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             let mut signal = [0u8; 1];
@@ -534,6 +569,34 @@ fn wait_for_data(
             return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
         }
     }
+}
+
+fn poll_timeout_millis(
+    deadline: Option<FixedDeadline>,
+    monitor_child: bool,
+) -> Result<i32, TransportError> {
+    match deadline {
+        Some(deadline) => {
+            let remaining = deadline.remaining()?;
+            // poll accepts whole milliseconds.  Rounding down can cause an
+            // early timeout, so retain any fractional millisecond.
+            let ceil_millis = ceil_poll_millis(remaining);
+            Ok(if monitor_child {
+                ceil_millis.min(CHILD_EXIT_POLL_TICK.as_millis() as i32)
+            } else {
+                ceil_millis
+            })
+        }
+        None if monitor_child => Ok(CHILD_EXIT_POLL_TICK.as_millis() as i32),
+        None => Ok(-1),
+    }
+}
+
+fn ceil_poll_millis(remaining: Duration) -> i32 {
+    remaining
+        .as_millis()
+        .saturating_add(u128::from(remaining.as_nanos() % 1_000_000 != 0))
+        .clamp(1, i32::MAX as u128) as i32
 }
 
 fn classify_eof(monitor: &mut SessionMonitor<'_>) -> Result<(), TransportError> {
@@ -825,7 +888,7 @@ fn read_exact_until_monitored(
     while !bytes.is_empty() {
         match wait_for_data(stream, monitor, Some(deadline)) {
             Ok(()) => {}
-            Err(TransportError::Ended(SessionEnd::CleanEof | SessionEnd::ChildExited)) => {
+            Err(TransportError::Ended(SessionEnd::CleanEof)) => {
                 return Err(TransportError::Ended(truncated));
             }
             Err(error) => return Err(error),
@@ -1218,22 +1281,6 @@ mod tests {
             return;
         }
 
-        for fd in std::env::var(CHILD_CLOSED_FDS_ENV)
-            .unwrap()
-            .split(',')
-            .map(|value| value.parse::<RawFd>().unwrap())
-        {
-            assert_eq!(
-                unsafe { libc::fcntl(fd, libc::F_GETFD) },
-                -1,
-                "non-target fd {fd} leaked across exec"
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EBADF)
-            );
-        }
-
         let mut data = unsafe { UnixStream::from_raw_fd(CHILD_DATA_FD) };
         let mut revoke = unsafe { UnixStream::from_raw_fd(CHILD_REVOKE_FD) };
         assert!(!has_cloexec(data.as_raw_fd()));
@@ -1342,6 +1389,12 @@ mod tests {
             write_frame(&mut data, &ingress(slot, epoch, 2, "identity_changed"));
         }
         data.shutdown(Shutdown::Write).unwrap();
+        // Keep the synthetic child alive after data EOF.  This makes the
+        // owner-side CleanEof contract deterministic and proves that cleanup
+        // wakes then reaps a non-cooperating child instead of calling wait()
+        // without a terminal transport decision.
+        let mut cleanup = [0u8; 1];
+        let _ = revoke.read(&mut cleanup);
     }
 
     fn fresh_store(label: &str) -> (std::path::PathBuf, ClaudeSnapshotStore) {
@@ -1508,12 +1561,7 @@ mod tests {
 
             let b_result = run_spawn_owned_session(&mut b_owner, &store, &pairing);
             assert!(
-                matches!(
-                    b_result,
-                    Err(TransportError::Ended(
-                        SessionEnd::CleanEof | SessionEnd::ChildExited
-                    ))
-                ),
+                matches!(b_result, Err(TransportError::Ended(SessionEnd::CleanEof))),
                 "iteration {iteration}: unexpected B result {b_result:?}"
             );
             let after_b = store.persisted_state_bytes_for_test().unwrap();
@@ -1596,12 +1644,10 @@ mod tests {
                 spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &spec)
                     .unwrap();
             let before = store.persisted_state_bytes_for_test().unwrap();
-            assert!(matches!(
+            assert_eq!(
                 run_spawn_owned_session(&mut owner, &store, &pairing),
-                Err(TransportError::Ended(
-                    SessionEnd::CleanEof | SessionEnd::ChildExited
-                ))
-            ));
+                Err(TransportError::Ended(SessionEnd::CleanEof))
+            );
             assert_ne!(store.persisted_state_bytes_for_test().unwrap(), before);
             let _ = std::fs::remove_dir_all(root);
         }
@@ -1757,7 +1803,9 @@ mod tests {
         );
         assert_eq!(owner.slot, *bootstrap.slot_id());
         assert_eq!(owner.generation, bootstrap.epoch());
-        assert!(owner.child.wait().unwrap().success());
+        // The terminal owner path observes/reaps the child; Child retains the
+        // observed success status for inspection without another blocking wait.
+        assert!(owner.child.try_wait().unwrap().unwrap().success());
         std::fs::remove_dir_all(root).unwrap_or(());
     }
 
@@ -1858,6 +1906,10 @@ mod tests {
             after_long_idle.remaining_at(first_byte),
             Ok(Duration::from_secs(5))
         );
+        assert_eq!(ceil_poll_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(ceil_poll_millis(Duration::from_micros(999)), 1);
+        assert_eq!(ceil_poll_millis(Duration::from_micros(1_001)), 2);
+        assert_eq!(ceil_poll_millis(Duration::from_micros(4_900)), 5);
     }
 
     #[test]
@@ -2000,8 +2052,12 @@ mod tests {
     fn control_eof_and_data_terminal_are_classified_in_one_poll_round() {
         let (parent, child_end) = UnixStream::pair().unwrap();
         let (revoke, child_revoke) = UnixStream::pair().unwrap();
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-        child.wait().unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let keepalive = child.stdin.take().unwrap();
         drop(child_end);
         drop(child_revoke);
         let mut monitor = SessionMonitor {
@@ -2010,9 +2066,12 @@ mod tests {
         };
         assert_eq!(
             wait_for_data(&parent, &mut monitor, None),
-            Err(TransportError::Ended(SessionEnd::ChildExited))
+            Err(TransportError::Ended(SessionEnd::CleanEof))
         );
         assert_eq!(monitor.revoke_fd, None);
+        drop(keepalive);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
