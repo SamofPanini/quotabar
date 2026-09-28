@@ -15,8 +15,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::process::Child;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -24,12 +26,35 @@ const HANDSHAKE_MAX: usize = 1024;
 const FRAME_MAX: usize = 16 * 1024;
 const FRAME_BURST: u8 = 4;
 const FRAME_REFILL: Duration = Duration::from_secs(15);
+const CHILD_DATA_FD: RawFd = 198;
+const CHILD_REVOKE_FD: RawFd = 199;
+const CHILD_NON_TARGET_FDS: [RawFd; 4] = [210, 211, 212, 213];
+const CHILD_STAGE_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD_STAGE";
+const CHILD_CLOSED_FDS_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CLOSED_FDS";
+const CHILD_TEST_NAME: &str =
+    "services::claude_validation_transport::tests::owned_session_child_entry";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportError {
     Rejected,
     Expired,
-    Io,
+    Ended(SessionEnd),
+}
+
+/// Fixed terminal classification for the owned production path.  It is kept
+/// separate from protocol parsing errors so EOF, truncation and revocation
+/// cannot be silently accepted as a normal frame-loop completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+    CleanEof,
+    HeaderTruncated,
+    PayloadTruncated,
+    DeadlineExpired,
+    ProtocolRejected,
+    ResourceLimited,
+    Revoked,
+    ChildExited,
+    WorkerOrStoreFailed,
 }
 
 /// Integer, per-session ingress limiter.  It bounds long sessions without a
@@ -37,6 +62,49 @@ pub(crate) enum TransportError {
 struct FrameBucket {
     tokens: u8,
     last_refill: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FixedDeadline {
+    expires_at: Instant,
+}
+
+impl FixedDeadline {
+    fn after(start: Instant, budget: Duration) -> Self {
+        Self {
+            expires_at: start + budget,
+        }
+    }
+
+    fn remaining_at(self, now: Instant) -> Result<Duration, TransportError> {
+        let remaining = self
+            .expires_at
+            .checked_duration_since(now)
+            .ok_or(TransportError::Ended(SessionEnd::DeadlineExpired))?;
+        if remaining.is_zero() {
+            Err(TransportError::Ended(SessionEnd::DeadlineExpired))
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn remaining(self) -> Result<Duration, TransportError> {
+        self.remaining_at(Instant::now())
+    }
+}
+
+struct SessionMonitor<'a> {
+    revoke_fd: Option<RawFd>,
+    child: Option<&'a mut Child>,
+}
+
+impl SessionMonitor<'_> {
+    fn disconnected() -> Self {
+        Self {
+            revoke_fd: None,
+            child: None,
+        }
+    }
 }
 
 /// Redacted, non-serializable ownership record for a synthetic child session.
@@ -48,6 +116,102 @@ struct SpawnOwnedSession {
     revoke: UnixStream,
     slot: AccountSlotId,
     generation: u64,
+    #[cfg(test)]
+    audit: Option<std::sync::Arc<TestLaunchAudit>>,
+    #[cfg(test)]
+    revoke_peer_for_test: Option<UnixStream>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedChildMode {
+    Session,
+    ExitBeforeRegistration,
+    ExitAfterBootstrap,
+    BlockAfterHandshakeByte,
+    SubmitAvailable,
+    SubmitUnavailable,
+    SubmitLifecycle,
+    RejectWrongSlot,
+    RejectOldEpoch,
+    RejectReplay,
+    RejectSkippedSequence,
+}
+
+impl OwnedChildMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::ExitBeforeRegistration => "exit-before-registration",
+            Self::ExitAfterBootstrap => "exit-after-bootstrap",
+            Self::BlockAfterHandshakeByte => "block-after-handshake-byte",
+            Self::SubmitAvailable => "submit-available",
+            Self::SubmitUnavailable => "submit-unavailable",
+            Self::SubmitLifecycle => "submit-lifecycle",
+            Self::RejectWrongSlot => "reject-wrong-slot",
+            Self::RejectOldEpoch => "reject-old-epoch",
+            Self::RejectReplay => "reject-replay",
+            Self::RejectSkippedSequence => "reject-skipped-sequence",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedLaunchFault {
+    None,
+    MissingExecutable,
+    PreExec,
+    BootstrapPartial,
+}
+
+#[derive(Clone, Debug)]
+struct OwnedLaunchSpec {
+    mode: OwnedChildMode,
+    fault: OwnedLaunchFault,
+    #[cfg(test)]
+    audit: std::sync::Arc<TestLaunchAudit>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestLaunchAudit {
+    originals_closed_in_parent: std::sync::atomic::AtomicBool,
+    child_reaped: std::sync::atomic::AtomicBool,
+}
+
+impl OwnedLaunchSpec {
+    fn production() -> Self {
+        Self {
+            mode: OwnedChildMode::Session,
+            fault: OwnedLaunchFault::None,
+            #[cfg(test)]
+            audit: std::sync::Arc::new(TestLaunchAudit::default()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl OwnedLaunchSpec {
+    fn test(mode: OwnedChildMode, fault: OwnedLaunchFault) -> Self {
+        Self {
+            mode,
+            fault,
+            audit: std::sync::Arc::new(TestLaunchAudit::default()),
+        }
+    }
+}
+
+/// Fixed crate-internal orchestration seam. Callers can select only app-owned
+/// slot metadata; executable identity, descriptors, launch mode, and bootstrap
+/// authority remain private to this module.
+pub(crate) fn run_owned_validation_session(
+    store: &ClaudeSnapshotStore,
+    pairing: &PairingRegistry,
+    plan: PlanMetadata,
+    now: DateTime<Utc>,
+) -> Result<(), TransportError> {
+    let spec = OwnedLaunchSpec::production();
+    let mut owner = spawn_owned_session(store, pairing, plan, now, &spec)?;
+    run_spawn_owned_session(&mut owner, store, pairing)
 }
 
 impl std::fmt::Debug for SpawnOwnedSession {
@@ -57,6 +221,29 @@ impl std::fmt::Debug for SpawnOwnedSession {
 }
 
 impl SpawnOwnedSession {
+    /// The only crate-private handoff from a successful child spawn.  It owns
+    /// every endpoint and the exact pairing generation; callers cannot build a
+    /// session from a filesystem endpoint, peer identity, or borrowed descriptor.
+    fn from_owned_spawn(
+        child: Child,
+        parent: UnixStream,
+        revoke: UnixStream,
+        slot: AccountSlotId,
+        generation: u64,
+    ) -> Self {
+        Self {
+            child,
+            parent,
+            revoke,
+            slot,
+            generation,
+            #[cfg(test)]
+            audit: None,
+            #[cfg(test)]
+            revoke_peer_for_test: None,
+        }
+    }
+
     fn revoke_and_reap(&mut self, pairing: &PairingRegistry) {
         pairing.revoke(&self.slot, self.generation);
         // This control endpoint is intentionally private to the spawn owner.
@@ -67,7 +254,154 @@ impl SpawnOwnedSession {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        #[cfg(test)]
+        if let Some(audit) = &self.audit {
+            audit
+                .child_reaped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
+}
+
+fn spawn_owned_session(
+    store: &ClaudeSnapshotStore,
+    pairing: &PairingRegistry,
+    plan: PlanMetadata,
+    now: DateTime<Utc>,
+    spec: &OwnedLaunchSpec,
+) -> Result<SpawnOwnedSession, TransportError> {
+    let (parent, child_data) =
+        UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    let (revoke, child_revoke) =
+        UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    let child_data_fd = child_data.as_raw_fd();
+    let child_revoke_fd = child_revoke.as_raw_fd();
+    let parent_fd = parent.as_raw_fd();
+    let revoke_fd = revoke.as_raw_fd();
+    #[cfg(test)]
+    let test_revoke_peer = child_revoke
+        .try_clone()
+        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+
+    let executable = if spec.fault == OwnedLaunchFault::MissingExecutable {
+        std::path::PathBuf::from("/quotabar-c3b1/missing-fixed-synthetic-child")
+    } else {
+        std::env::current_exe()
+            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?
+    };
+    let mut command = Command::new(executable);
+    #[cfg(test)]
+    {
+        command
+            .arg("--exact")
+            .arg(CHILD_TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_STAGE_ENV, spec.mode.name())
+            .env(
+                CHILD_CLOSED_FDS_ENV,
+                CHILD_NON_TARGET_FDS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+    }
+    #[cfg(not(test))]
+    {
+        command.arg("--quotabar-private-synthetic-child");
+    }
+    let force_pre_exec_failure = spec.fault == OwnedLaunchFault::PreExec;
+    unsafe {
+        command.pre_exec(move || {
+            if force_pre_exec_failure {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixed pre-exec failure",
+                ));
+            }
+            if libc::dup2(child_data_fd, CHILD_DATA_FD) < 0
+                || libc::dup2(child_revoke_fd, CHILD_REVOKE_FD) < 0
+                || libc::fcntl(CHILD_DATA_FD, libc::F_SETFD, 0) < 0
+                || libc::fcntl(CHILD_REVOKE_FD, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            for (source, target) in [
+                (child_data_fd, CHILD_NON_TARGET_FDS[0]),
+                (child_revoke_fd, CHILD_NON_TARGET_FDS[1]),
+                (parent_fd, CHILD_NON_TARGET_FDS[2]),
+                (revoke_fd, CHILD_NON_TARGET_FDS[3]),
+            ] {
+                if libc::dup2(source, target) < 0
+                    || libc::fcntl(target, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    drop(child_data);
+    drop(child_revoke);
+
+    #[cfg(test)]
+    spec.audit.originals_closed_in_parent.store(
+        [child_data_fd, child_revoke_fd]
+            .into_iter()
+            .all(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+
+    if spec.mode == OwnedChildMode::ExitBeforeRegistration {
+        let _ = child.wait();
+        #[cfg(test)]
+        spec.audit
+            .child_reaped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return Err(TransportError::Ended(SessionEnd::ChildExited));
+    }
+
+    let bootstrap = match pairing.register_or_rebind(store, plan, now) {
+        Ok(bootstrap) => bootstrap,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            #[cfg(test)]
+            spec.audit
+                .child_reaped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+        }
+    };
+    let mut owner = SpawnOwnedSession {
+        child,
+        parent,
+        revoke,
+        slot: bootstrap.slot_id().clone(),
+        generation: bootstrap.epoch(),
+        #[cfg(test)]
+        audit: Some(spec.audit.clone()),
+        #[cfg(test)]
+        revoke_peer_for_test: Some(test_revoke_peer),
+    };
+    let bootstrap_result = if spec.fault == OwnedLaunchFault::BootstrapPartial {
+        owner.parent.write_all(&[0, 0]).and_then(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "fixed partial bootstrap failure",
+            ))
+        })
+    } else {
+        bootstrap.write_private_payload(&mut owner.parent)
+    };
+    if bootstrap_result.is_err() {
+        owner.revoke_and_reap(pairing);
+        return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+    }
+    Ok(owner)
 }
 
 fn run_spawn_owned_session(
@@ -75,11 +409,121 @@ fn run_spawn_owned_session(
     store: &ClaudeSnapshotStore,
     pairing: &PairingRegistry,
 ) -> Result<(), TransportError> {
-    let result = handle_authenticated_session(&mut owner.parent, store, pairing);
-    if result.is_err() {
+    let revoke_fd = owner.revoke.as_raw_fd();
+    let result = {
+        let mut monitor = SessionMonitor {
+            revoke_fd: Some(revoke_fd),
+            child: Some(&mut owner.child),
+        };
+        handle_authenticated_session_monitored(&mut owner.parent, store, pairing, &mut monitor)
+    };
+    if matches!(result, Err(TransportError::Ended(SessionEnd::CleanEof))) {
+        let _ = owner.child.wait();
+        #[cfg(test)]
+        if let Some(audit) = &owner.audit {
+            audit
+                .child_reaped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    } else {
         owner.revoke_and_reap(pairing);
     }
     result
+}
+
+fn wait_for_first_byte_or_revoke(owner: &mut SpawnOwnedSession) -> Result<(), TransportError> {
+    let revoke_fd = owner.revoke.as_raw_fd();
+    let mut monitor = SessionMonitor {
+        revoke_fd: Some(revoke_fd),
+        child: Some(&mut owner.child),
+    };
+    wait_for_data(&owner.parent, &mut monitor, None)
+}
+
+fn wait_for_data(
+    stream: &UnixStream,
+    monitor: &mut SessionMonitor<'_>,
+    deadline: Option<FixedDeadline>,
+) -> Result<(), TransportError> {
+    let mut watched = [
+        libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: monitor.revoke_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        watched[0].revents = 0;
+        watched[1].revents = 0;
+        let timeout = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.remaining()?;
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+            }
+            None => -1,
+        };
+        let ready =
+            unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as libc::nfds_t, timeout) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+        }
+        if ready == 0 {
+            return Err(TransportError::Ended(SessionEnd::DeadlineExpired));
+        }
+        if watched[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let mut signal = [0u8; 1];
+            let read =
+                unsafe { libc::read(watched[1].fd, signal.as_mut_ptr().cast(), signal.len()) };
+            return if read == 1 && signal[0] == b'E' {
+                Err(TransportError::Ended(SessionEnd::ChildExited))
+            } else {
+                Err(TransportError::Ended(SessionEnd::Revoked))
+            };
+        }
+        if watched[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let mut probe = [0u8; 1];
+            let peeked = unsafe {
+                libc::recv(
+                    watched[0].fd,
+                    probe.as_mut_ptr().cast(),
+                    probe.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if peeked > 0 {
+                return Ok(());
+            }
+            if peeked == 0 {
+                return classify_eof(monitor);
+            }
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                continue;
+            }
+            return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+        }
+        if watched[0].revents & libc::POLLNVAL != 0 {
+            return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+        }
+    }
+}
+
+fn classify_eof(monitor: &mut SessionMonitor<'_>) -> Result<(), TransportError> {
+    match monitor.child.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(Some(_)) => Err(TransportError::Ended(SessionEnd::ChildExited)),
+            Ok(None) => Err(TransportError::Ended(SessionEnd::CleanEof)),
+            Err(_) => Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
+        },
+        None => Err(TransportError::Ended(SessionEnd::CleanEof)),
+    }
 }
 
 impl FrameBucket {
@@ -114,8 +558,18 @@ pub(crate) fn handle_authenticated_session(
     store: &ClaudeSnapshotStore,
     pairing: &PairingRegistry,
 ) -> Result<(), TransportError> {
-    let authority = authenticate_session(stream, pairing)?;
-    handle_session_loop(stream, store, authority)
+    let mut monitor = SessionMonitor::disconnected();
+    handle_authenticated_session_monitored(stream, store, pairing, &mut monitor)
+}
+
+fn handle_authenticated_session_monitored(
+    stream: &mut UnixStream,
+    store: &ClaudeSnapshotStore,
+    pairing: &PairingRegistry,
+    monitor: &mut SessionMonitor<'_>,
+) -> Result<(), TransportError> {
+    let authority = authenticate_session_monitored(stream, pairing, monitor)?;
+    handle_session_loop_monitored(stream, store, authority, monitor)
 }
 
 /// Authentication is the only phase that borrows the shared pairing table.
@@ -125,8 +579,21 @@ pub(crate) fn authenticate_session(
     stream: &mut UnixStream,
     pairing: &PairingRegistry,
 ) -> Result<SessionAuthority, TransportError> {
-    let handshake = read_secret_frame(stream, HANDSHAKE_MAX, Duration::from_secs(3))?;
-    let (slot, token) = parse_handshake(&handshake)?;
+    let mut monitor = SessionMonitor::disconnected();
+    authenticate_session_monitored(stream, pairing, &mut monitor)
+}
+
+fn authenticate_session_monitored(
+    stream: &mut UnixStream,
+    pairing: &PairingRegistry,
+    monitor: &mut SessionMonitor<'_>,
+) -> Result<SessionAuthority, TransportError> {
+    let handshake =
+        read_secret_frame_monitored(stream, HANDSHAKE_MAX, Duration::from_secs(3), monitor)?;
+    let (slot, token) = parse_handshake(&handshake).map_err(|error| match error {
+        TransportError::Rejected => TransportError::Ended(SessionEnd::ProtocolRejected),
+        other => other,
+    })?;
     match pairing.consume(&slot, &token) {
         PairingConsume::Accepted(authority) => {
             write_fixed_result(stream, "accepted", Duration::from_secs(5))?;
@@ -150,21 +617,37 @@ pub(crate) fn handle_session_loop(
     store: &ClaudeSnapshotStore,
     authority: SessionAuthority,
 ) -> Result<(), TransportError> {
+    let mut monitor = SessionMonitor::disconnected();
+    handle_session_loop_monitored(stream, store, authority, &mut monitor)
+}
+
+fn handle_session_loop_monitored(
+    stream: &mut UnixStream,
+    store: &ClaudeSnapshotStore,
+    authority: SessionAuthority,
+    monitor: &mut SessionMonitor<'_>,
+) -> Result<(), TransportError> {
     // No idle deadline: EOF is normal and a new frame may arrive arbitrarily late.
     stream
         .set_read_timeout(None)
-        .map_err(|_| TransportError::Io)?;
+        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
     let mut bucket = FrameBucket::new(Instant::now());
     let mut next_sequence = 1u64;
     loop {
-        let frame = match read_frame(stream, FRAME_MAX, &mut bucket) {
+        let frame = match read_frame_monitored(stream, FRAME_MAX, &mut bucket, monitor) {
             Ok(frame) => frame,
-            Err(TransportError::Io) => return Ok(()),
+            Err(TransportError::Ended(SessionEnd::CleanEof)) => {
+                return Err(TransportError::Ended(SessionEnd::CleanEof))
+            }
             Err(error) => return Err(error),
         };
-        let event = parse_ingress(&frame, &authority.slot_id, authority.epoch, authority.plan)?;
+        let event = parse_ingress(&frame, &authority.slot_id, authority.epoch, authority.plan)
+            .map_err(|error| match error {
+                TransportError::Rejected => TransportError::Ended(SessionEnd::ProtocolRejected),
+                other => other,
+            })?;
         if event.sequence != next_sequence {
-            return Err(TransportError::Rejected);
+            return Err(TransportError::Ended(SessionEnd::ProtocolRejected));
         }
         // Sampling at each commit boundary avoids a session-wide frozen UTC
         // observation timestamp; deadlines remain entirely monotonic above.
@@ -183,10 +666,10 @@ pub(crate) fn handle_session_loop(
             },
             Utc::now(),
         )
-        .map_err(|_| TransportError::Rejected)?;
+        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
         next_sequence = next_sequence
             .checked_add(1)
-            .ok_or(TransportError::Rejected)?;
+            .ok_or(TransportError::Ended(SessionEnd::ResourceLimited))?;
     }
 }
 
@@ -195,27 +678,58 @@ fn read_frame(
     max: usize,
     bucket: &mut FrameBucket,
 ) -> Result<Vec<u8>, TransportError> {
+    let mut monitor = SessionMonitor::disconnected();
+    read_frame_monitored(stream, max, bucket, &mut monitor)
+}
+
+fn read_frame_monitored(
+    stream: &mut UnixStream,
+    max: usize,
+    bucket: &mut FrameBucket,
+    monitor: &mut SessionMonitor<'_>,
+) -> Result<Vec<u8>, TransportError> {
     let mut length = [0u8; 4];
+    wait_for_data(stream, monitor, None)?;
     match stream.read(&mut length[..1]) {
-        Ok(0) => return Err(TransportError::Io),
+        Ok(0) => return classify_eof(monitor).and(Ok(Vec::new())),
         Ok(_) => {}
-        Err(_) => return Err(TransportError::Io),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            return Err(TransportError::Ended(SessionEnd::CleanEof))
+        }
+        Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
     }
     if !bucket.take(Instant::now()) {
-        return Err(TransportError::Rejected);
+        return Err(TransportError::Ended(SessionEnd::ResourceLimited));
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    read_exact_until(stream, &mut length[1..], deadline)?;
+    let deadline = FixedDeadline::after(Instant::now(), Duration::from_secs(5));
+    read_exact_until_monitored(
+        stream,
+        &mut length[1..],
+        deadline,
+        SessionEnd::HeaderTruncated,
+        monitor,
+    )?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > max {
-        return Err(TransportError::Rejected);
+        return Err(TransportError::Ended(SessionEnd::ResourceLimited));
     }
     let mut frame = vec![0; length];
-    read_exact_until(stream, &mut frame, deadline)?;
-    stream
-        .set_read_timeout(None)
-        .map_err(|_| TransportError::Io)?;
-    std::str::from_utf8(&frame).map_err(|_| TransportError::Rejected)?;
+    read_exact_until_monitored(
+        stream,
+        &mut frame,
+        deadline,
+        SessionEnd::PayloadTruncated,
+        monitor,
+    )?;
+    std::str::from_utf8(&frame).map_err(|_| TransportError::Ended(SessionEnd::ProtocolRejected))?;
     Ok(frame)
 }
 
@@ -227,40 +741,81 @@ fn read_secret_frame(
     max: usize,
     budget: Duration,
 ) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    let mut monitor = SessionMonitor::disconnected();
+    read_secret_frame_monitored(stream, max, budget, &mut monitor)
+}
+
+fn read_secret_frame_monitored(
+    stream: &mut UnixStream,
+    max: usize,
+    budget: Duration,
+    monitor: &mut SessionMonitor<'_>,
+) -> Result<Zeroizing<Vec<u8>>, TransportError> {
     let mut length = [0u8; 4];
     stream
         .set_read_timeout(None)
-        .map_err(|_| TransportError::Io)?;
-    stream
-        .read_exact(&mut length[..1])
-        .map_err(|_| TransportError::Io)?;
-    let deadline = Instant::now() + budget;
-    read_exact_until(stream, &mut length[1..], deadline)?;
+        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    wait_for_data(stream, monitor, None)?;
+    match stream.read(&mut length[..1]) {
+        Ok(0) => return classify_eof(monitor).and(Ok(Zeroizing::new(Vec::new()))),
+        Ok(_) => {}
+        Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
+    }
+    let deadline = FixedDeadline::after(Instant::now(), budget);
+    read_exact_until_monitored(
+        stream,
+        &mut length[1..],
+        deadline,
+        SessionEnd::HeaderTruncated,
+        monitor,
+    )?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > max {
-        return Err(TransportError::Rejected);
+        return Err(TransportError::Ended(SessionEnd::ResourceLimited));
     }
     let mut frame = Zeroizing::new(vec![0; length]);
-    read_exact_until(stream, &mut frame, deadline)?;
+    read_exact_until_monitored(
+        stream,
+        &mut frame,
+        deadline,
+        SessionEnd::PayloadTruncated,
+        monitor,
+    )?;
     Ok(frame)
 }
 
 fn read_exact_until(
     stream: &mut UnixStream,
+    bytes: &mut [u8],
+    deadline: FixedDeadline,
+    truncated: SessionEnd,
+) -> Result<(), TransportError> {
+    let mut monitor = SessionMonitor::disconnected();
+    read_exact_until_monitored(stream, bytes, deadline, truncated, &mut monitor)
+}
+
+fn read_exact_until_monitored(
+    stream: &mut UnixStream,
     mut bytes: &mut [u8],
-    deadline: Instant,
+    deadline: FixedDeadline,
+    truncated: SessionEnd,
+    monitor: &mut SessionMonitor<'_>,
 ) -> Result<(), TransportError> {
     while !bytes.is_empty() {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(TransportError::Io)?;
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| TransportError::Io)?;
+        match wait_for_data(stream, monitor, Some(deadline)) {
+            Ok(()) => {}
+            Err(TransportError::Ended(SessionEnd::CleanEof | SessionEnd::ChildExited)) => {
+                return Err(TransportError::Ended(truncated));
+            }
+            Err(error) => return Err(error),
+        }
         match stream.read(bytes) {
-            Ok(0) => return Err(TransportError::Io),
+            Ok(0) => return Err(TransportError::Ended(truncated)),
             Ok(read) => bytes = &mut bytes[read..],
-            Err(_) => return Err(TransportError::Io),
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(TransportError::Ended(SessionEnd::DeadlineExpired))
+            }
+            Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
         }
     }
     Ok(())
@@ -272,7 +827,7 @@ fn write_fixed_result(
     budget: Duration,
 ) -> Result<(), TransportError> {
     let bytes = format!("{{\"result\":\"{result}\"}}").into_bytes();
-    let deadline = Instant::now() + budget;
+    let deadline = FixedDeadline::after(Instant::now(), budget);
     write_all_until(stream, &(bytes.len() as u32).to_be_bytes(), deadline)?;
     write_all_until(stream, &bytes, deadline)
 }
@@ -280,19 +835,20 @@ fn write_fixed_result(
 fn write_all_until(
     stream: &mut UnixStream,
     mut bytes: &[u8],
-    deadline: Instant,
+    deadline: FixedDeadline,
 ) -> Result<(), TransportError> {
     while !bytes.is_empty() {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(TransportError::Io)?;
+        let remaining = deadline.remaining()?;
         stream
             .set_write_timeout(Some(remaining))
-            .map_err(|_| TransportError::Io)?;
+            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
         match stream.write(bytes) {
-            Ok(0) => return Err(TransportError::Io),
+            Ok(0) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
             Ok(written) => bytes = &bytes[written..],
-            Err(_) => return Err(TransportError::Io),
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(TransportError::Ended(SessionEnd::DeadlineExpired))
+            }
+            Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
         }
     }
     Ok(())
@@ -593,11 +1149,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::unix::io::{AsRawFd, FromRawFd};
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
+    use std::sync::atomic::Ordering;
     use uuid::Uuid;
-
-    const CHILD_STAGE_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD_STAGE";
 
     fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
         stream
@@ -628,6 +1181,429 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
     }
 
+    #[test]
+    fn owned_session_child_entry() {
+        let Ok(stage) = std::env::var(CHILD_STAGE_ENV) else {
+            return;
+        };
+        if stage == "owned-second-exec" {
+            for fd in [CHILD_DATA_FD, CHILD_REVOKE_FD] {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF)
+                );
+            }
+            return;
+        }
+
+        for fd in std::env::var(CHILD_CLOSED_FDS_ENV)
+            .unwrap()
+            .split(',')
+            .map(|value| value.parse::<RawFd>().unwrap())
+        {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) },
+                -1,
+                "non-target fd {fd} leaked across exec"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+
+        let mut data = unsafe { UnixStream::from_raw_fd(CHILD_DATA_FD) };
+        let mut revoke = unsafe { UnixStream::from_raw_fd(CHILD_REVOKE_FD) };
+        assert!(!has_cloexec(data.as_raw_fd()));
+        assert!(!has_cloexec(revoke.as_raw_fd()));
+        for fd in [data.as_raw_fd(), revoke.as_raw_fd()] {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+            assert!(has_cloexec(fd));
+        }
+        let second = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(CHILD_TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_STAGE_ENV, "owned-second-exec")
+            .status()
+            .unwrap();
+        assert!(second.success());
+
+        if stage == OwnedChildMode::ExitBeforeRegistration.name() {
+            return;
+        }
+        let payload = Zeroizing::new(read_frame_for_test(&mut data));
+        assert!(payload.len() > 44);
+        let slot = &payload[..36];
+        let epoch = u64::from_be_bytes(payload[36..44].try_into().unwrap());
+        let token = &payload[44..];
+        if stage == OwnedChildMode::ExitAfterBootstrap.name() {
+            revoke.write_all(b"E").unwrap();
+            return;
+        }
+        if stage == OwnedChildMode::BlockAfterHandshakeByte.name() {
+            data.write_all(&[0]).unwrap();
+            let mut signal = [0u8; 1];
+            revoke.read_exact(&mut signal).unwrap();
+            return;
+        }
+
+        let handshake = synthetic_handshake(slot, token);
+        write_frame(&mut data, &handshake);
+        assert_eq!(read_frame_for_test(&mut data), br#"{"result":"accepted"}"#);
+        if stage == OwnedChildMode::SubmitAvailable.name() {
+            let slot = std::str::from_utf8(slot).unwrap();
+            let observed = Utc::now();
+            let observed_text = observed.to_rfc3339_opts(SecondsFormat::Secs, true);
+            let five_reset =
+                (observed + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+            let weekly_reset =
+                (observed + chrono::Duration::days(7)).to_rfc3339_opts(SecondsFormat::Secs, true);
+            let frame = format!(
+                "{{\"event\":\"observation\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"1\",\"observedAt\":\"{observed_text}\",\"status\":\"available\",\"source\":\"completion_sse\",\"windows\":[{{\"kind\":\"five_hour\",\"usedPercent\":7,\"resetAt\":\"{five_reset}\"}},{{\"kind\":\"weekly\",\"usedPercent\":9,\"resetAt\":\"{weekly_reset}\"}}]}}"
+            );
+            write_frame(&mut data, frame.as_bytes());
+        } else if stage == OwnedChildMode::SubmitUnavailable.name() {
+            let slot = std::str::from_utf8(slot).unwrap();
+            let observed = Utc::now();
+            let observed_text = observed.to_rfc3339_opts(SecondsFormat::Secs, true);
+            let reset =
+                (observed + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+            let available = format!(
+                "{{\"event\":\"observation\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"1\",\"observedAt\":\"{observed_text}\",\"status\":\"available\",\"source\":\"completion_sse\",\"windows\":[{{\"kind\":\"five_hour\",\"usedPercent\":7,\"resetAt\":\"{reset}\"}}]}}"
+            );
+            write_frame(&mut data, available.as_bytes());
+            let unavailable = format!(
+                "{{\"event\":\"observation\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"2\",\"observedAt\":\"{observed_text}\",\"status\":\"unavailable\",\"errorCode\":\"unavailable\"}}"
+            );
+            write_frame(&mut data, unavailable.as_bytes());
+        } else if stage == OwnedChildMode::RejectReplay.name() {
+            let slot = std::str::from_utf8(slot).unwrap();
+            let observed = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            let frame = format!(
+                "{{\"event\":\"observation\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"1\",\"observedAt\":\"{observed}\",\"status\":\"unavailable\",\"errorCode\":\"unavailable\"}}"
+            );
+            write_frame(&mut data, frame.as_bytes());
+            let mut continue_signal = [0u8; 1];
+            revoke.read_exact(&mut continue_signal).unwrap();
+            write_frame(&mut data, frame.as_bytes());
+        } else if stage == OwnedChildMode::SubmitLifecycle.name() {
+            let slot = std::str::from_utf8(slot).unwrap();
+            let observed = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            let frame = format!(
+                "{{\"event\":\"continuity_uncertain\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"1\",\"observedAt\":\"{observed}\"}}"
+            );
+            write_frame(&mut data, frame.as_bytes());
+        } else if stage == OwnedChildMode::RejectWrongSlot.name() {
+            let frame = ingress(
+                "22222222-2222-4222-8222-222222222222",
+                epoch,
+                1,
+                "identity_changed",
+            );
+            write_frame(&mut data, &frame);
+        } else if stage == OwnedChildMode::RejectOldEpoch.name() {
+            let slot = std::str::from_utf8(slot).unwrap();
+            write_frame(
+                &mut data,
+                &ingress(slot, epoch.saturating_sub(1), 1, "identity_changed"),
+            );
+        } else if stage == OwnedChildMode::RejectSkippedSequence.name() {
+            let slot = std::str::from_utf8(slot).unwrap();
+            write_frame(&mut data, &ingress(slot, epoch, 2, "identity_changed"));
+        }
+        data.shutdown(Shutdown::Write).unwrap();
+    }
+
+    fn fresh_store(label: &str) -> (std::path::PathBuf, ClaudeSnapshotStore) {
+        let root = std::env::temp_dir().join(format!("quotabar-c3b1-{label}-{}", Uuid::new_v4()));
+        let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
+        (root, store)
+    }
+
+    fn wait_until_readable(fd: RawFd) {
+        let mut watched = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut watched, 1, 5_000) },
+            1,
+            "child barrier did not become readable"
+        );
+        assert_ne!(watched.revents & libc::POLLIN, 0);
+    }
+
+    fn wait_until_store_changes(store: &ClaudeSnapshotStore, before: &[u8]) -> Vec<u8> {
+        let watchdog = Instant::now() + Duration::from_secs(5);
+        loop {
+            let observed = store.persisted_state_bytes_for_test().unwrap();
+            if observed != before {
+                return observed;
+            }
+            assert!(Instant::now() < watchdog, "store change watchdog expired");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn production_owned_spawn_covers_failure_cleanup_and_fd_provenance() {
+        for fault in [
+            OwnedLaunchFault::MissingExecutable,
+            OwnedLaunchFault::PreExec,
+        ] {
+            let (root, store) = fresh_store("spawn-failure");
+            let pairing = PairingRegistry::new();
+            let spec = OwnedLaunchSpec::test(OwnedChildMode::Session, fault);
+            assert_eq!(
+                spawn_owned_session(
+                    &store,
+                    &pairing,
+                    PlanMetadata::Paid,
+                    chrono::Utc::now(),
+                    &spec,
+                )
+                .unwrap_err(),
+                TransportError::Ended(SessionEnd::WorkerOrStoreFailed)
+            );
+            assert_eq!(pairing.pending_count_for_test(), 0);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        let (root, store) = fresh_store("exit-before-registration");
+        let pairing = PairingRegistry::new();
+        let spec = OwnedLaunchSpec::test(
+            OwnedChildMode::ExitBeforeRegistration,
+            OwnedLaunchFault::None,
+        );
+        assert_eq!(
+            spawn_owned_session(
+                &store,
+                &pairing,
+                PlanMetadata::Paid,
+                chrono::Utc::now(),
+                &spec,
+            )
+            .unwrap_err(),
+            TransportError::Ended(SessionEnd::ChildExited)
+        );
+        assert!(spec.audit.originals_closed_in_parent.load(Ordering::SeqCst));
+        assert!(spec.audit.child_reaped.load(Ordering::SeqCst));
+        assert_eq!(pairing.pending_count_for_test(), 0);
+        let _ = std::fs::remove_dir_all(root);
+
+        let (root, store) = fresh_store("bootstrap-failure");
+        let pairing = PairingRegistry::new();
+        let spec =
+            OwnedLaunchSpec::test(OwnedChildMode::Session, OwnedLaunchFault::BootstrapPartial);
+        assert_eq!(
+            spawn_owned_session(
+                &store,
+                &pairing,
+                PlanMetadata::Paid,
+                chrono::Utc::now(),
+                &spec,
+            )
+            .unwrap_err(),
+            TransportError::Ended(SessionEnd::WorkerOrStoreFailed)
+        );
+        assert!(spec.audit.child_reaped.load(Ordering::SeqCst));
+        assert_eq!(pairing.pending_count_for_test(), 0);
+        let _ = std::fs::remove_dir_all(root);
+
+        for mode in [OwnedChildMode::ExitAfterBootstrap, OwnedChildMode::Session] {
+            let (root, store) = fresh_store("owned-session");
+            let pairing = PairingRegistry::new();
+            let spec = OwnedLaunchSpec::test(mode, OwnedLaunchFault::None);
+            let mut owner = spawn_owned_session(
+                &store,
+                &pairing,
+                PlanMetadata::Paid,
+                chrono::Utc::now(),
+                &spec,
+            )
+            .unwrap();
+            let result = run_spawn_owned_session(&mut owner, &store, &pairing);
+            let expected = if mode == OwnedChildMode::ExitAfterBootstrap {
+                SessionEnd::ChildExited
+            } else {
+                SessionEnd::CleanEof
+            };
+            assert_eq!(result, Err(TransportError::Ended(expected)));
+            assert!(spec.audit.originals_closed_in_parent.load(Ordering::SeqCst));
+            assert!(spec.audit.child_reaped.load(Ordering::SeqCst));
+            assert_eq!(pairing.pending_count_for_test(), 0);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn two_real_children_interleave_deterministically_for_25_iterations() {
+        for iteration in 0..25 {
+            let (root, store) = fresh_store("two-child");
+            let store = std::sync::Arc::new(store);
+            let pairing = std::sync::Arc::new(PairingRegistry::new());
+
+            let a_spec = OwnedLaunchSpec::test(
+                OwnedChildMode::BlockAfterHandshakeByte,
+                OwnedLaunchFault::None,
+            );
+            let mut a_owner =
+                spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &a_spec)
+                    .unwrap();
+            wait_until_readable(a_owner.parent.as_raw_fd());
+            let mut revoke_a = a_owner.revoke_peer_for_test.take().unwrap();
+
+            let b_mode = if iteration % 2 == 0 {
+                OwnedChildMode::SubmitAvailable
+            } else {
+                OwnedChildMode::SubmitUnavailable
+            };
+            let b_spec = OwnedLaunchSpec::test(b_mode, OwnedLaunchFault::None);
+            let mut b_owner =
+                spawn_owned_session(&store, &pairing, PlanMetadata::Free, Utc::now(), &b_spec)
+                    .unwrap();
+            let before_b = store.persisted_state_bytes_for_test().unwrap();
+
+            let a_store = store.clone();
+            let a_pairing = pairing.clone();
+            let a_worker = std::thread::spawn(move || {
+                run_spawn_owned_session(&mut a_owner, &a_store, &a_pairing)
+            });
+            assert!(pairing.try_lock_available_for_test());
+
+            let b_result = run_spawn_owned_session(&mut b_owner, &store, &pairing);
+            assert!(
+                matches!(
+                    b_result,
+                    Err(TransportError::Ended(
+                        SessionEnd::CleanEof | SessionEnd::ChildExited
+                    ))
+                ),
+                "iteration {iteration}: unexpected B result {b_result:?}"
+            );
+            let after_b = store.persisted_state_bytes_for_test().unwrap();
+            assert_ne!(
+                after_b, before_b,
+                "iteration {iteration}: B did not persist"
+            );
+
+            revoke_a.write_all(b"R").unwrap();
+            assert_eq!(
+                a_worker.join().unwrap(),
+                Err(TransportError::Ended(SessionEnd::Revoked))
+            );
+            assert_eq!(
+                store.persisted_state_bytes_for_test().unwrap(),
+                after_b,
+                "iteration {iteration}: A changed durable bytes"
+            );
+            assert!(a_spec.audit.child_reaped.load(Ordering::SeqCst));
+            assert!(b_spec.audit.child_reaped.load(Ordering::SeqCst));
+            assert_eq!(pairing.pending_count_for_test(), 0);
+
+            let projection = store.project(Utc::now()).unwrap();
+            let paid = projection
+                .slots
+                .iter()
+                .find(|slot| slot.plan == Some(PlanMetadata::Paid))
+                .unwrap();
+            let free = projection
+                .slots
+                .iter()
+                .find(|slot| slot.plan == Some(PlanMetadata::Free))
+                .unwrap();
+            assert_eq!(paid.five_hour.used_percent, None);
+            if b_mode == OwnedChildMode::SubmitAvailable {
+                assert_eq!(free.five_hour.used_percent, Some(7.0));
+            } else {
+                assert_eq!(free.five_hour.used_percent, Some(7.0));
+                assert_eq!(
+                    free.five_hour.last_error_code,
+                    Some(SafeErrorCode::Unavailable)
+                );
+            }
+            drop(store);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn production_owned_seam_covers_rejection_and_lifecycle_matrix() {
+        for mode in [
+            OwnedChildMode::RejectWrongSlot,
+            OwnedChildMode::RejectOldEpoch,
+            OwnedChildMode::RejectSkippedSequence,
+        ] {
+            let (root, store) = fresh_store("owned-reject");
+            let pairing = PairingRegistry::new();
+            let spec = OwnedLaunchSpec::test(mode, OwnedLaunchFault::None);
+            let mut owner =
+                spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &spec)
+                    .unwrap();
+            let before = store.persisted_state_bytes_for_test().unwrap();
+            assert_eq!(
+                run_spawn_owned_session(&mut owner, &store, &pairing),
+                Err(TransportError::Ended(SessionEnd::ProtocolRejected))
+            );
+            assert_eq!(store.persisted_state_bytes_for_test().unwrap(), before);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        for mode in [
+            OwnedChildMode::SubmitAvailable,
+            OwnedChildMode::SubmitUnavailable,
+            OwnedChildMode::SubmitLifecycle,
+        ] {
+            let (root, store) = fresh_store("owned-accepted");
+            let pairing = PairingRegistry::new();
+            let spec = OwnedLaunchSpec::test(mode, OwnedLaunchFault::None);
+            let mut owner =
+                spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &spec)
+                    .unwrap();
+            let before = store.persisted_state_bytes_for_test().unwrap();
+            assert!(matches!(
+                run_spawn_owned_session(&mut owner, &store, &pairing),
+                Err(TransportError::Ended(
+                    SessionEnd::CleanEof | SessionEnd::ChildExited
+                ))
+            ));
+            assert_ne!(store.persisted_state_bytes_for_test().unwrap(), before);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn production_owned_replay_preserves_bytes_after_first_commit() {
+        let (root, store) = fresh_store("owned-replay");
+        let store = std::sync::Arc::new(store);
+        let pairing = std::sync::Arc::new(PairingRegistry::new());
+        let spec = OwnedLaunchSpec::test(OwnedChildMode::RejectReplay, OwnedLaunchFault::None);
+        let mut owner =
+            spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &spec).unwrap();
+        let mut continue_child = owner.revoke.try_clone().unwrap();
+        let before = store.persisted_state_bytes_for_test().unwrap();
+        let worker_store = store.clone();
+        let worker_pairing = pairing.clone();
+        let worker = std::thread::spawn(move || {
+            run_spawn_owned_session(&mut owner, &worker_store, &worker_pairing)
+        });
+        let after_first = wait_until_store_changes(&store, &before);
+        continue_child.write_all(b"C").unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            Err(TransportError::Ended(SessionEnd::ProtocolRejected))
+        );
+        assert_eq!(store.persisted_state_bytes_for_test().unwrap(), after_first);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn run_production_transport_frames(
         plan: PlanMetadata,
         frames: Vec<Vec<u8>>,
@@ -652,9 +1628,6 @@ mod tests {
             for frame in frames {
                 write_frame(&mut client, &frame);
             }
-            // Keep the writer endpoint alive until the server has a chance to
-            // enter its post-auth frame loop; EOF is a distinct normal case.
-            std::thread::sleep(Duration::from_millis(20));
             client.shutdown(Shutdown::Write).unwrap();
         });
         let result = handle_authenticated_session(&mut server, &store, &pairing);
@@ -734,13 +1707,13 @@ mod tests {
         let bootstrap = pairing
             .register_or_rebind(&store, PlanMetadata::Paid, now)
             .unwrap();
-        let mut owner = SpawnOwnedSession {
+        let mut owner = SpawnOwnedSession::from_owned_spawn(
             child,
-            parent: parent_bootstrap,
-            revoke: parent_revoke,
-            slot: bootstrap.slot_id().clone(),
-            generation: bootstrap.epoch(),
-        };
+            parent_bootstrap,
+            parent_revoke,
+            bootstrap.slot_id().clone(),
+            bootstrap.epoch(),
+        );
         let slot = bootstrap.slot_id().as_str().as_bytes();
         let token = bootstrap.token_bytes_for_synthetic_child();
         let probe = synthetic_handshake(slot, token);
@@ -749,7 +1722,10 @@ mod tests {
         bytes.extend_from_slice(slot);
         bytes.extend_from_slice(token);
         write_frame(&mut owner.parent, &bytes);
-        run_spawn_owned_session(&mut owner, &store, &pairing).unwrap();
+        assert_eq!(
+            run_spawn_owned_session(&mut owner, &store, &pairing),
+            Err(TransportError::Ended(SessionEnd::CleanEof))
+        );
         assert_eq!(owner.slot, *bootstrap.slot_id());
         assert_eq!(owner.generation, bootstrap.epoch());
         assert!(owner.child.wait().unwrap().success());
@@ -804,6 +1780,58 @@ mod tests {
     }
 
     #[test]
+    fn secret_frame_distinguishes_header_and_payload_truncation() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&[0]).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(
+            read_secret_frame(&mut server, HANDSHAKE_MAX, Duration::from_secs(3)),
+            Err(TransportError::Ended(SessionEnd::HeaderTruncated))
+        );
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&3u32.to_be_bytes()).unwrap();
+        client.write_all(b"x").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(
+            read_secret_frame(&mut server, HANDSHAKE_MAX, Duration::from_secs(3)),
+            Err(TransportError::Ended(SessionEnd::PayloadTruncated))
+        );
+    }
+
+    #[test]
+    fn fixed_deadline_fake_clock_covers_edges_drip_and_long_idle() {
+        let start = Instant::now();
+        let deadline = FixedDeadline::after(start, Duration::from_secs(5));
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_millis(4_900)),
+            Ok(Duration::from_millis(100))
+        );
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_secs(5)),
+            Err(TransportError::Ended(SessionEnd::DeadlineExpired))
+        );
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_millis(5_001)),
+            Err(TransportError::Ended(SessionEnd::DeadlineExpired))
+        );
+
+        // Receiving additional drip bytes never creates a replacement
+        // deadline: every continuation read retains the original expires_at.
+        let after_drip = deadline;
+        assert_eq!(after_drip.expires_at, deadline.expires_at);
+
+        // Idle time before the first byte is intentionally unbounded.  The
+        // fixed framing budget begins only once that first byte is observed.
+        let first_byte = start + Duration::from_secs(60 * 60);
+        let after_long_idle = FixedDeadline::after(first_byte, Duration::from_secs(5));
+        assert_eq!(
+            after_long_idle.remaining_at(first_byte),
+            Ok(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
     fn per_session_bucket_has_fixed_burst_and_monotonic_refill_boundaries() {
         let start = Instant::now();
         let mut bucket = FrameBucket::new(start);
@@ -839,7 +1867,6 @@ mod tests {
         let blocked = std::thread::spawn(move || {
             handle_authenticated_session(&mut first_server, &first_store, &first_pairing)
         });
-        std::thread::sleep(Duration::from_millis(25));
         assert!(pairing.try_lock_available_for_test());
 
         let (mut second_server, mut second_client) = UnixStream::pair().unwrap();
@@ -851,10 +1878,13 @@ mod tests {
         second_client.shutdown(Shutdown::Write).unwrap();
         assert_eq!(
             handle_authenticated_session(&mut second_server, &store, &pairing),
-            Ok(())
+            Err(TransportError::Ended(SessionEnd::CleanEof))
         );
         first_client.shutdown(Shutdown::Both).unwrap();
-        assert!(matches!(blocked.join().unwrap(), Err(TransportError::Io)));
+        assert!(matches!(
+            blocked.join().unwrap(),
+            Err(TransportError::Ended(SessionEnd::HeaderTruncated))
+        ));
         // The blocked first handshake has not reached the consume point; the
         // available try-lock above is the lock-boundary evidence.
         assert_eq!(
@@ -876,20 +1906,20 @@ mod tests {
         let (parent, mut child_end) = UnixStream::pair().unwrap();
         let (revoke, _child_revoke) = UnixStream::pair().unwrap();
         let child = Command::new("/usr/bin/true").spawn().unwrap();
-        let mut owner = SpawnOwnedSession {
+        let mut owner = SpawnOwnedSession::from_owned_spawn(
             child,
             parent,
             revoke,
-            slot: bootstrap.slot_id().clone(),
-            generation: bootstrap.epoch(),
-        };
+            bootstrap.slot_id().clone(),
+            bootstrap.epoch(),
+        );
         // A malformed one-byte header fails before consume, then the owner
         // must revoke its still-pending authority and reap its exact child.
         child_end.write_all(&[0]).unwrap();
         child_end.shutdown(Shutdown::Write).unwrap();
         assert!(matches!(
             run_spawn_owned_session(&mut owner, &store, &pairing),
-            Err(TransportError::Io)
+            Err(TransportError::Ended(SessionEnd::HeaderTruncated))
         ));
         assert!(owner.child.try_wait().unwrap().is_some());
         assert!(matches!(
@@ -897,6 +1927,44 @@ mod tests {
             PairingConsume::Rejected
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_first_byte_wait_wakes_on_private_revoke_without_reading_data_fd() {
+        let (parent, _child_end) = UnixStream::pair().unwrap();
+        let (revoke, mut revoke_peer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let _keepalive = child.stdin.take().unwrap();
+        let slot = AccountSlotId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let mut owner = SpawnOwnedSession::from_owned_spawn(child, parent, revoke, slot, 1);
+        revoke_peer.write_all(b"x").unwrap();
+        assert_eq!(
+            wait_for_first_byte_or_revoke(&mut owner),
+            Err(TransportError::Ended(SessionEnd::Revoked))
+        );
+        let registry = PairingRegistry::new();
+        owner.revoke_and_reap(&registry);
+    }
+
+    #[test]
+    fn owned_first_byte_wait_distinguishes_child_exit_from_clean_peer_eof() {
+        let (parent, child_end) = UnixStream::pair().unwrap();
+        let (revoke, _revoke_peer) = UnixStream::pair().unwrap();
+        let child = Command::new("/usr/bin/true").spawn().unwrap();
+        let slot = AccountSlotId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let mut owner = SpawnOwnedSession::from_owned_spawn(child, parent, revoke, slot, 1);
+        owner.child.wait().unwrap();
+        drop(child_end);
+        assert_eq!(
+            wait_for_first_byte_or_revoke(&mut owner),
+            Err(TransportError::Ended(SessionEnd::ChildExited))
+        );
+        let registry = PairingRegistry::new();
+        owner.revoke_and_reap(&registry);
     }
 
     #[test]
@@ -909,7 +1977,7 @@ mod tests {
         let lifecycle = ingress(slot, 1, 2, "continuity_uncertain");
         assert_eq!(
             run_production_transport_frames(PlanMetadata::Paid, vec![unavailable, lifecycle]),
-            Ok(())
+            Err(TransportError::Ended(SessionEnd::CleanEof))
         );
     }
 
@@ -922,14 +1990,14 @@ mod tests {
                 PlanMetadata::Paid,
                 vec![ingress(free, 1, 1, "identity_changed")]
             ),
-            Err(TransportError::Rejected)
+            Err(TransportError::Ended(SessionEnd::ProtocolRejected))
         );
         assert_eq!(
             run_production_transport_frames(
                 PlanMetadata::Paid,
                 vec![ingress(paid, 1, 2, "identity_changed")]
             ),
-            Err(TransportError::Rejected)
+            Err(TransportError::Ended(SessionEnd::ProtocolRejected))
         );
     }
 

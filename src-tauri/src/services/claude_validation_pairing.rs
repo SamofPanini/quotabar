@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::Mutex;
 use std::time::{Duration as MonotonicDuration, Instant};
 use subtle::ConstantTimeEq;
@@ -131,6 +132,22 @@ impl fmt::Debug for PairingBootstrapV1 {
 }
 
 impl PairingBootstrapV1 {
+    /// Delivers the bootstrap authority directly to an already-owned private
+    /// descriptor without exposing a production token accessor.
+    pub(crate) fn write_private_payload(&self, writer: &mut impl Write) -> io::Result<()> {
+        let slot = self.slot_id.as_str().as_bytes();
+        let length = slot
+            .len()
+            .checked_add(std::mem::size_of::<u64>())
+            .and_then(|length| length.checked_add(self.token.as_bytes().len()))
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bootstrap overflow"))?;
+        writer.write_all(&length.to_be_bytes())?;
+        writer.write_all(slot)?;
+        writer.write_all(&self.epoch.to_be_bytes())?;
+        writer.write_all(self.token.as_bytes())
+    }
+
     #[cfg(test)]
     pub(crate) fn token_bytes_for_synthetic_child(&self) -> &[u8] {
         self.token.as_bytes()
@@ -314,6 +331,14 @@ impl PairingRegistry {
     #[cfg(test)]
     pub(crate) fn try_lock_available_for_test(&self) -> bool {
         self.sessions.try_lock().is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_count_for_test(&self) -> usize {
+        self.sessions
+            .lock()
+            .map(|table| table.sessions.len())
+            .unwrap_or(usize::MAX)
     }
 
     #[cfg(test)]
