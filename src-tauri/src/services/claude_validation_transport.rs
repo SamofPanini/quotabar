@@ -63,6 +63,7 @@ pub(crate) enum SessionEnd {
     ResourceLimited,
     Revoked,
     ChildExited,
+    CleanupFailed,
     WorkerOrStoreFailed,
 }
 
@@ -98,9 +99,48 @@ impl FixedDeadline {
     }
 
     fn remaining(self) -> Result<Duration, TransportError> {
-        self.remaining_at(Instant::now())
+        self.remaining_at(monotonic_now())
     }
 }
+
+fn monotonic_now() -> Instant {
+    #[cfg(test)]
+    {
+        return TEST_CLOCK_OFFSET
+            .with(|offset| Instant::now() + Duration::from_millis(offset.get()));
+    }
+    #[cfg(not(test))]
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCK_OFFSET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_CLOCK_ADVANCE_ON_EXACT_WAIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_CLOCK_STEP_PER_FRAME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn advance_test_clock_on_exact_wait() {
+    TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.with(|advance| {
+        if let Some(millis) = advance.take() {
+            TEST_CLOCK_OFFSET.with(|offset| offset.set(offset.get().saturating_add(millis)));
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn advance_test_clock_on_exact_wait() {}
+
+#[cfg(test)]
+fn advance_test_clock_for_frame() {
+    TEST_CLOCK_STEP_PER_FRAME.with(|step| {
+        TEST_CLOCK_OFFSET.with(|offset| offset.set(offset.get().saturating_add(step.get())));
+    });
+}
+
+#[cfg(not(test))]
+fn advance_test_clock_for_frame() {}
 
 struct SessionMonitor<'a> {
     revoke_fd: Option<RawFd>,
@@ -127,6 +167,8 @@ struct SpawnOwnedSession {
     generation: u64,
     #[cfg(test)]
     audit: Option<std::sync::Arc<TestLaunchAudit>>,
+    #[cfg(test)]
+    inject_cleanup_failure: bool,
 }
 
 /// An already-prepared child descriptor plan.  Construction occurs before
@@ -138,6 +180,33 @@ struct PreparedChildFdRemap {
     revoke_source: RawFd,
 }
 
+/// Parent-side ownership guard for descriptors prepared before fork.  The
+/// child receives independent post-fork copies; every parent early return
+/// drops this guard and closes both prepared sources exactly once.
+struct PreparedChildFdGuard {
+    plan: Option<PreparedChildFdRemap>,
+}
+
+impl PreparedChildFdGuard {
+    fn plan(&self) -> PreparedChildFdRemap {
+        self.plan
+            .expect("prepared child FD guard unexpectedly disarmed")
+    }
+
+    fn close_now(&mut self) {
+        if let Some(plan) = self.plan.take() {
+            close_prepared_child_source(plan.data_source);
+            close_prepared_child_source(plan.revoke_source);
+        }
+    }
+}
+
+impl Drop for PreparedChildFdGuard {
+    fn drop(&mut self) {
+        self.close_now();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OwnedChildMode {
     Session,
@@ -145,9 +214,15 @@ enum OwnedChildMode {
     ExitAfterBootstrap,
     ExitNonzeroAfterBootstrap,
     ExitAfterDataEof,
+    CooperativeEof,
     IgnoreRevokeAfterDataEof,
+    LongFirstByteSilence,
+    SlowDrip,
+    BurstFive,
+    RefillHundred,
     TruncatedHeader,
     BlockAfterHandshakeByte,
+    RevokeThenExit,
     SubmitAvailable,
     SubmitUnavailable,
     SubmitLifecycle,
@@ -165,9 +240,15 @@ impl OwnedChildMode {
             Self::ExitAfterBootstrap => "exit-after-bootstrap",
             Self::ExitNonzeroAfterBootstrap => "exit-nonzero-after-bootstrap",
             Self::ExitAfterDataEof => "exit-after-data-eof",
+            Self::CooperativeEof => "cooperative-eof",
             Self::IgnoreRevokeAfterDataEof => "ignore-revoke-after-data-eof",
+            Self::LongFirstByteSilence => "long-first-byte-silence",
+            Self::SlowDrip => "slow-drip",
+            Self::BurstFive => "burst-five",
+            Self::RefillHundred => "refill-hundred",
             Self::TruncatedHeader => "truncated-header",
             Self::BlockAfterHandshakeByte => "block-after-handshake-byte",
+            Self::RevokeThenExit => "revoke-then-exit",
             Self::SubmitAvailable => "submit-available",
             Self::SubmitUnavailable => "submit-unavailable",
             Self::SubmitLifecycle => "submit-lifecycle",
@@ -182,9 +263,12 @@ impl OwnedChildMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OwnedLaunchFault {
     None,
+    ExecutableResolution,
     MissingExecutable,
     PreExec,
+    RegisterFailure,
     BootstrapPartial,
+    BootstrapCleanupFailure,
 }
 
 #[derive(Clone, Debug)]
@@ -192,17 +276,23 @@ struct OwnedLaunchSpec {
     mode: OwnedChildMode,
     fault: OwnedLaunchFault,
     #[cfg(test)]
+    exact_wait_clock_advance: Option<Duration>,
+    #[cfg(test)]
+    frame_clock_step: Duration,
+    #[cfg(test)]
     audit: std::sync::Arc<TestLaunchAudit>,
 }
 
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct TestLaunchAudit {
+    prepared_sources_closed: std::sync::atomic::AtomicBool,
     originals_closed_in_parent: std::sync::atomic::AtomicBool,
     child_reaped: std::sync::atomic::AtomicBool,
     child_exit_success: std::sync::atomic::AtomicBool,
     child_exit_nonzero: std::sync::atomic::AtomicBool,
     child_killed: std::sync::atomic::AtomicBool,
+    generation_revoked: std::sync::atomic::AtomicBool,
     ready_receiver: std::sync::Mutex<Option<UnixStream>>,
     revoke_sender: std::sync::Mutex<Option<UnixStream>>,
 }
@@ -212,6 +302,10 @@ impl OwnedLaunchSpec {
         Self {
             mode: OwnedChildMode::Session,
             fault: OwnedLaunchFault::None,
+            #[cfg(test)]
+            exact_wait_clock_advance: None,
+            #[cfg(test)]
+            frame_clock_step: Duration::ZERO,
             #[cfg(test)]
             audit: std::sync::Arc::new(TestLaunchAudit::default()),
         }
@@ -231,8 +325,16 @@ impl OwnedLaunchSpec {
         Self {
             mode,
             fault,
+            exact_wait_clock_advance: None,
+            frame_clock_step: Duration::ZERO,
             audit: std::sync::Arc::new(TestLaunchAudit::default()),
         }
+    }
+
+    fn with_clock(mut self, exact_wait_advance: Option<Duration>, frame_step: Duration) -> Self {
+        self.exact_wait_clock_advance = exact_wait_advance;
+        self.frame_clock_step = frame_step;
+        self
     }
 }
 
@@ -282,33 +384,69 @@ impl SpawnOwnedSession {
             generation,
             #[cfg(test)]
             audit: None,
+            #[cfg(test)]
+            inject_cleanup_failure: false,
         }
     }
 
     fn revoke_and_reap(&mut self, pairing: &PairingRegistry) -> Result<(), TransportError> {
         pairing.revoke(&self.slot, self.generation);
+        #[cfg(test)]
+        if let Some(audit) = &self.audit {
+            audit
+                .generation_revoked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         // This control endpoint is intentionally private to the spawn owner.
         // A best-effort byte wakes a cooperating child; failure is harmless
         // because the owned child is subsequently terminated and reaped.
         let _ = self.revoke.write_all(b"revoke");
-        let exit = wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)?;
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let exit = match exit {
-            Some(exit) => exit,
-            None => {
-                #[cfg(test)]
-                if let Some(audit) = &self.audit {
-                    audit
-                        .child_killed
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                self.child
-                    .kill()
-                    .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
-                wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)?
-                    .ok_or(TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?
+        #[cfg(test)]
+        let first_wait = if self.inject_cleanup_failure {
+            // This fault is injected at the bounded-reap seam, not at the
+            // terminal classification seam.  The fallback below must still
+            // establish final child state before this error can escape.
+            Err(TransportError::Ended(SessionEnd::CleanupFailed))
+        } else {
+            wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)
+        };
+        #[cfg(not(test))]
+        let first_wait = wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE);
+        let exit = match first_wait {
+            Ok(Some(exit)) => exit,
+            Ok(None) => self.terminate_and_reap()?,
+            Err(cleanup_error) => {
+                // A failed first reap observation may not be treated as a
+                // final state.  Force bounded termination/reap first, then
+                // surface the original cleanup failure deterministically.
+                let exit = self.terminate_and_reap()?;
+                self.record_reaped_exit(exit);
+                return Err(cleanup_error);
             }
         };
+        self.record_reaped_exit(exit);
+        Ok(())
+    }
+
+    fn terminate_and_reap(&mut self) -> Result<std::process::ExitStatus, TransportError> {
+        #[cfg(test)]
+        if let Some(audit) = &self.audit {
+            audit
+                .child_killed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Err(error) = self.child.kill() {
+            if error.kind() != std::io::ErrorKind::InvalidInput {
+                return Err(TransportError::Ended(SessionEnd::CleanupFailed));
+            }
+        }
+        wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)?
+            .ok_or(TransportError::Ended(SessionEnd::CleanupFailed))
+    }
+
+    fn record_reaped_exit(&self, exit: std::process::ExitStatus) {
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let _exit = exit;
         #[cfg(test)]
         if let Some(audit) = &self.audit {
             audit
@@ -316,14 +454,50 @@ impl SpawnOwnedSession {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             audit
                 .child_exit_success
-                .store(exit.success(), std::sync::atomic::Ordering::SeqCst);
+                .store(_exit.success(), std::sync::atomic::Ordering::SeqCst);
             audit.child_exit_nonzero.store(
-                exit.code().is_some_and(|code| code != 0),
+                _exit.code().is_some_and(|code| code != 0),
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
-        Ok(())
     }
+}
+
+fn reap_unregistered_child(
+    child: &mut Child,
+    revoke: &mut UnixStream,
+    #[cfg(test)] audit: &std::sync::Arc<TestLaunchAudit>,
+) -> Result<(), TransportError> {
+    let _ = revoke.write_all(b"revoke");
+    #[cfg_attr(not(test), allow(unused_variables))]
+    let exit = match wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE)? {
+        Some(exit) => exit,
+        None => {
+            #[cfg(test)]
+            audit
+                .child_killed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            child
+                .kill()
+                .map_err(|_| TransportError::Ended(SessionEnd::CleanupFailed))?;
+            wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE)?
+                .ok_or(TransportError::Ended(SessionEnd::CleanupFailed))?
+        }
+    };
+    #[cfg(test)]
+    {
+        audit
+            .child_reaped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        audit
+            .child_exit_success
+            .store(exit.success(), std::sync::atomic::Ordering::SeqCst);
+        audit.child_exit_nonzero.store(
+            exit.code().is_some_and(|code| code != 0),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+    Ok(())
 }
 
 fn wait_for_child_exit_bounded(
@@ -336,7 +510,7 @@ fn wait_for_child_exit_bounded(
             Ok(Some(exit)) => return Ok(Some(exit)),
             Ok(None) if Instant::now() < deadline => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                std::thread::park_timeout(remaining.min(Duration::from_millis(5)));
             }
             Ok(None) => return Ok(None),
             Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
@@ -359,7 +533,7 @@ fn duplicate_child_source(source: RawFd) -> Result<RawFd, TransportError> {
 fn prepare_child_fd_remap(
     data_source: RawFd,
     revoke_source: RawFd,
-) -> Result<PreparedChildFdRemap, TransportError> {
+) -> Result<PreparedChildFdGuard, TransportError> {
     // Copy both sources before either fixed target can be overwritten.  This
     // handles every source/target alias and permutation deterministically.
     let data_source = duplicate_child_source(data_source)?;
@@ -370,9 +544,11 @@ fn prepare_child_fd_remap(
             return Err(error);
         }
     };
-    Ok(PreparedChildFdRemap {
-        data_source,
-        revoke_source,
+    Ok(PreparedChildFdGuard {
+        plan: Some(PreparedChildFdRemap {
+            data_source,
+            revoke_source,
+        }),
     })
 }
 
@@ -411,9 +587,19 @@ fn spawn_owned_session(
     now: DateTime<Utc>,
     spec: &OwnedLaunchSpec,
 ) -> Result<SpawnOwnedSession, TransportError> {
+    // Resolve every fallible parent-side command input before descriptor
+    // ownership is transferred.  A later guard still closes the descriptors
+    // on test-injected preparation failure, but the production path cannot
+    // leak them through current_exe()/command construction early returns.
+    let executable = if spec.fault == OwnedLaunchFault::MissingExecutable {
+        std::path::PathBuf::from("/quotabar-c3b1/missing-fixed-synthetic-child")
+    } else {
+        std::env::current_exe()
+            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?
+    };
     let (parent, child_data) =
         UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
-    let (revoke, child_revoke) =
+    let (mut revoke, child_revoke) =
         UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
     #[cfg(test)]
     let (test_ready_receiver, child_ready) =
@@ -431,11 +617,17 @@ fn spawn_owned_session(
     let prepared_test_ready_fd = match duplicate_child_source(child_ready_fd) {
         Ok(fd) => fd,
         Err(error) => {
-            close_prepared_child_source(prepared.data_source);
-            close_prepared_child_source(prepared.revoke_source);
             return Err(error);
         }
     };
+    #[cfg(test)]
+    if spec.fault == OwnedLaunchFault::ExecutableResolution {
+        close_prepared_child_source(prepared_test_ready_fd);
+        spec.audit
+            .prepared_sources_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+    }
     // The prepared descriptors are now the only copies deliberately inherited
     // by Command.  Dropping the originals before fork also proves that no
     // parent endpoint can leak into the child through the launch setup.
@@ -444,12 +636,6 @@ fn spawn_owned_session(
     #[cfg(test)]
     drop(child_ready);
 
-    let executable = if spec.fault == OwnedLaunchFault::MissingExecutable {
-        std::path::PathBuf::from("/quotabar-c3b1/missing-fixed-synthetic-child")
-    } else {
-        std::env::current_exe()
-            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?
-    };
     let mut command = Command::new(executable);
     #[cfg(test)]
     {
@@ -464,6 +650,7 @@ fn spawn_owned_session(
         command.arg(PRIVATE_SYNTHETIC_CHILD_ARG);
     }
     let force_pre_exec_failure = spec.fault == OwnedLaunchFault::PreExec;
+    let prepared_plan = prepared.plan();
     unsafe {
         command.pre_exec(move || {
             if force_pre_exec_failure {
@@ -472,7 +659,7 @@ fn spawn_owned_session(
                     "fixed pre-exec failure",
                 ));
             }
-            install_prepared_child_fds(prepared)?;
+            install_prepared_child_fds(prepared_plan)?;
             #[cfg(test)]
             if libc::dup2(prepared_test_ready_fd, CHILD_TEST_READY_FD) < 0
                 || libc::fcntl(CHILD_TEST_READY_FD, libc::F_SETFD, 0) < 0
@@ -484,8 +671,7 @@ fn spawn_owned_session(
         });
     }
     let spawned = command.spawn();
-    close_prepared_child_source(prepared.data_source);
-    close_prepared_child_source(prepared.revoke_source);
+    drop(prepared);
     #[cfg(test)]
     close_prepared_child_source(prepared_test_ready_fd);
     let mut child = spawned.map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
@@ -499,6 +685,10 @@ fn spawn_owned_session(
         std::sync::atomic::Ordering::SeqCst,
     );
     #[cfg(test)]
+    spec.audit
+        .prepared_sources_closed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
     {
         let ready_for_audit = test_ready_receiver
             .try_clone()
@@ -511,23 +701,28 @@ fn spawn_owned_session(
     }
 
     if spec.mode == OwnedChildMode::ExitBeforeRegistration {
-        let _ = child.wait();
-        #[cfg(test)]
-        spec.audit
-            .child_reaped
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        reap_unregistered_child(
+            &mut child,
+            &mut revoke,
+            #[cfg(test)]
+            &spec.audit,
+        )?;
         return Err(TransportError::Ended(SessionEnd::ChildExited));
     }
 
-    let bootstrap = match pairing.register_or_rebind(store, plan, now) {
+    let bootstrap = match if spec.fault == OwnedLaunchFault::RegisterFailure {
+        Err(())
+    } else {
+        pairing.register_or_rebind(store, plan, now).map_err(|_| ())
+    } {
         Ok(bootstrap) => bootstrap,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            #[cfg(test)]
-            spec.audit
-                .child_reaped
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(()) => {
+            reap_unregistered_child(
+                &mut child,
+                &mut revoke,
+                #[cfg(test)]
+                &spec.audit,
+            )?;
             return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
         }
     };
@@ -539,8 +734,13 @@ fn spawn_owned_session(
         generation: bootstrap.epoch(),
         #[cfg(test)]
         audit: Some(spec.audit.clone()),
+        #[cfg(test)]
+        inject_cleanup_failure: spec.fault == OwnedLaunchFault::BootstrapCleanupFailure,
     };
-    let bootstrap_result = if spec.fault == OwnedLaunchFault::BootstrapPartial {
+    let bootstrap_result = if matches!(
+        spec.fault,
+        OwnedLaunchFault::BootstrapPartial | OwnedLaunchFault::BootstrapCleanupFailure
+    ) {
         owner.parent.write_all(&[0, 0]).and_then(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -551,8 +751,13 @@ fn spawn_owned_session(
         bootstrap.write_private_payload(&mut owner.parent)
     };
     if bootstrap_result.is_err() {
-        let _ = owner.revoke_and_reap(pairing);
-        return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+        return match owner.revoke_and_reap(pairing) {
+            Ok(()) => Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
+            // Cleanup failure wins deterministically: callers must never see a
+            // plausible protocol/bootstrap error while resource finality is
+            // unknown.
+            Err(cleanup_error) => Err(cleanup_error),
+        };
     }
     Ok(owner)
 }
@@ -827,7 +1032,7 @@ fn handle_session_loop_monitored(
     stream
         .set_read_timeout(None)
         .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
-    let mut bucket = FrameBucket::new(Instant::now());
+    let mut bucket = FrameBucket::new(monotonic_now());
     let mut next_sequence = 1u64;
     loop {
         let frame = match read_frame_monitored(stream, FRAME_MAX, &mut bucket, monitor) {
@@ -863,6 +1068,9 @@ fn handle_session_loop_monitored(
             Utc::now(),
         )
         .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+        // Test-only controllable monotonic time advances only at the same
+        // production commit boundary that governs the real frame bucket.
+        advance_test_clock_for_frame();
         next_sequence = next_sequence
             .checked_add(1)
             .ok_or(TransportError::Ended(SessionEnd::ResourceLimited))?;
@@ -902,10 +1110,10 @@ fn read_frame_monitored(
         }
         Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
     }
-    if !bucket.take(Instant::now()) {
+    if !bucket.take(monotonic_now()) {
         return Err(TransportError::Ended(SessionEnd::ResourceLimited));
     }
-    let deadline = FixedDeadline::after(Instant::now(), Duration::from_secs(5));
+    let deadline = FixedDeadline::after(monotonic_now(), Duration::from_secs(5));
     read_exact_until_monitored(
         stream,
         &mut length[1..],
@@ -957,7 +1165,7 @@ fn read_secret_frame_monitored(
         Ok(_) => {}
         Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
     }
-    let deadline = FixedDeadline::after(Instant::now(), budget);
+    let deadline = FixedDeadline::after(monotonic_now(), budget);
     read_exact_until_monitored(
         stream,
         &mut length[1..],
@@ -998,6 +1206,9 @@ fn read_exact_until_monitored(
     monitor: &mut SessionMonitor<'_>,
 ) -> Result<(), TransportError> {
     while !bytes.is_empty() {
+        // This hook changes only the monotonic source under cfg(test); it
+        // leaves the actual socket/parser/orchestration path intact.
+        advance_test_clock_on_exact_wait();
         match wait_for_data(stream, monitor, Some(deadline)) {
             Ok(()) => {}
             Err(TransportError::Ended(SessionEnd::CleanEof)) => {
@@ -1023,7 +1234,7 @@ fn write_fixed_result(
     budget: Duration,
 ) -> Result<(), TransportError> {
     let bytes = format!("{{\"result\":\"{result}\"}}").into_bytes();
-    let deadline = FixedDeadline::after(Instant::now(), budget);
+    let deadline = FixedDeadline::after(monotonic_now(), budget);
     write_all_until(stream, &(bytes.len() as u32).to_be_bytes(), deadline)?;
     write_all_until(stream, &bytes, deadline)
 }
@@ -1411,11 +1622,13 @@ mod tests {
     }
 
     fn assert_exact_fd_remap(data_source: RawFd, revoke_source: RawFd) {
-        let plan = prepare_child_fd_remap(data_source, revoke_source).unwrap();
+        let mut guard = prepare_child_fd_remap(data_source, revoke_source).unwrap();
+        let plan = guard.plan();
         assert!(plan.data_source >= CHILD_SAFE_FD_MIN);
         assert!(plan.revoke_source >= CHILD_SAFE_FD_MIN);
         assert_ne!(plan.data_source, plan.revoke_source);
         unsafe { install_prepared_child_fds(plan) }.unwrap();
+        guard.close_now();
         for source in [plan.data_source, plan.revoke_source] {
             assert_eq!(unsafe { libc::fcntl(source, libc::F_GETFD) }, -1);
             assert_eq!(
@@ -1538,6 +1751,19 @@ mod tests {
             data.shutdown(Shutdown::Write).unwrap();
             return;
         }
+        if stage == OwnedChildMode::LongFirstByteSilence.name() {
+            ready.write_all(b"S").unwrap();
+            let mut signal = [0u8; 1];
+            revoke.read_exact(&mut signal).unwrap();
+            revoke.write_all(b"R").unwrap();
+            return;
+        }
+        if stage == OwnedChildMode::SlowDrip.name() {
+            data.write_all(&[0]).unwrap();
+            let mut cleanup = [0u8; 1];
+            let _ = revoke.read(&mut cleanup);
+            return;
+        }
         if stage == OwnedChildMode::IgnoreRevokeAfterDataEof.name() {
             data.shutdown(Shutdown::Write).unwrap();
             loop {
@@ -1554,7 +1780,9 @@ mod tests {
             let _ = revoke.read(&mut cleanup);
             return;
         }
-        if stage == OwnedChildMode::BlockAfterHandshakeByte.name() {
+        if stage == OwnedChildMode::BlockAfterHandshakeByte.name()
+            || stage == OwnedChildMode::RevokeThenExit.name()
+        {
             data.write_all(&[0]).unwrap();
             // The data byte establishes a partial handshake.  Use the private
             // test-only ready descriptor for the barrier so the production
@@ -1562,13 +1790,49 @@ mod tests {
             ready.write_all(b"B").unwrap();
             let mut signal = [0u8; 1];
             revoke.read_exact(&mut signal).unwrap();
-            revoke.write_all(b"R").unwrap();
+            revoke
+                .write_all(if stage == OwnedChildMode::RevokeThenExit.name() {
+                    b"E"
+                } else {
+                    b"R"
+                })
+                .unwrap();
             return;
         }
 
         let handshake = synthetic_handshake(slot, token);
         write_frame(&mut data, &handshake);
         assert_eq!(read_frame_for_test(&mut data), br#"{"result":"accepted"}"#);
+        if stage == OwnedChildMode::CooperativeEof.name() {
+            data.shutdown(Shutdown::Write).unwrap();
+            let mut cleanup = [0u8; 1];
+            let _ = revoke.read(&mut cleanup);
+            return;
+        }
+        if stage == OwnedChildMode::BurstFive.name()
+            || stage == OwnedChildMode::RefillHundred.name()
+        {
+            let count = if stage == OwnedChildMode::BurstFive.name() {
+                5
+            } else {
+                100
+            };
+            let slot = std::str::from_utf8(slot).unwrap();
+            for sequence in 1..=count {
+                let observed = Utc::now();
+                let observed_text = observed.to_rfc3339_opts(SecondsFormat::Secs, true);
+                let reset = (observed + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true);
+                let frame = format!(
+                    "{{\"event\":\"observation\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"{sequence}\",\"observedAt\":\"{observed_text}\",\"status\":\"available\",\"source\":\"completion_sse\",\"windows\":[{{\"kind\":\"five_hour\",\"usedPercent\":7,\"resetAt\":\"{reset}\"}}]}}"
+                );
+                write_frame(&mut data, frame.as_bytes());
+            }
+            data.shutdown(Shutdown::Write).unwrap();
+            let mut cleanup = [0u8; 1];
+            let _ = revoke.read(&mut cleanup);
+            return;
+        }
         if stage == OwnedChildMode::SubmitAvailable.name() {
             let slot = std::str::from_utf8(slot).unwrap();
             let observed = Utc::now();
@@ -1669,7 +1933,7 @@ mod tests {
                 Instant::now() < watchdog,
                 "store appearance watchdog expired"
             );
-            std::thread::yield_now();
+            std::thread::park_timeout(Duration::from_millis(1));
         }
     }
 
@@ -1681,7 +1945,7 @@ mod tests {
                 return observed;
             }
             assert!(Instant::now() < watchdog, "store change watchdog expired");
-            std::thread::yield_now();
+            std::thread::park_timeout(Duration::from_millis(1));
         }
     }
 
@@ -1691,9 +1955,19 @@ mod tests {
         plan: PlanMetadata,
         spec: OwnedLaunchSpec,
     ) -> Result<(), TransportError> {
+        let exact_wait_advance = spec.exact_wait_clock_advance;
+        let frame_step = spec.frame_clock_step;
         TEST_TOP_LEVEL_LAUNCH.with(|slot| *slot.borrow_mut() = Some(spec));
+        TEST_CLOCK_OFFSET.with(|offset| offset.set(0));
+        TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.with(|advance| {
+            advance.set(exact_wait_advance.map(|duration| duration.as_millis() as u64));
+        });
+        TEST_CLOCK_STEP_PER_FRAME.with(|step| step.set(frame_step.as_millis() as u64));
         let result = run_owned_validation_session(store, pairing, plan, Utc::now());
         TEST_TOP_LEVEL_LAUNCH.with(|slot| *slot.borrow_mut() = None);
+        TEST_CLOCK_OFFSET.with(|offset| offset.set(0));
+        TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.with(|advance| advance.set(None));
+        TEST_CLOCK_STEP_PER_FRAME.with(|step| step.set(0));
         result
     }
 
@@ -1707,7 +1981,7 @@ mod tests {
                 return stream;
             }
             assert!(Instant::now() < deadline, "{label} was not published");
-            std::thread::yield_now();
+            std::thread::park_timeout(Duration::from_millis(1));
         }
     }
 
@@ -1732,7 +2006,15 @@ mod tests {
                 false,
             ),
             (
-                "data-eof-child-alive",
+                "data-eof-child-cooperates",
+                OwnedChildMode::CooperativeEof,
+                SessionEnd::CleanEof,
+                true,
+                false,
+                false,
+            ),
+            (
+                "data-eof-child-refuses-revoke",
                 OwnedChildMode::IgnoreRevokeAfterDataEof,
                 SessionEnd::CleanEof,
                 false,
@@ -1773,28 +2055,52 @@ mod tests {
             let _ = std::fs::remove_dir_all(root);
         }
 
-        // The monitor checks an observed child exit before ready revoke data,
-        // so an exit/revoke race has a fixed ChildExited precedence.
-        let (parent, child_end) = UnixStream::pair().unwrap();
-        let (revoke, mut revoke_peer) = UnixStream::pair().unwrap();
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-        child.wait().unwrap();
-        drop(child_end);
-        revoke_peer.write_all(b"R").unwrap();
-        let mut monitor = SessionMonitor {
-            revoke_fd: Some(revoke.as_raw_fd()),
-            child: Some(&mut child),
-        };
+        // Sixth row: the real child receives the private revoke, then writes
+        // its exact exit signal before it terminates.  This is deliberately
+        // exercised through the top-level wrapper rather than a hand-built
+        // monitor, so ChildExited precedence is production-seam evidence.
+        let (root, store) = fresh_store("revoke-exit-race");
+        let pairing = std::sync::Arc::new(PairingRegistry::new());
+        let spec = OwnedLaunchSpec::test(OwnedChildMode::RevokeThenExit, OwnedLaunchFault::None);
+        let audit = spec.audit.clone();
+        let worker_store = std::sync::Arc::new(store);
+        let worker_store_for_thread = worker_store.clone();
+        let worker_pairing = pairing.clone();
+        let worker = std::thread::spawn(move || {
+            run_top_level_owned_session_for_test(
+                &worker_store_for_thread,
+                &worker_pairing,
+                PlanMetadata::Paid,
+                spec,
+            )
+        });
+        let mut ready = take_test_control_stream(&audit.ready_receiver, "revoke/exit barrier");
+        wait_until_readable(ready.as_raw_fd());
+        let mut marker = [0u8; 1];
+        ready.read_exact(&mut marker).unwrap();
+        assert_eq!(marker, *b"B");
+        let mut revoke = take_test_control_stream(&audit.revoke_sender, "revoke/exit sender");
+        revoke.write_all(b"R").unwrap();
         assert_eq!(
-            wait_for_data(&parent, &mut monitor, None),
+            worker.join().unwrap(),
             Err(TransportError::Ended(SessionEnd::ChildExited))
         );
+        assert!(audit.child_reaped.load(Ordering::SeqCst));
+        assert_eq!(pairing.pending_count_for_test(), 0);
+        drop(worker_store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn production_owned_spawn_covers_failure_cleanup_and_fd_provenance() {
         let _guard = owned_child_test_lock();
         for (label, mode, fault, expected) in [
+            (
+                "executable-resolution-after-prepared-fds",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::ExecutableResolution,
+                SessionEnd::WorkerOrStoreFailed,
+            ),
             (
                 "missing-executable",
                 OwnedChildMode::Session,
@@ -1808,16 +2114,22 @@ mod tests {
                 SessionEnd::WorkerOrStoreFailed,
             ),
             (
-                "exit-before-registration",
-                OwnedChildMode::ExitBeforeRegistration,
-                OwnedLaunchFault::None,
-                SessionEnd::ChildExited,
+                "post-spawn-registration-failure",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::RegisterFailure,
+                SessionEnd::WorkerOrStoreFailed,
             ),
             (
                 "bootstrap-partial",
                 OwnedChildMode::Session,
                 OwnedLaunchFault::BootstrapPartial,
                 SessionEnd::WorkerOrStoreFailed,
+            ),
+            (
+                "bootstrap-cleanup-failure-precedence",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::BootstrapCleanupFailure,
+                SessionEnd::CleanupFailed,
             ),
         ] {
             let (root, store) = fresh_store(label);
@@ -1829,10 +2141,108 @@ mod tests {
                 Err(TransportError::Ended(expected)),
                 "{label}"
             );
-            if fault != OwnedLaunchFault::MissingExecutable && fault != OwnedLaunchFault::PreExec {
+            if !matches!(
+                fault,
+                OwnedLaunchFault::ExecutableResolution
+                    | OwnedLaunchFault::MissingExecutable
+                    | OwnedLaunchFault::PreExec
+            ) {
                 assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
             }
+            if fault == OwnedLaunchFault::ExecutableResolution {
+                assert!(
+                    audit.prepared_sources_closed.load(Ordering::SeqCst),
+                    "{label}"
+                );
+            }
+            if matches!(
+                fault,
+                OwnedLaunchFault::BootstrapPartial | OwnedLaunchFault::BootstrapCleanupFailure
+            ) {
+                assert!(audit.generation_revoked.load(Ordering::SeqCst), "{label}");
+            }
             assert_eq!(pairing.pending_count_for_test(), 0);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn top_level_slow_drip_silence_burst_and_refill_use_real_child_seam() {
+        let _guard = owned_child_test_lock();
+
+        let (root, store) = fresh_store("slow-drip");
+        let pairing = PairingRegistry::new();
+        let spec = OwnedLaunchSpec::test(OwnedChildMode::SlowDrip, OwnedLaunchFault::None)
+            .with_clock(Some(Duration::from_secs(6)), Duration::ZERO);
+        let audit = spec.audit.clone();
+        assert_eq!(
+            run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
+            Err(TransportError::Ended(SessionEnd::DeadlineExpired))
+        );
+        assert!(audit.child_reaped.load(Ordering::SeqCst));
+        assert_eq!(pairing.pending_count_for_test(), 0);
+        let _ = std::fs::remove_dir_all(root);
+
+        let (root, store) = fresh_store("first-byte-silence");
+        let store = std::sync::Arc::new(store);
+        let pairing = std::sync::Arc::new(PairingRegistry::new());
+        let spec =
+            OwnedLaunchSpec::test(OwnedChildMode::LongFirstByteSilence, OwnedLaunchFault::None);
+        let audit = spec.audit.clone();
+        let worker_store = store.clone();
+        let worker_pairing = pairing.clone();
+        let worker = std::thread::spawn(move || {
+            run_top_level_owned_session_for_test(
+                &worker_store,
+                &worker_pairing,
+                PlanMetadata::Paid,
+                spec,
+            )
+        });
+        let mut ready =
+            take_test_control_stream(&audit.ready_receiver, "first-byte silence barrier");
+        wait_until_readable(ready.as_raw_fd());
+        let mut marker = [0u8; 1];
+        ready.read_exact(&mut marker).unwrap();
+        assert_eq!(marker, *b"S");
+        let mut revoke =
+            take_test_control_stream(&audit.revoke_sender, "first-byte silence revoke");
+        revoke.write_all(b"R").unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            Err(TransportError::Ended(SessionEnd::Revoked))
+        );
+        assert!(audit.child_reaped.load(Ordering::SeqCst));
+        assert_eq!(pairing.pending_count_for_test(), 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+
+        for (label, mode, clock_step, expected) in [
+            (
+                "four-frame-burst-then-rate-reject",
+                OwnedChildMode::BurstFive,
+                Duration::ZERO,
+                SessionEnd::ResourceLimited,
+            ),
+            (
+                "hundred-frame-refill",
+                OwnedChildMode::RefillHundred,
+                FRAME_REFILL,
+                SessionEnd::CleanEof,
+            ),
+        ] {
+            let (root, store) = fresh_store(label);
+            let pairing = PairingRegistry::new();
+            let spec =
+                OwnedLaunchSpec::test(mode, OwnedLaunchFault::None).with_clock(None, clock_step);
+            let audit = spec.audit.clone();
+            assert_eq!(
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
+                Err(TransportError::Ended(expected)),
+                "{label}"
+            );
+            assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
+            assert_eq!(pairing.pending_count_for_test(), 0, "{label}");
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -2199,7 +2609,7 @@ mod tests {
             Err(TransportError::Ended(SessionEnd::Revoked))
         );
         let registry = PairingRegistry::new();
-        let _ = owner.revoke_and_reap(&registry);
+        assert!(owner.revoke_and_reap(&registry).is_ok());
     }
 
     #[test]
@@ -2209,14 +2619,18 @@ mod tests {
         let child = Command::new("/usr/bin/true").spawn().unwrap();
         let slot = AccountSlotId::parse("11111111-1111-4111-8111-111111111111").unwrap();
         let mut owner = SpawnOwnedSession::from_owned_spawn(child, parent, revoke, slot, 1);
-        owner.child.wait().unwrap();
+        assert!(
+            wait_for_child_exit_bounded(&mut owner.child, CHILD_CLEANUP_GRACE)
+                .unwrap()
+                .is_some()
+        );
         drop(child_end);
         assert_eq!(
             wait_for_first_byte_or_revoke(&mut owner),
             Err(TransportError::Ended(SessionEnd::ChildExited))
         );
         let registry = PairingRegistry::new();
-        let _ = owner.revoke_and_reap(&registry);
+        assert!(owner.revoke_and_reap(&registry).is_ok());
     }
 
     #[test]
@@ -2242,7 +2656,9 @@ mod tests {
         assert_eq!(monitor.revoke_fd, None);
         drop(keepalive);
         let _ = child.kill();
-        let _ = child.wait();
+        assert!(wait_for_child_exit_bounded(&mut child, CHILD_CLEANUP_GRACE)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
