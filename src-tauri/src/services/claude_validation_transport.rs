@@ -1352,7 +1352,10 @@ mod tests {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .unwrap()
+            // A failing test must not mask every later fixed-FD test with a
+            // poisoned-lock panic; retain the lock while exposing the first
+            // assertion failure directly.
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
@@ -1544,6 +1547,11 @@ mod tests {
         if stage == OwnedChildMode::TruncatedHeader.name() {
             data.write_all(&[0]).unwrap();
             data.shutdown(Shutdown::Write).unwrap();
+            // Keep the child alive until its owning session revokes it.  This
+            // makes the parent-side truncated-header result deterministic:
+            // data EOF is observed before an unrelated child-exit race.
+            let mut cleanup = [0u8; 1];
+            let _ = revoke.read(&mut cleanup);
             return;
         }
         if stage == OwnedChildMode::BlockAfterHandshakeByte.name() {
