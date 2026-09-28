@@ -120,6 +120,8 @@ struct SpawnOwnedSession {
     audit: Option<std::sync::Arc<TestLaunchAudit>>,
     #[cfg(test)]
     revoke_peer_for_test: Option<UnixStream>,
+    #[cfg(test)]
+    ready_receiver_for_test: Option<UnixStream>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +243,8 @@ impl SpawnOwnedSession {
             audit: None,
             #[cfg(test)]
             revoke_peer_for_test: None,
+            #[cfg(test)]
+            ready_receiver_for_test: None,
         }
     }
 
@@ -280,6 +284,10 @@ fn spawn_owned_session(
     let revoke_fd = revoke.as_raw_fd();
     #[cfg(test)]
     let test_revoke_peer = child_revoke
+        .try_clone()
+        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    #[cfg(test)]
+    let test_ready_receiver = revoke
         .try_clone()
         .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
 
@@ -386,6 +394,8 @@ fn spawn_owned_session(
         audit: Some(spec.audit.clone()),
         #[cfg(test)]
         revoke_peer_for_test: Some(test_revoke_peer),
+        #[cfg(test)]
+        ready_receiver_for_test: Some(test_ready_receiver),
     };
     let bootstrap_result = if spec.fault == OwnedLaunchFault::BootstrapPartial {
         owner.parent.write_all(&[0, 0]).and_then(|_| {
@@ -482,11 +492,22 @@ fn wait_for_data(
             let mut signal = [0u8; 1];
             let read =
                 unsafe { libc::read(watched[1].fd, signal.as_mut_ptr().cast(), signal.len()) };
-            return if read == 1 && signal[0] == b'E' {
-                Err(TransportError::Ended(SessionEnd::ChildExited))
+            if read == 1 {
+                return if signal[0] == b'E' {
+                    Err(TransportError::Ended(SessionEnd::ChildExited))
+                } else {
+                    Err(TransportError::Ended(SessionEnd::Revoked))
+                };
+            }
+            if read == 0 {
+                // A child can close its control end as it finishes. That HUP
+                // is not a revoke signal; let the data endpoint determine
+                // whether the terminal framing is EOF or child exit.
+                monitor.revoke_fd = None;
+                watched[1].fd = -1;
             } else {
-                Err(TransportError::Ended(SessionEnd::Revoked))
-            };
+                return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
+            }
         }
         if watched[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             let mut probe = [0u8; 1];
@@ -1247,6 +1268,10 @@ mod tests {
         }
         if stage == OwnedChildMode::BlockAfterHandshakeByte.name() {
             data.write_all(&[0]).unwrap();
+            // The data byte establishes a partial handshake.  Use the private
+            // control channel for the test barrier so scheduling evidence does
+            // not depend on a readiness event from the FD under test.
+            revoke.write_all(b"B").unwrap();
             let mut signal = [0u8; 1];
             revoke.read_exact(&mut signal).unwrap();
             return;
@@ -1456,7 +1481,11 @@ mod tests {
             let mut a_owner =
                 spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &a_spec)
                     .unwrap();
-            wait_until_readable(a_owner.parent.as_raw_fd());
+            let mut ready_receiver = a_owner.ready_receiver_for_test.take().unwrap();
+            wait_until_readable(ready_receiver.as_raw_fd());
+            let mut ready = [0u8; 1];
+            ready_receiver.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, *b"B");
             let mut revoke_a = a_owner.revoke_peer_for_test.take().unwrap();
 
             let b_mode = if iteration % 2 == 0 {
@@ -1965,6 +1994,25 @@ mod tests {
         );
         let registry = PairingRegistry::new();
         owner.revoke_and_reap(&registry);
+    }
+
+    #[test]
+    fn control_eof_and_data_terminal_are_classified_in_one_poll_round() {
+        let (parent, child_end) = UnixStream::pair().unwrap();
+        let (revoke, child_revoke) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        drop(child_end);
+        drop(child_revoke);
+        let mut monitor = SessionMonitor {
+            revoke_fd: Some(revoke.as_raw_fd()),
+            child: Some(&mut child),
+        };
+        assert_eq!(
+            wait_for_data(&parent, &mut monitor, None),
+            Err(TransportError::Ended(SessionEnd::ChildExited))
+        );
+        assert_eq!(monitor.revoke_fd, None);
     }
 
     #[test]
