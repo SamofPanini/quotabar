@@ -13,6 +13,8 @@ use std::path::{Component, Path, PathBuf};
 const MANIFEST: &str = ".quotabar-c3b1-owner";
 const MANIFEST_HEADER: &str = "quotabar-c3b1-owner-v2";
 const PRIVATE_MODE: u32 = 0o700;
+const MAX_ENTRIES: usize = 16;
+const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NamespaceError {
@@ -47,7 +49,7 @@ pub(crate) struct PreparedValidationNamespace {
     entries: Vec<OwnedEntry>,
     mutation_valid: bool,
     #[cfg(test)]
-    fail_next_persist: bool,
+    persist_failpoint: Option<PersistFailpoint>,
 }
 
 impl PreparedValidationNamespace {
@@ -80,7 +82,7 @@ impl PreparedValidationNamespace {
             entries: vec![OwnedEntry::from_stat(manifest, &manifest_stat, 0o600)],
             mutation_valid: true,
             #[cfg(test)]
-            fail_next_persist: false,
+            persist_failpoint: None,
         };
         namespace.persist_inventory()?;
         Ok(namespace)
@@ -89,6 +91,11 @@ impl PreparedValidationNamespace {
     /// Only direct normal names are admitted, preventing ancestor traversal.
     pub(crate) fn create_private_dir(&mut self, relative: &str) -> Result<(), NamespaceError> {
         if !self.mutation_valid {
+            return Err(NamespaceError::Mismatch);
+        }
+        // The manifest entry itself consumes one of the fixed inventory slots.
+        // Check before stat/mkdir so a seventeenth entry cannot reach disk.
+        if self.entries.len() >= MAX_ENTRIES {
             return Err(NamespaceError::Mismatch);
         }
         let name = checked_direct_name(relative)?;
@@ -144,24 +151,20 @@ impl PreparedValidationNamespace {
     }
 
     fn persist_inventory_inner(&mut self) -> Result<(), NamespaceError> {
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_persist) {
-            return Err(NamespaceError::Io);
-        }
-        let manifest = self
+        let manifest_name = self
             .entries
             .iter()
             .find(|entry| entry.name.as_c_str().to_bytes() == MANIFEST.as_bytes())
-            .ok_or(NamespaceError::Mismatch)?;
-        let bytes = render_inventory(&self.entries);
-        if bytes.len() > 64 * 1024 {
-            return Err(NamespaceError::Mismatch);
-        }
+            .ok_or(NamespaceError::Mismatch)?
+            .name
+            .clone();
+        let bytes = render_inventory_bounded(&self.entries)?;
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(|_| NamespaceError::Io)?;
         let nonce_text: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         let temporary = CString::new(format!(".quotabar-c3b1-tmp-{nonce_text}"))
             .map_err(|_| NamespaceError::Io)?;
+        self.fail_if(PersistFailpoint::BeforeTempCreate)?;
         let mut file = unsafe {
             file_from_fd(libc::openat(
                 self.root.as_raw_fd(),
@@ -170,29 +173,55 @@ impl PreparedValidationNamespace {
                 0o600,
             ))
         }?;
+        self.fail_if(PersistFailpoint::AfterTempCreate)?;
         file.write_all(&bytes).map_err(|_| NamespaceError::Io)?;
+        self.fail_if(PersistFailpoint::AfterTempWrite)?;
         file.sync_all().map_err(|_| NamespaceError::Io)?;
+        self.fail_if(PersistFailpoint::AfterTempFsync)?;
         if unsafe {
             libc::renameat(
                 self.root.as_raw_fd(),
                 temporary.as_ptr(),
                 self.root.as_raw_fd(),
-                manifest.name.as_ptr(),
+                manifest_name.as_ptr(),
             )
         } != 0
         {
             return Err(NamespaceError::Io);
         }
+        self.fail_if(PersistFailpoint::AfterRename)?;
+        self.fail_if(PersistFailpoint::BeforeDirectoryFsync)?;
         if unsafe { libc::fsync(self.root.as_raw_fd()) } != 0 {
             return Err(NamespaceError::Io);
         }
+        self.fail_if(PersistFailpoint::AfterDirectoryFsync)?;
         Ok(())
     }
 
     #[cfg(test)]
-    fn fail_next_persist_for_test(&mut self) {
-        self.fail_next_persist = true;
+    fn fail_persist_at_for_test(&mut self, point: PersistFailpoint) {
+        self.persist_failpoint = Some(point);
     }
+
+    fn fail_if(&mut self, point: PersistFailpoint) -> Result<(), NamespaceError> {
+        #[cfg(test)]
+        if self.persist_failpoint == Some(point) {
+            self.persist_failpoint = None;
+            return Err(NamespaceError::Io);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistFailpoint {
+    BeforeTempCreate,
+    AfterTempCreate,
+    AfterTempWrite,
+    AfterTempFsync,
+    AfterRename,
+    BeforeDirectoryFsync,
+    AfterDirectoryFsync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,29 +253,33 @@ impl OwnedEntry {
     }
 }
 
-fn render_inventory(entries: &[OwnedEntry]) -> Vec<u8> {
-    let mut text = format!("{MANIFEST_HEADER}\n");
+fn render_inventory_bounded(entries: &[OwnedEntry]) -> Result<Vec<u8>, NamespaceError> {
+    // Compute and check the exact byte count before allocating the output.
+    let mut required = MANIFEST_HEADER.len() + 1;
     for entry in entries
         .iter()
         .filter(|entry| entry.name.as_c_str().to_bytes() != MANIFEST.as_bytes())
     {
-        text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
-            entry.name.to_string_lossy(),
-            entry.dev,
-            entry.ino,
-            entry.mode,
-            match entry.kind {
-                EntryKind::File => "file",
-                EntryKind::Directory => "directory",
-            }
-        ));
+        let kind = match entry.kind { EntryKind::File => "file", EntryKind::Directory => "directory" };
+        required = required
+            .checked_add(entry.name.as_bytes().len() + 1 + entry.dev.to_string().len() + 1
+                + entry.ino.to_string().len() + 1 + entry.mode.to_string().len() + 1 + kind.len() + 1)
+            .ok_or(NamespaceError::Mismatch)?;
+        if required > MAX_MANIFEST_BYTES { return Err(NamespaceError::Mismatch); }
     }
-    text.into_bytes()
+    let mut text = String::with_capacity(required);
+    text.push_str(MANIFEST_HEADER);
+    text.push('\n');
+    for entry in entries.iter().filter(|entry| entry.name.as_c_str().to_bytes() != MANIFEST.as_bytes()) {
+        let kind = match entry.kind { EntryKind::File => "file", EntryKind::Directory => "directory" };
+        use std::fmt::Write as _;
+        write!(&mut text, "{}\t{}\t{}\t{}\t{}\n", entry.name.to_string_lossy(), entry.dev, entry.ino, entry.mode, kind).map_err(|_| NamespaceError::Io)?;
+    }
+    Ok(text.into_bytes())
 }
 
 fn parse_inventory(bytes: &[u8]) -> Result<Vec<OwnedEntry>, NamespaceError> {
-    if bytes.len() > 64 * 1024 {
+    if bytes.len() > MAX_MANIFEST_BYTES {
         return Err(NamespaceError::Mismatch);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| NamespaceError::Mismatch)?;
@@ -256,7 +289,7 @@ fn parse_inventory(bytes: &[u8]) -> Result<Vec<OwnedEntry>, NamespaceError> {
     }
     let mut entries = Vec::new();
     for line in lines {
-        if entries.len() == 16 {
+        if entries.len() == MAX_ENTRIES {
             return Err(NamespaceError::Mismatch);
         }
         let mut fields = line.split('\t');
@@ -432,7 +465,7 @@ fn create_file_at(dirfd: i32, name: &CStr, mode: u32) -> Result<File, NamespaceE
     }
 }
 fn read_file_at_bounded(dirfd: i32, name: &CStr) -> Result<Vec<u8>, NamespaceError> {
-    const MAX: usize = 64 * 1024;
+    const MAX: usize = MAX_MANIFEST_BYTES;
     let mut file = unsafe {
         file_from_fd(libc::openat(
             dirfd,
@@ -493,6 +526,7 @@ fn validate_file_stat(stat: &libc::stat, mode: u32) -> Result<(), NamespaceError
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use uuid::Uuid;
 
     fn root() -> PathBuf {
@@ -651,6 +685,22 @@ mod tests {
     }
 
     #[test]
+    fn seventeenth_inventory_entry_is_rejected_before_mkdir() {
+        let root = root();
+        let mut namespace = PreparedValidationNamespace::prepare_new(root.clone()).unwrap();
+        for index in 0..15 {
+            namespace.create_private_dir(&format!("entry-{index}")).unwrap();
+        }
+        let before = fs::read(root.join(MANIFEST)).unwrap();
+        assert_eq!(namespace.create_private_dir("seventeenth"), Err(NamespaceError::Mismatch));
+        assert!(!root.join("seventeenth").exists());
+        assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), before);
+        for index in 0..15 { let _ = fs::remove_dir(root.join(format!("entry-{index}"))); }
+        let _ = fs::remove_file(root.join(MANIFEST));
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
     fn bounded_manifest_reader_distinguishes_65536_and_65537_bytes() {
         let root = root();
         fs::create_dir(&root).unwrap();
@@ -678,7 +728,7 @@ mod tests {
     fn failed_persist_permanently_revokes_mutation_capability() {
         let root = root();
         let mut namespace = PreparedValidationNamespace::prepare_new(root.clone()).unwrap();
-        namespace.fail_next_persist_for_test();
+        namespace.fail_persist_at_for_test(PersistFailpoint::BeforeTempCreate);
         assert!(namespace.create_private_dir("first").is_err());
         assert_eq!(
             namespace.create_private_dir("second"),
@@ -688,6 +738,40 @@ mod tests {
         let _ = fs::remove_dir(root.join("first"));
         let _ = fs::remove_file(root.join(MANIFEST));
         let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn every_persist_failpoint_leaves_a_complete_old_or_new_manifest_and_revokes_mutation() {
+        for point in [
+            PersistFailpoint::BeforeTempCreate,
+            PersistFailpoint::AfterTempCreate,
+            PersistFailpoint::AfterTempWrite,
+            PersistFailpoint::AfterTempFsync,
+            PersistFailpoint::AfterRename,
+            PersistFailpoint::BeforeDirectoryFsync,
+            PersistFailpoint::AfterDirectoryFsync,
+        ] {
+            let root = root();
+            let mut namespace = PreparedValidationNamespace::prepare_new(root.clone()).unwrap();
+            let old = fs::read(root.join(MANIFEST)).unwrap();
+            namespace.fail_persist_at_for_test(point);
+            assert_eq!(namespace.create_private_dir("slot"), Err(NamespaceError::Io));
+            let observed = fs::read(root.join(MANIFEST)).unwrap();
+            let new = format!("{MANIFEST_HEADER}\nslot\t{}\t{}\t448\tdirectory\n",
+                fs::metadata(root.join("slot")).unwrap().dev(),
+                fs::metadata(root.join("slot")).unwrap().ino()).into_bytes();
+            assert!(observed == old || observed == new, "{point:?} produced torn manifest");
+            assert_eq!(namespace.create_private_dir("again"), Err(NamespaceError::Mismatch));
+            let _ = fs::remove_dir(root.join("slot"));
+            for entry in fs::read_dir(&root).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_string_lossy().starts_with(".quotabar-c3b1-tmp-") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+            let _ = fs::remove_file(root.join(MANIFEST));
+            let _ = fs::remove_dir(root);
+        }
     }
 
     #[test]
