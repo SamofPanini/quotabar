@@ -28,6 +28,8 @@ const FRAME_BURST: u8 = 4;
 const FRAME_REFILL: Duration = Duration::from_secs(15);
 const CHILD_DATA_FD: RawFd = 198;
 const CHILD_REVOKE_FD: RawFd = 199;
+#[cfg(test)]
+const CHILD_TEST_READY_FD: RawFd = 200;
 // Keep prepared sources outside the complete target set.  These descriptors
 // exist only between parent setup and exec; the child closes them after the
 // two target mappings have been installed.
@@ -35,6 +37,9 @@ const CHILD_SAFE_FD_MIN: RawFd = 256;
 const CHILD_EXIT_POLL_TICK: Duration = Duration::from_millis(25);
 const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(100);
 const CHILD_STAGE_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD_STAGE";
+const PRIVATE_SYNTHETIC_CHILD_ARG: &str = "--quotabar-private-synthetic-child";
+#[cfg(test)]
+const PRIVATE_SYNTHETIC_CHILD_ARG_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD_ARG";
 const CHILD_TEST_NAME: &str =
     "services::claude_validation_transport::tests::owned_session_child_entry";
 
@@ -122,10 +127,15 @@ struct SpawnOwnedSession {
     generation: u64,
     #[cfg(test)]
     audit: Option<std::sync::Arc<TestLaunchAudit>>,
-    #[cfg(test)]
-    revoke_peer_for_test: Option<UnixStream>,
-    #[cfg(test)]
-    ready_receiver_for_test: Option<UnixStream>,
+}
+
+/// An already-prepared child descriptor plan.  Construction occurs before
+/// fork; `pre_exec` is limited to the fixed async-signal-safe operations in
+/// `install_prepared_child_fds` below.
+#[derive(Clone, Copy, Debug)]
+struct PreparedChildFdRemap {
+    data_source: RawFd,
+    revoke_source: RawFd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +143,10 @@ enum OwnedChildMode {
     Session,
     ExitBeforeRegistration,
     ExitAfterBootstrap,
+    ExitNonzeroAfterBootstrap,
+    ExitAfterDataEof,
+    IgnoreRevokeAfterDataEof,
+    TruncatedHeader,
     BlockAfterHandshakeByte,
     SubmitAvailable,
     SubmitUnavailable,
@@ -149,6 +163,10 @@ impl OwnedChildMode {
             Self::Session => "session",
             Self::ExitBeforeRegistration => "exit-before-registration",
             Self::ExitAfterBootstrap => "exit-after-bootstrap",
+            Self::ExitNonzeroAfterBootstrap => "exit-nonzero-after-bootstrap",
+            Self::ExitAfterDataEof => "exit-after-data-eof",
+            Self::IgnoreRevokeAfterDataEof => "ignore-revoke-after-data-eof",
+            Self::TruncatedHeader => "truncated-header",
             Self::BlockAfterHandshakeByte => "block-after-handshake-byte",
             Self::SubmitAvailable => "submit-available",
             Self::SubmitUnavailable => "submit-unavailable",
@@ -182,6 +200,11 @@ struct OwnedLaunchSpec {
 struct TestLaunchAudit {
     originals_closed_in_parent: std::sync::atomic::AtomicBool,
     child_reaped: std::sync::atomic::AtomicBool,
+    child_exit_success: std::sync::atomic::AtomicBool,
+    child_exit_nonzero: std::sync::atomic::AtomicBool,
+    child_killed: std::sync::atomic::AtomicBool,
+    ready_receiver: std::sync::Mutex<Option<UnixStream>>,
+    revoke_sender: std::sync::Mutex<Option<UnixStream>>,
 }
 
 impl OwnedLaunchSpec {
@@ -193,6 +216,13 @@ impl OwnedLaunchSpec {
             audit: std::sync::Arc::new(TestLaunchAudit::default()),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TOP_LEVEL_LAUNCH: std::cell::RefCell<Option<OwnedLaunchSpec>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -215,6 +245,13 @@ pub(crate) fn run_owned_validation_session(
     plan: PlanMetadata,
     now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
+    #[cfg(test)]
+    let spec = TEST_TOP_LEVEL_LAUNCH.with(|slot| {
+        slot.borrow()
+            .clone()
+            .unwrap_or_else(OwnedLaunchSpec::production)
+    });
+    #[cfg(not(test))]
     let spec = OwnedLaunchSpec::production();
     let mut owner = spawn_owned_session(store, pairing, plan, now, &spec)?;
     run_spawn_owned_session(&mut owner, store, pairing)
@@ -245,32 +282,64 @@ impl SpawnOwnedSession {
             generation,
             #[cfg(test)]
             audit: None,
-            #[cfg(test)]
-            revoke_peer_for_test: None,
-            #[cfg(test)]
-            ready_receiver_for_test: None,
         }
     }
 
-    fn revoke_and_reap(&mut self, pairing: &PairingRegistry) {
+    fn revoke_and_reap(&mut self, pairing: &PairingRegistry) -> Result<(), TransportError> {
         pairing.revoke(&self.slot, self.generation);
         // This control endpoint is intentionally private to the spawn owner.
         // A best-effort byte wakes a cooperating child; failure is harmless
         // because the owned child is subsequently terminated and reaped.
         let _ = self.revoke.write_all(b"revoke");
-        let cleanup_deadline = Instant::now() + CHILD_CLEANUP_GRACE;
-        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < cleanup_deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        let exit = wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)?;
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let exit = match exit {
+            Some(exit) => exit,
+            None => {
+                #[cfg(test)]
+                if let Some(audit) = &self.audit {
+                    audit
+                        .child_killed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.child
+                    .kill()
+                    .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+                wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)?
+                    .ok_or(TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?
+            }
+        };
         #[cfg(test)]
         if let Some(audit) = &self.audit {
             audit
                 .child_reaped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            audit
+                .child_exit_success
+                .store(exit.success(), std::sync::atomic::Ordering::SeqCst);
+            audit.child_exit_nonzero.store(
+                exit.code().is_some_and(|code| code != 0),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn wait_for_child_exit_bounded(
+    child: &mut Child,
+    budget: Duration,
+) -> Result<Option<std::process::ExitStatus>, TransportError> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit)) => return Ok(Some(exit)),
+            Ok(None) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
         }
     }
 }
@@ -287,6 +356,26 @@ fn duplicate_child_source(source: RawFd) -> Result<RawFd, TransportError> {
     }
 }
 
+fn prepare_child_fd_remap(
+    data_source: RawFd,
+    revoke_source: RawFd,
+) -> Result<PreparedChildFdRemap, TransportError> {
+    // Copy both sources before either fixed target can be overwritten.  This
+    // handles every source/target alias and permutation deterministically.
+    let data_source = duplicate_child_source(data_source)?;
+    let revoke_source = match duplicate_child_source(revoke_source) {
+        Ok(fd) => fd,
+        Err(error) => {
+            close_prepared_child_source(data_source);
+            return Err(error);
+        }
+    };
+    Ok(PreparedChildFdRemap {
+        data_source,
+        revoke_source,
+    })
+}
+
 fn close_prepared_child_source(fd: RawFd) {
     // The result is intentionally ignored: a failed close cannot make a
     // prepared descriptor usable by this parent, and the child has its own
@@ -296,10 +385,9 @@ fn close_prepared_child_source(fd: RawFd) {
     }
 }
 
-unsafe fn install_prepared_child_fds(
-    data_source: RawFd,
-    revoke_source: RawFd,
-) -> std::io::Result<()> {
+unsafe fn install_prepared_child_fds(plan: PreparedChildFdRemap) -> std::io::Result<()> {
+    let data_source = plan.data_source;
+    let revoke_source = plan.revoke_source;
     debug_assert_ne!(data_source, CHILD_DATA_FD);
     debug_assert_ne!(data_source, CHILD_REVOKE_FD);
     debug_assert_ne!(revoke_source, CHILD_DATA_FD);
@@ -327,21 +415,24 @@ fn spawn_owned_session(
         UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
     let (revoke, child_revoke) =
         UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    #[cfg(test)]
+    let (test_ready_receiver, child_ready) =
+        UnixStream::pair().map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
     let child_data_fd = child_data.as_raw_fd();
     let child_revoke_fd = child_revoke.as_raw_fd();
     #[cfg(test)]
-    let test_revoke_peer = child_revoke
+    let test_revoke_sender = revoke
         .try_clone()
         .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
     #[cfg(test)]
-    let test_ready_receiver = revoke
-        .try_clone()
-        .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
-    let prepared_data_fd = duplicate_child_source(child_data_fd)?;
-    let prepared_revoke_fd = match duplicate_child_source(child_revoke_fd) {
+    let child_ready_fd = child_ready.as_raw_fd();
+    let prepared = prepare_child_fd_remap(child_data_fd, child_revoke_fd)?;
+    #[cfg(test)]
+    let prepared_test_ready_fd = match duplicate_child_source(child_ready_fd) {
         Ok(fd) => fd,
         Err(error) => {
-            close_prepared_child_source(prepared_data_fd);
+            close_prepared_child_source(prepared.data_source);
+            close_prepared_child_source(prepared.revoke_source);
             return Err(error);
         }
     };
@@ -350,6 +441,8 @@ fn spawn_owned_session(
     // parent endpoint can leak into the child through the launch setup.
     drop(child_data);
     drop(child_revoke);
+    #[cfg(test)]
+    drop(child_ready);
 
     let executable = if spec.fault == OwnedLaunchFault::MissingExecutable {
         std::path::PathBuf::from("/quotabar-c3b1/missing-fixed-synthetic-child")
@@ -363,12 +456,12 @@ fn spawn_owned_session(
         command
             .arg("--exact")
             .arg(CHILD_TEST_NAME)
-            .arg("--nocapture")
-            .env(CHILD_STAGE_ENV, spec.mode.name());
+            .env(CHILD_STAGE_ENV, spec.mode.name())
+            .env(PRIVATE_SYNTHETIC_CHILD_ARG_ENV, PRIVATE_SYNTHETIC_CHILD_ARG);
     }
     #[cfg(not(test))]
     {
-        command.arg("--quotabar-private-synthetic-child");
+        command.arg(PRIVATE_SYNTHETIC_CHILD_ARG);
     }
     let force_pre_exec_failure = spec.fault == OwnedLaunchFault::PreExec;
     unsafe {
@@ -379,12 +472,22 @@ fn spawn_owned_session(
                     "fixed pre-exec failure",
                 ));
             }
-            install_prepared_child_fds(prepared_data_fd, prepared_revoke_fd)
+            install_prepared_child_fds(prepared)?;
+            #[cfg(test)]
+            if libc::dup2(prepared_test_ready_fd, CHILD_TEST_READY_FD) < 0
+                || libc::fcntl(CHILD_TEST_READY_FD, libc::F_SETFD, 0) < 0
+                || libc::close(prepared_test_ready_fd) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         });
     }
     let spawned = command.spawn();
-    close_prepared_child_source(prepared_data_fd);
-    close_prepared_child_source(prepared_revoke_fd);
+    close_prepared_child_source(prepared.data_source);
+    close_prepared_child_source(prepared.revoke_source);
+    #[cfg(test)]
+    close_prepared_child_source(prepared_test_ready_fd);
     let mut child = spawned.map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
 
     #[cfg(test)]
@@ -395,6 +498,17 @@ fn spawn_owned_session(
         true,
         std::sync::atomic::Ordering::SeqCst,
     );
+    #[cfg(test)]
+    {
+        let ready_for_audit = test_ready_receiver
+            .try_clone()
+            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+        let revoke_for_audit = test_revoke_sender
+            .try_clone()
+            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+        *spec.audit.ready_receiver.lock().unwrap() = Some(ready_for_audit);
+        *spec.audit.revoke_sender.lock().unwrap() = Some(revoke_for_audit);
+    }
 
     if spec.mode == OwnedChildMode::ExitBeforeRegistration {
         let _ = child.wait();
@@ -425,10 +539,6 @@ fn spawn_owned_session(
         generation: bootstrap.epoch(),
         #[cfg(test)]
         audit: Some(spec.audit.clone()),
-        #[cfg(test)]
-        revoke_peer_for_test: Some(test_revoke_peer),
-        #[cfg(test)]
-        ready_receiver_for_test: Some(test_ready_receiver),
     };
     let bootstrap_result = if spec.fault == OwnedLaunchFault::BootstrapPartial {
         owner.parent.write_all(&[0, 0]).and_then(|_| {
@@ -441,7 +551,7 @@ fn spawn_owned_session(
         bootstrap.write_private_payload(&mut owner.parent)
     };
     if bootstrap_result.is_err() {
-        owner.revoke_and_reap(pairing);
+        let _ = owner.revoke_and_reap(pairing);
         return Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed));
     }
     Ok(owner)
@@ -463,8 +573,10 @@ fn run_spawn_owned_session(
     // EOF is a transport terminal, not permission to wait indefinitely for a
     // non-cooperating owned child.  The same private revoke/terminate/reap
     // path is used for every terminal result.
-    owner.revoke_and_reap(pairing);
-    result
+    match owner.revoke_and_reap(pairing) {
+        Ok(()) => result,
+        Err(error) => Err(error),
+    }
 }
 
 fn wait_for_first_byte_or_revoke(owner: &mut SpawnOwnedSession) -> Result<(), TransportError> {
@@ -1236,6 +1348,13 @@ mod tests {
     use std::sync::atomic::Ordering;
     use uuid::Uuid;
 
+    fn owned_child_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
     fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
         stream
             .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -1265,13 +1384,104 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
     }
 
+    fn duplicate_to(source: RawFd, target: RawFd) {
+        assert_eq!(unsafe { libc::dup2(source, target) }, target);
+    }
+
+    fn read_exact_fd(fd: RawFd, expected: u8) {
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) },
+            1
+        );
+        assert_eq!(byte, expected);
+    }
+
+    fn restore_fd(target: RawFd, saved: RawFd) {
+        unsafe {
+            libc::close(target);
+            if saved >= 0 {
+                assert_eq!(libc::dup2(saved, target), target);
+                libc::close(saved);
+            }
+        }
+    }
+
+    fn assert_exact_fd_remap(data_source: RawFd, revoke_source: RawFd) {
+        let plan = prepare_child_fd_remap(data_source, revoke_source).unwrap();
+        assert!(plan.data_source >= CHILD_SAFE_FD_MIN);
+        assert!(plan.revoke_source >= CHILD_SAFE_FD_MIN);
+        assert_ne!(plan.data_source, plan.revoke_source);
+        unsafe { install_prepared_child_fds(plan) }.unwrap();
+        for source in [plan.data_source, plan.revoke_source] {
+            assert_eq!(unsafe { libc::fcntl(source, libc::F_GETFD) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+    }
+
+    // libtest reserves process argv for its own selector, so the fixed private
+    // child argument is delivered through this test-only dispatch envelope.
+    // The receiver is deliberately exact: an alternate argument cannot enter
+    // the inherited-FD child path.
+    fn dispatch_private_synthetic_child_for_test(argument: &str) -> bool {
+        argument == PRIVATE_SYNTHETIC_CHILD_ARG
+    }
+
+    #[test]
+    fn prepared_fd_remap_is_deterministic_for_collision_and_permutation_layouts() {
+        let _guard = owned_child_test_lock();
+        // These are explicit descriptor layouts, not allocator accidents. The
+        // production preparation and pre-exec execution boundary are both
+        // exercised for source==target, A==target(B), a full swap, a future
+        // target hit, and adjacent high descriptors.
+        for (label, data_layout, revoke_layout) in [
+            ("source-equals-target", CHILD_DATA_FD, 270),
+            ("data-is-revoke-target", CHILD_REVOKE_FD, 270),
+            ("swap", CHILD_REVOKE_FD, CHILD_DATA_FD),
+            ("future-target", 270, CHILD_DATA_FD),
+            ("adjacent-high", 700, 701),
+        ] {
+            let saved_data = unsafe { libc::fcntl(CHILD_DATA_FD, libc::F_DUPFD_CLOEXEC, 300) };
+            let saved_revoke = unsafe { libc::fcntl(CHILD_REVOKE_FD, libc::F_DUPFD_CLOEXEC, 302) };
+            let (data_end, mut data_peer) = UnixStream::pair().unwrap();
+            let (revoke_end, mut revoke_peer) = UnixStream::pair().unwrap();
+            duplicate_to(data_end.as_raw_fd(), data_layout);
+            duplicate_to(revoke_end.as_raw_fd(), revoke_layout);
+
+            assert_exact_fd_remap(data_layout, revoke_layout);
+            data_peer.write_all(b"D").unwrap();
+            revoke_peer.write_all(b"R").unwrap();
+            read_exact_fd(CHILD_DATA_FD, b'D');
+            read_exact_fd(CHILD_REVOKE_FD, b'R');
+
+            let mut close_after = std::collections::BTreeSet::new();
+            close_after.insert(data_layout);
+            close_after.insert(revoke_layout);
+            for fd in close_after {
+                if fd != CHILD_DATA_FD && fd != CHILD_REVOKE_FD {
+                    unsafe { libc::close(fd) };
+                }
+            }
+            restore_fd(CHILD_DATA_FD, saved_data);
+            restore_fd(CHILD_REVOKE_FD, saved_revoke);
+            drop(data_end);
+            drop(revoke_end);
+            assert!(label.len() > 1);
+        }
+    }
+
     #[test]
     fn owned_session_child_entry() {
         let Ok(stage) = std::env::var(CHILD_STAGE_ENV) else {
             return;
         };
+        let private_argument = std::env::var(PRIVATE_SYNTHETIC_CHILD_ARG_ENV).unwrap();
+        assert!(dispatch_private_synthetic_child_for_test(&private_argument));
         if stage == "owned-second-exec" {
-            for fd in [CHILD_DATA_FD, CHILD_REVOKE_FD] {
+            for fd in [CHILD_DATA_FD, CHILD_REVOKE_FD, CHILD_TEST_READY_FD] {
                 assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
                 assert_eq!(
                     std::io::Error::last_os_error().raw_os_error(),
@@ -1283,9 +1493,11 @@ mod tests {
 
         let mut data = unsafe { UnixStream::from_raw_fd(CHILD_DATA_FD) };
         let mut revoke = unsafe { UnixStream::from_raw_fd(CHILD_REVOKE_FD) };
+        let mut ready = unsafe { UnixStream::from_raw_fd(CHILD_TEST_READY_FD) };
         assert!(!has_cloexec(data.as_raw_fd()));
         assert!(!has_cloexec(revoke.as_raw_fd()));
-        for fd in [data.as_raw_fd(), revoke.as_raw_fd()] {
+        assert!(!has_cloexec(ready.as_raw_fd()));
+        for fd in [data.as_raw_fd(), revoke.as_raw_fd(), ready.as_raw_fd()] {
             assert_eq!(
                 unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
                 0
@@ -1297,6 +1509,7 @@ mod tests {
             .arg(CHILD_TEST_NAME)
             .arg("--nocapture")
             .env(CHILD_STAGE_ENV, "owned-second-exec")
+            .env(PRIVATE_SYNTHETIC_CHILD_ARG_ENV, PRIVATE_SYNTHETIC_CHILD_ARG)
             .status()
             .unwrap();
         assert!(second.success());
@@ -1313,14 +1526,35 @@ mod tests {
             revoke.write_all(b"E").unwrap();
             return;
         }
+        if stage == OwnedChildMode::ExitNonzeroAfterBootstrap.name() {
+            revoke.write_all(b"E").unwrap();
+            std::process::exit(7);
+        }
+        if stage == OwnedChildMode::ExitAfterDataEof.name() {
+            revoke.write_all(b"E").unwrap();
+            data.shutdown(Shutdown::Write).unwrap();
+            return;
+        }
+        if stage == OwnedChildMode::IgnoreRevokeAfterDataEof.name() {
+            data.shutdown(Shutdown::Write).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        if stage == OwnedChildMode::TruncatedHeader.name() {
+            data.write_all(&[0]).unwrap();
+            data.shutdown(Shutdown::Write).unwrap();
+            return;
+        }
         if stage == OwnedChildMode::BlockAfterHandshakeByte.name() {
             data.write_all(&[0]).unwrap();
             // The data byte establishes a partial handshake.  Use the private
-            // control channel for the test barrier so scheduling evidence does
-            // not depend on a readiness event from the FD under test.
-            revoke.write_all(b"B").unwrap();
+            // test-only ready descriptor for the barrier so the production
+            // revoke channel remains available to the monitored owner.
+            ready.write_all(b"B").unwrap();
             let mut signal = [0u8; 1];
             revoke.read_exact(&mut signal).unwrap();
+            revoke.write_all(b"R").unwrap();
             return;
         }
 
@@ -1417,6 +1651,20 @@ mod tests {
         assert_ne!(watched.revents & libc::POLLIN, 0);
     }
 
+    fn wait_until_store_appears(store: &ClaudeSnapshotStore) -> Vec<u8> {
+        let watchdog = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(bytes) = store.persisted_state_bytes_for_test() {
+                return bytes;
+            }
+            assert!(
+                Instant::now() < watchdog,
+                "store appearance watchdog expired"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     fn wait_until_store_changes(store: &ClaudeSnapshotStore, before: &[u8]) -> Vec<u8> {
         let watchdog = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1429,92 +1677,153 @@ mod tests {
         }
     }
 
+    fn run_top_level_owned_session_for_test(
+        store: &ClaudeSnapshotStore,
+        pairing: &PairingRegistry,
+        plan: PlanMetadata,
+        spec: OwnedLaunchSpec,
+    ) -> Result<(), TransportError> {
+        TEST_TOP_LEVEL_LAUNCH.with(|slot| *slot.borrow_mut() = Some(spec));
+        let result = run_owned_validation_session(store, pairing, plan, Utc::now());
+        TEST_TOP_LEVEL_LAUNCH.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    fn take_test_control_stream(
+        slot: &std::sync::Mutex<Option<UnixStream>>,
+        label: &str,
+    ) -> UnixStream {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(stream) = slot.lock().unwrap().take() {
+                return stream;
+            }
+            assert!(Instant::now() < deadline, "{label} was not published");
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
-    fn production_owned_spawn_covers_failure_cleanup_and_fd_provenance() {
-        for fault in [
-            OwnedLaunchFault::MissingExecutable,
-            OwnedLaunchFault::PreExec,
+    fn top_level_eof_exit_reap_matrix_has_one_fixed_result_per_case() {
+        let _guard = owned_child_test_lock();
+        for (label, mode, expected, success, nonzero, killed) in [
+            (
+                "clean-child-exit",
+                OwnedChildMode::ExitAfterBootstrap,
+                SessionEnd::ChildExited,
+                true,
+                false,
+                false,
+            ),
+            (
+                "nonzero-child-exit",
+                OwnedChildMode::ExitNonzeroAfterBootstrap,
+                SessionEnd::ChildExited,
+                false,
+                true,
+                false,
+            ),
+            (
+                "data-eof-child-alive",
+                OwnedChildMode::IgnoreRevokeAfterDataEof,
+                SessionEnd::CleanEof,
+                false,
+                false,
+                true,
+            ),
+            (
+                "data-hup-and-exit",
+                OwnedChildMode::ExitAfterDataEof,
+                SessionEnd::ChildExited,
+                true,
+                false,
+                false,
+            ),
         ] {
-            let (root, store) = fresh_store("spawn-failure");
+            let (root, store) = fresh_store(label);
             let pairing = PairingRegistry::new();
-            let spec = OwnedLaunchSpec::test(OwnedChildMode::Session, fault);
+            let spec = OwnedLaunchSpec::test(mode, OwnedLaunchFault::None);
+            let audit = spec.audit.clone();
             assert_eq!(
-                spawn_owned_session(
-                    &store,
-                    &pairing,
-                    PlanMetadata::Paid,
-                    chrono::Utc::now(),
-                    &spec,
-                )
-                .unwrap_err(),
-                TransportError::Ended(SessionEnd::WorkerOrStoreFailed)
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
+                Err(TransportError::Ended(expected)),
+                "{label}"
             );
-            assert_eq!(pairing.pending_count_for_test(), 0);
+            assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
+            assert_eq!(
+                audit.child_exit_success.load(Ordering::SeqCst),
+                success,
+                "{label}"
+            );
+            assert_eq!(
+                audit.child_exit_nonzero.load(Ordering::SeqCst),
+                nonzero,
+                "{label}"
+            );
+            assert_eq!(audit.child_killed.load(Ordering::SeqCst), killed, "{label}");
+            assert_eq!(pairing.pending_count_for_test(), 0, "{label}");
             let _ = std::fs::remove_dir_all(root);
         }
 
-        let (root, store) = fresh_store("exit-before-registration");
-        let pairing = PairingRegistry::new();
-        let spec = OwnedLaunchSpec::test(
-            OwnedChildMode::ExitBeforeRegistration,
-            OwnedLaunchFault::None,
-        );
+        // The monitor checks an observed child exit before ready revoke data,
+        // so an exit/revoke race has a fixed ChildExited precedence.
+        let (parent, child_end) = UnixStream::pair().unwrap();
+        let (revoke, mut revoke_peer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        drop(child_end);
+        revoke_peer.write_all(b"R").unwrap();
+        let mut monitor = SessionMonitor {
+            revoke_fd: Some(revoke.as_raw_fd()),
+            child: Some(&mut child),
+        };
         assert_eq!(
-            spawn_owned_session(
-                &store,
-                &pairing,
-                PlanMetadata::Paid,
-                chrono::Utc::now(),
-                &spec,
-            )
-            .unwrap_err(),
-            TransportError::Ended(SessionEnd::ChildExited)
+            wait_for_data(&parent, &mut monitor, None),
+            Err(TransportError::Ended(SessionEnd::ChildExited))
         );
-        assert!(spec.audit.originals_closed_in_parent.load(Ordering::SeqCst));
-        assert!(spec.audit.child_reaped.load(Ordering::SeqCst));
-        assert_eq!(pairing.pending_count_for_test(), 0);
-        let _ = std::fs::remove_dir_all(root);
+    }
 
-        let (root, store) = fresh_store("bootstrap-failure");
-        let pairing = PairingRegistry::new();
-        let spec =
-            OwnedLaunchSpec::test(OwnedChildMode::Session, OwnedLaunchFault::BootstrapPartial);
-        assert_eq!(
-            spawn_owned_session(
-                &store,
-                &pairing,
-                PlanMetadata::Paid,
-                chrono::Utc::now(),
-                &spec,
-            )
-            .unwrap_err(),
-            TransportError::Ended(SessionEnd::WorkerOrStoreFailed)
-        );
-        assert!(spec.audit.child_reaped.load(Ordering::SeqCst));
-        assert_eq!(pairing.pending_count_for_test(), 0);
-        let _ = std::fs::remove_dir_all(root);
-
-        for mode in [OwnedChildMode::ExitAfterBootstrap, OwnedChildMode::Session] {
-            let (root, store) = fresh_store("owned-session");
+    #[test]
+    fn production_owned_spawn_covers_failure_cleanup_and_fd_provenance() {
+        let _guard = owned_child_test_lock();
+        for (label, mode, fault, expected) in [
+            (
+                "missing-executable",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::MissingExecutable,
+                SessionEnd::WorkerOrStoreFailed,
+            ),
+            (
+                "pre-exec",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::PreExec,
+                SessionEnd::WorkerOrStoreFailed,
+            ),
+            (
+                "exit-before-registration",
+                OwnedChildMode::ExitBeforeRegistration,
+                OwnedLaunchFault::None,
+                SessionEnd::ChildExited,
+            ),
+            (
+                "bootstrap-partial",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::BootstrapPartial,
+                SessionEnd::WorkerOrStoreFailed,
+            ),
+        ] {
+            let (root, store) = fresh_store(label);
             let pairing = PairingRegistry::new();
-            let spec = OwnedLaunchSpec::test(mode, OwnedLaunchFault::None);
-            let mut owner = spawn_owned_session(
-                &store,
-                &pairing,
-                PlanMetadata::Paid,
-                chrono::Utc::now(),
-                &spec,
-            )
-            .unwrap();
-            let result = run_spawn_owned_session(&mut owner, &store, &pairing);
-            let expected = if mode == OwnedChildMode::ExitAfterBootstrap {
-                SessionEnd::ChildExited
-            } else {
-                SessionEnd::CleanEof
-            };
-            assert_eq!(result, Err(TransportError::Ended(expected)));
-            assert!(spec.audit.originals_closed_in_parent.load(Ordering::SeqCst));
-            assert!(spec.audit.child_reaped.load(Ordering::SeqCst));
+            let spec = OwnedLaunchSpec::test(mode, fault);
+            let audit = spec.audit.clone();
+            assert_eq!(
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
+                Err(TransportError::Ended(expected)),
+                "{label}"
+            );
+            if fault != OwnedLaunchFault::MissingExecutable && fault != OwnedLaunchFault::PreExec {
+                assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
+            }
             assert_eq!(pairing.pending_count_for_test(), 0);
             let _ = std::fs::remove_dir_all(root);
         }
@@ -1522,6 +1831,7 @@ mod tests {
 
     #[test]
     fn two_real_children_interleave_deterministically_for_25_iterations() {
+        let _guard = owned_child_test_lock();
         for iteration in 0..25 {
             let (root, store) = fresh_store("two-child");
             let store = std::sync::Arc::new(store);
@@ -1531,15 +1841,23 @@ mod tests {
                 OwnedChildMode::BlockAfterHandshakeByte,
                 OwnedLaunchFault::None,
             );
-            let mut a_owner =
-                spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &a_spec)
-                    .unwrap();
-            let mut ready_receiver = a_owner.ready_receiver_for_test.take().unwrap();
+            let a_audit = a_spec.audit.clone();
+            let a_store = store.clone();
+            let a_pairing = pairing.clone();
+            let a_worker = std::thread::spawn(move || {
+                run_top_level_owned_session_for_test(
+                    &a_store,
+                    &a_pairing,
+                    PlanMetadata::Paid,
+                    a_spec,
+                )
+            });
+            let mut ready_receiver = take_test_control_stream(&a_audit.ready_receiver, "A barrier");
             wait_until_readable(ready_receiver.as_raw_fd());
             let mut ready = [0u8; 1];
             ready_receiver.read_exact(&mut ready).unwrap();
             assert_eq!(ready, *b"B");
-            let mut revoke_a = a_owner.revoke_peer_for_test.take().unwrap();
+            let mut revoke_a = take_test_control_stream(&a_audit.revoke_sender, "A revoke");
 
             let b_mode = if iteration % 2 == 0 {
                 OwnedChildMode::SubmitAvailable
@@ -1547,19 +1865,12 @@ mod tests {
                 OwnedChildMode::SubmitUnavailable
             };
             let b_spec = OwnedLaunchSpec::test(b_mode, OwnedLaunchFault::None);
-            let mut b_owner =
-                spawn_owned_session(&store, &pairing, PlanMetadata::Free, Utc::now(), &b_spec)
-                    .unwrap();
+            let b_audit = b_spec.audit.clone();
             let before_b = store.persisted_state_bytes_for_test().unwrap();
-
-            let a_store = store.clone();
-            let a_pairing = pairing.clone();
-            let a_worker = std::thread::spawn(move || {
-                run_spawn_owned_session(&mut a_owner, &a_store, &a_pairing)
-            });
             assert!(pairing.try_lock_available_for_test());
 
-            let b_result = run_spawn_owned_session(&mut b_owner, &store, &pairing);
+            let b_result =
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Free, b_spec);
             assert!(
                 matches!(b_result, Err(TransportError::Ended(SessionEnd::CleanEof))),
                 "iteration {iteration}: unexpected B result {b_result:?}"
@@ -1580,8 +1891,8 @@ mod tests {
                 after_b,
                 "iteration {iteration}: A changed durable bytes"
             );
-            assert!(a_spec.audit.child_reaped.load(Ordering::SeqCst));
-            assert!(b_spec.audit.child_reaped.load(Ordering::SeqCst));
+            assert!(a_audit.child_reaped.load(Ordering::SeqCst));
+            assert!(b_audit.child_reaped.load(Ordering::SeqCst));
             assert_eq!(pairing.pending_count_for_test(), 0);
 
             let projection = store.project(Utc::now()).unwrap();
@@ -1612,6 +1923,7 @@ mod tests {
 
     #[test]
     fn production_owned_seam_covers_rejection_and_lifecycle_matrix() {
+        let _guard = owned_child_test_lock();
         for mode in [
             OwnedChildMode::RejectWrongSlot,
             OwnedChildMode::RejectOldEpoch,
@@ -1620,15 +1932,11 @@ mod tests {
             let (root, store) = fresh_store("owned-reject");
             let pairing = PairingRegistry::new();
             let spec = OwnedLaunchSpec::test(mode, OwnedLaunchFault::None);
-            let mut owner =
-                spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &spec)
-                    .unwrap();
-            let before = store.persisted_state_bytes_for_test().unwrap();
             assert_eq!(
-                run_spawn_owned_session(&mut owner, &store, &pairing),
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
                 Err(TransportError::Ended(SessionEnd::ProtocolRejected))
             );
-            assert_eq!(store.persisted_state_bytes_for_test().unwrap(), before);
+            assert_eq!(pairing.pending_count_for_test(), 0);
             let _ = std::fs::remove_dir_all(root);
         }
 
@@ -1640,35 +1948,36 @@ mod tests {
             let (root, store) = fresh_store("owned-accepted");
             let pairing = PairingRegistry::new();
             let spec = OwnedLaunchSpec::test(mode, OwnedLaunchFault::None);
-            let mut owner =
-                spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &spec)
-                    .unwrap();
-            let before = store.persisted_state_bytes_for_test().unwrap();
             assert_eq!(
-                run_spawn_owned_session(&mut owner, &store, &pairing),
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
                 Err(TransportError::Ended(SessionEnd::CleanEof))
             );
-            assert_ne!(store.persisted_state_bytes_for_test().unwrap(), before);
+            assert!(store.persisted_state_bytes_for_test().is_ok());
             let _ = std::fs::remove_dir_all(root);
         }
     }
 
     #[test]
     fn production_owned_replay_preserves_bytes_after_first_commit() {
+        let _guard = owned_child_test_lock();
         let (root, store) = fresh_store("owned-replay");
         let store = std::sync::Arc::new(store);
         let pairing = std::sync::Arc::new(PairingRegistry::new());
         let spec = OwnedLaunchSpec::test(OwnedChildMode::RejectReplay, OwnedLaunchFault::None);
-        let mut owner =
-            spawn_owned_session(&store, &pairing, PlanMetadata::Paid, Utc::now(), &spec).unwrap();
-        let mut continue_child = owner.revoke.try_clone().unwrap();
-        let before = store.persisted_state_bytes_for_test().unwrap();
+        let audit = spec.audit.clone();
         let worker_store = store.clone();
         let worker_pairing = pairing.clone();
         let worker = std::thread::spawn(move || {
-            run_spawn_owned_session(&mut owner, &worker_store, &worker_pairing)
+            run_top_level_owned_session_for_test(
+                &worker_store,
+                &worker_pairing,
+                PlanMetadata::Paid,
+                spec,
+            )
         });
-        let after_first = wait_until_store_changes(&store, &before);
+        let registered = wait_until_store_appears(&store);
+        let after_first = wait_until_store_changes(&store, &registered);
+        let mut continue_child = take_test_control_stream(&audit.revoke_sender, "replay continue");
         continue_child.write_all(b"C").unwrap();
         assert_eq!(
             worker.join().unwrap(),
@@ -1716,133 +2025,6 @@ mod tests {
             "{{\"event\":\"{event}\",\"slot\":\"{slot}\",\"epoch\":\"{epoch}\",\"sequence\":\"{sequence}\",\"observedAt\":\"2024-01-01T00:00:00Z\"}}"
         )
         .into_bytes()
-    }
-
-    #[test]
-    fn reexecuted_synthetic_child_uses_private_inherited_fd() {
-        match std::env::var(CHILD_STAGE_ENV).ok().as_deref() {
-            Some("bootstrap") => {
-                synthetic_child();
-                return;
-            }
-            Some("second-exec") => {
-                assert_eq!(
-                    unsafe { libc::fcntl(3, libc::F_GETFD) },
-                    -1,
-                    "CLOEXEC must close the bootstrap mapping before a second exec"
-                );
-                assert_eq!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(libc::EBADF)
-                );
-                return;
-            }
-            _ => {}
-        }
-        // A real re-exec is intentionally exercised once. Repeating process
-        // creation here makes CI depend on host scheduling rather than the FD
-        // provenance invariant being proved; sustained-rate repetition stays
-        // in the deterministic in-process bucket test below.
-        run_reexecuted_synthetic_child_once();
-    }
-
-    fn run_reexecuted_synthetic_child_once() {
-        let (parent_bootstrap, child_bootstrap) = UnixStream::pair().unwrap();
-        let (parent_revoke, child_revoke) = UnixStream::pair().unwrap();
-        let child_fd = child_bootstrap.as_raw_fd();
-        let revoke_fd = child_revoke.as_raw_fd();
-        assert!(has_cloexec(parent_bootstrap.as_raw_fd()));
-        assert!(has_cloexec(child_fd));
-        assert!(has_cloexec(parent_revoke.as_raw_fd()));
-        assert!(has_cloexec(revoke_fd));
-        let child = unsafe {
-            Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("services::claude_validation_transport::tests::reexecuted_synthetic_child_uses_private_inherited_fd")
-                .arg("--nocapture")
-                .env(CHILD_STAGE_ENV, "bootstrap")
-                .pre_exec(move || {
-                    if libc::dup2(child_fd, 3) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::dup2(revoke_fd, 4) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                })
-                .spawn()
-                .unwrap()
-        };
-        drop(child_bootstrap);
-        drop(child_revoke);
-        let root = std::env::temp_dir().join(format!("quotabar-c3b1-r4-{}", Uuid::new_v4()));
-        let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
-        let pairing = PairingRegistry::new();
-        let now = chrono::Utc::now();
-        let bootstrap = pairing
-            .register_or_rebind(&store, PlanMetadata::Paid, now)
-            .unwrap();
-        let mut owner = SpawnOwnedSession::from_owned_spawn(
-            child,
-            parent_bootstrap,
-            parent_revoke,
-            bootstrap.slot_id().clone(),
-            bootstrap.epoch(),
-        );
-        let slot = bootstrap.slot_id().as_str().as_bytes();
-        let token = bootstrap.token_bytes_for_synthetic_child();
-        let probe = synthetic_handshake(slot, token);
-        assert!(parse_handshake(&probe).is_ok());
-        let mut bytes = Zeroizing::new(Vec::with_capacity(slot.len() + token.len()));
-        bytes.extend_from_slice(slot);
-        bytes.extend_from_slice(token);
-        write_frame(&mut owner.parent, &bytes);
-        assert_eq!(
-            run_spawn_owned_session(&mut owner, &store, &pairing),
-            Err(TransportError::Ended(SessionEnd::CleanEof))
-        );
-        assert_eq!(owner.slot, *bootstrap.slot_id());
-        assert_eq!(owner.generation, bootstrap.epoch());
-        // The terminal owner path observes/reaps the child; Child retains the
-        // observed success status for inspection without another blocking wait.
-        assert!(owner.child.try_wait().unwrap().unwrap().success());
-        std::fs::remove_dir_all(root).unwrap_or(());
-    }
-
-    fn synthetic_child() {
-        let mut bootstrap = unsafe { UnixStream::from_raw_fd(3) };
-        let revoke = unsafe { UnixStream::from_raw_fd(4) };
-        assert!(!has_cloexec(bootstrap.as_raw_fd()));
-        assert!(!has_cloexec(revoke.as_raw_fd()));
-        assert_eq!(
-            unsafe { libc::fcntl(bootstrap.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
-            0
-        );
-        assert!(has_cloexec(bootstrap.as_raw_fd()));
-        assert_eq!(
-            unsafe { libc::fcntl(revoke.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
-            0
-        );
-        assert!(has_cloexec(revoke.as_raw_fd()));
-        let second = Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("services::claude_validation_transport::tests::reexecuted_synthetic_child_uses_private_inherited_fd")
-            .arg("--nocapture")
-            .env(CHILD_STAGE_ENV, "second-exec")
-            .status()
-            .unwrap();
-        assert!(second.success());
-        let payload = Zeroizing::new(read_frame_for_test(&mut bootstrap));
-        let slot_end = 36;
-        let slot = &payload[..slot_end];
-        let token = &payload[slot_end..];
-        let mut stream = bootstrap;
-        let handshake = synthetic_handshake(slot, token);
-        write_frame(&mut stream, &handshake);
-        assert_eq!(
-            read_frame_for_test(&mut stream),
-            br#"{"result":"accepted"}"#
-        );
     }
 
     #[test]
@@ -1977,36 +2159,17 @@ mod tests {
 
     #[test]
     fn failed_owner_session_revokes_exact_generation_and_reaps_child() {
-        let root = std::env::temp_dir().join(format!("quotabar-c3b1-revoke-{}", Uuid::new_v4()));
-        let store = ClaudeSnapshotStore::at_root(root.clone()).unwrap();
+        let _guard = owned_child_test_lock();
+        let (root, store) = fresh_store("revoke-exact-generation");
         let pairing = PairingRegistry::new();
-        let bootstrap = pairing
-            .register_or_rebind(&store, PlanMetadata::Paid, chrono::Utc::now())
-            .unwrap();
-        let token = bootstrap.decoded_token_for_test();
-        let (parent, mut child_end) = UnixStream::pair().unwrap();
-        let (revoke, _child_revoke) = UnixStream::pair().unwrap();
-        let child = Command::new("/usr/bin/true").spawn().unwrap();
-        let mut owner = SpawnOwnedSession::from_owned_spawn(
-            child,
-            parent,
-            revoke,
-            bootstrap.slot_id().clone(),
-            bootstrap.epoch(),
-        );
-        // A malformed one-byte header fails before consume, then the owner
-        // must revoke its still-pending authority and reap its exact child.
-        child_end.write_all(&[0]).unwrap();
-        child_end.shutdown(Shutdown::Write).unwrap();
-        assert!(matches!(
-            run_spawn_owned_session(&mut owner, &store, &pairing),
+        let spec = OwnedLaunchSpec::test(OwnedChildMode::TruncatedHeader, OwnedLaunchFault::None);
+        let audit = spec.audit.clone();
+        assert_eq!(
+            run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
             Err(TransportError::Ended(SessionEnd::HeaderTruncated))
-        ));
-        assert!(owner.child.try_wait().unwrap().is_some());
-        assert!(matches!(
-            pairing.consume(bootstrap.slot_id(), &token),
-            PairingConsume::Rejected
-        ));
+        );
+        assert!(audit.child_reaped.load(Ordering::SeqCst));
+        assert_eq!(pairing.pending_count_for_test(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2028,7 +2191,7 @@ mod tests {
             Err(TransportError::Ended(SessionEnd::Revoked))
         );
         let registry = PairingRegistry::new();
-        owner.revoke_and_reap(&registry);
+        let _ = owner.revoke_and_reap(&registry);
     }
 
     #[test]
@@ -2045,7 +2208,7 @@ mod tests {
             Err(TransportError::Ended(SessionEnd::ChildExited))
         );
         let registry = PairingRegistry::new();
-        owner.revoke_and_reap(&registry);
+        let _ = owner.revoke_and_reap(&registry);
     }
 
     #[test]
@@ -2076,6 +2239,7 @@ mod tests {
 
     #[test]
     fn production_transport_seam_accepts_lifecycle_and_unavailable_routes() {
+        let _guard = owned_child_test_lock();
         let slot = "11111111-1111-4111-8111-111111111111";
         let unavailable = format!(
             "{{\"event\":\"observation\",\"slot\":\"{slot}\",\"epoch\":\"1\",\"sequence\":\"1\",\"observedAt\":\"2024-01-01T00:00:00Z\",\"status\":\"unavailable\",\"errorCode\":\"unavailable\"}}"
@@ -2090,6 +2254,7 @@ mod tests {
 
     #[test]
     fn production_transport_seam_rejects_wrong_slot_and_sequence_skip() {
+        let _guard = owned_child_test_lock();
         let paid = "11111111-1111-4111-8111-111111111111";
         let free = "22222222-2222-4222-8222-222222222222";
         assert_eq!(
