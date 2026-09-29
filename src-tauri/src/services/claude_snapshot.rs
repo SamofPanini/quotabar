@@ -4,6 +4,7 @@
 //! dependency. Future trusted adapters can use the crate-private mutation API;
 //! the webview can only obtain `ClaudeCurrentSnapshotsDto` projections.
 
+use crate::services::state_location::StateProvenance;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -366,6 +367,7 @@ impl ObservationEnvelopeV1 {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClaudeCurrentSnapshotsDto {
     pub(crate) slots: Vec<ClaudeSlotProjectionDto>,
+    pub(crate) provenance: StateProvenance,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -579,11 +581,43 @@ pub(crate) struct ClaudeSnapshotStore {
 }
 
 impl ClaudeSnapshotStore {
+    #[cfg(test)]
     pub(crate) fn in_app_config(config_dir: &Path) -> Result<Self, SnapshotError> {
         validate_no_symlink_ancestors(config_dir)?;
         let config_dir = config_dir.canonicalize().map_err(|_| SnapshotError::Io)?;
         let root = config_dir.join("claude-current-state");
         Self::at_root(root)
+    }
+
+    /// Resolves a durable primary root before the legacy bundle-owned root.
+    /// A malformed primary is an authority failure, not a reason to consult
+    /// legacy state.  Legacy reads deliberately use the read-only projection
+    /// path so an ordinary refresh cannot modify or migrate old data.
+    pub(crate) fn for_projection(
+        primary_root: PathBuf,
+        legacy_root: PathBuf,
+    ) -> Result<(Self, StateProvenance), SnapshotError> {
+        match Self::open_existing(primary_root.clone())? {
+            Some(store) => Ok((store, StateProvenance::Primary)),
+            None => match Self::open_existing(legacy_root)? {
+                Some(store) => Ok((store, StateProvenance::Legacy)),
+                None => Ok((Self::at_root(primary_root)?, StateProvenance::None)),
+            },
+        }
+    }
+
+    fn open_existing(root: PathBuf) -> Result<Option<Self>, SnapshotError> {
+        platform_supported()?;
+        validate_no_symlink_ancestors(&root)?;
+        match fs::symlink_metadata(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(SnapshotError::Io),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() => {
+                return Err(SnapshotError::InvalidState)
+            }
+            Ok(_) => {}
+        }
+        Self::at_root(root).map(Some)
     }
 
     pub(crate) fn at_root(root: PathBuf) -> Result<Self, SnapshotError> {
@@ -990,19 +1024,20 @@ impl ClaudeSnapshotStore {
         if changed {
             self.write_aggregate(&aggregate)?;
         }
-        Ok(ClaudeCurrentSnapshotsDto {
-            slots: aggregate
-                .slots
-                .iter()
-                .map(|slot| ClaudeSlotProjectionDto {
-                    alias: slot.alias.clone(),
-                    binding_state: slot.binding_state,
-                    plan: slot.plan,
-                    five_hour: projection_for(slot, WindowKind::FiveHour, now),
-                    weekly: projection_for(slot, WindowKind::Weekly, now),
-                })
-                .collect(),
-        })
+        Ok(project_dto(&aggregate, now, StateProvenance::Primary))
+    }
+
+    pub(crate) fn project_read_only(
+        &self,
+        now: DateTime<Utc>,
+        provenance: StateProvenance,
+    ) -> Result<ClaudeCurrentSnapshotsDto, SnapshotError> {
+        let mut aggregate = self.load(now)?;
+        if impossible_clock(&aggregate, now) {
+            return Err(SnapshotError::Rejected);
+        }
+        project_expiry(&mut aggregate, now);
+        Ok(project_dto(&aggregate, now, provenance))
     }
 
     fn mutate<F>(&self, now: DateTime<Utc>, change: F) -> Result<(), SnapshotError>
@@ -1169,6 +1204,27 @@ fn recovery_floor(high_water: DateTime<Utc>, window: &WindowRecord) -> DateTime<
     window
         .received_at
         .map_or(high_water, |received| high_water.max(received))
+}
+
+fn project_dto(
+    aggregate: &Aggregate,
+    now: DateTime<Utc>,
+    provenance: StateProvenance,
+) -> ClaudeCurrentSnapshotsDto {
+    ClaudeCurrentSnapshotsDto {
+        slots: aggregate
+            .slots
+            .iter()
+            .map(|slot| ClaudeSlotProjectionDto {
+                alias: slot.alias.clone(),
+                binding_state: slot.binding_state,
+                plan: slot.plan,
+                five_hour: projection_for(slot, WindowKind::FiveHour, now),
+                weekly: projection_for(slot, WindowKind::Weekly, now),
+            })
+            .collect(),
+        provenance,
+    }
 }
 
 fn project_expiry(aggregate: &mut Aggregate, now: DateTime<Utc>) -> bool {
@@ -1778,7 +1834,7 @@ mod tests {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
     }
     fn root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "quotabar-c3a-{name}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2655,6 +2711,100 @@ mod tests {
         let state = s.root.join(STATE_FILE);
         symlink("missing-target", &state).unwrap();
         assert!(matches!(s.project(now()), Err(SnapshotError::InvalidState)));
+    }
+
+    #[test]
+    fn durable_location_precedence_is_fail_closed_and_legacy_projection_is_read_only() {
+        let parent = root("durable-location");
+        fs::create_dir_all(&parent).unwrap();
+        let primary_root = parent.join("primary");
+        let legacy_root = parent.join("legacy");
+        let legacy = ClaudeSnapshotStore::at_root(legacy_root.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174039");
+        register(&legacy, id.clone(), now());
+        legacy
+            .apply_observation(
+                available(
+                    id,
+                    1,
+                    1,
+                    vec![window(
+                        WindowKind::FiveHour,
+                        42.0,
+                        Some(now() + Duration::hours(1)),
+                    )],
+                ),
+                now(),
+            )
+            .unwrap();
+        let before = fs::read(legacy.root.join(STATE_FILE)).unwrap();
+        let (selected, provenance) =
+            ClaudeSnapshotStore::for_projection(primary_root.clone(), legacy_root.clone()).unwrap();
+        assert_eq!(provenance, StateProvenance::Legacy);
+        let projected = selected
+            .project_read_only(now() + FRESH_FOR + Duration::seconds(1), provenance)
+            .unwrap();
+        assert_eq!(projected.provenance, StateProvenance::Legacy);
+        assert_eq!(projected.slots[0].five_hour.used_percent, Some(42.0));
+        assert_eq!(fs::read(legacy.root.join(STATE_FILE)).unwrap(), before);
+
+        let primary = ClaudeSnapshotStore::at_root(primary_root.clone()).unwrap();
+        let (selected, provenance) =
+            ClaudeSnapshotStore::for_projection(primary_root.clone(), legacy_root.clone()).unwrap();
+        assert_eq!(provenance, StateProvenance::Primary);
+        assert_eq!(selected.root, primary.root);
+
+        let empty_parent = parent.join("empty");
+        fs::create_dir_all(&empty_parent).unwrap();
+        let (empty, provenance) = ClaudeSnapshotStore::for_projection(
+            empty_parent.join("primary"),
+            empty_parent.join("legacy"),
+        )
+        .unwrap();
+        assert_eq!(provenance, StateProvenance::None);
+        assert!(!empty.root.join(STATE_FILE).exists());
+
+        let blocked_parent = parent.join("blocked");
+        fs::create_dir_all(&blocked_parent).unwrap();
+        fs::write(blocked_parent.join("primary"), b"not-a-directory").unwrap();
+        let fallback = ClaudeSnapshotStore::at_root(blocked_parent.join("legacy")).unwrap();
+        assert!(matches!(
+            ClaudeSnapshotStore::for_projection(blocked_parent.join("primary"), fallback.root),
+            Err(SnapshotError::InvalidState)
+        ));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_primary_location_never_falls_back_to_legacy() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let parent = root("unsafe-primary-location");
+        fs::create_dir_all(&parent).unwrap();
+        let legacy_root = parent.join("legacy");
+        let legacy = ClaudeSnapshotStore::at_root(legacy_root.clone()).unwrap();
+        let linked_primary = parent.join("linked-primary");
+        symlink(&legacy_root, &linked_primary).unwrap();
+        assert!(matches!(
+            ClaudeSnapshotStore::for_projection(linked_primary, legacy_root.clone()),
+            Err(SnapshotError::InvalidState)
+        ));
+
+        let primary_root = parent.join("primary");
+        let primary = ClaudeSnapshotStore::at_root(primary_root.clone()).unwrap();
+        let state = primary.root.join(STATE_FILE);
+        fs::write(&state, b"{").unwrap();
+        fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (selected, provenance) =
+            ClaudeSnapshotStore::for_projection(primary_root, legacy.root).unwrap();
+        assert_eq!(provenance, StateProvenance::Primary);
+        assert!(matches!(
+            selected.project_read_only(now(), provenance),
+            Err(SnapshotError::Io)
+        ));
+        fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::domain::account::{CodexProfile, CodexProfilePublicQuota, CodexProfilesResponse};
 use crate::services::codex;
+use crate::services::state_location::StateProvenance;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
@@ -26,6 +27,7 @@ struct ConfigProfile {
 pub(crate) struct Registry {
     entries: Vec<RegistryEntry>,
     error: Option<String>,
+    provenance: StateProvenance,
 }
 
 enum RegistryEntry {
@@ -65,28 +67,62 @@ fn invalid_alias(index: usize, reserved: &HashSet<String>, used: &mut HashSet<St
     }
 }
 
-pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> Registry {
-    let content = match fs::read_to_string(config_dir.join(CONFIG_FILE)) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Registry {
-                entries: vec![],
-                error: None,
-            };
+enum ConfigFile {
+    Missing,
+    Content(String),
+    Unavailable,
+}
+
+fn read_regular_config(path: &Path) -> ConfigFile {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return ConfigFile::Unavailable,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return ConfigFile::Unavailable,
         }
-        Err(_) => {
-            return Registry {
-                entries: vec![],
-                error: Some("Profile configuration is unavailable".into()),
-            };
-        }
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ConfigFile::Missing,
+        Err(_) => return ConfigFile::Unavailable,
     };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return ConfigFile::Unavailable;
+    }
+    fs::read_to_string(path)
+        .map(ConfigFile::Content)
+        .unwrap_or(ConfigFile::Unavailable)
+}
+
+fn unavailable_registry(provenance: StateProvenance) -> Registry {
+    Registry {
+        entries: vec![],
+        error: Some("Profile configuration is unavailable".into()),
+        provenance,
+    }
+}
+
+fn empty_registry() -> Registry {
+    Registry {
+        entries: vec![],
+        error: None,
+        provenance: StateProvenance::None,
+    }
+}
+
+fn parse_registry(
+    content: String,
+    provenance: StateProvenance,
+    default_home: Option<&Path>,
+) -> Registry {
     let config: Config = match serde_json::from_str::<Config>(&content) {
         Ok(config) if config.version == 1 => config,
         _ => {
             return Registry {
                 entries: vec![],
                 error: Some("Profile configuration is invalid".into()),
+                provenance,
             };
         }
     };
@@ -178,14 +214,46 @@ pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> R
     Registry {
         entries,
         error: overflow.then_some("Too many custom profiles configured".into()),
+        provenance,
     }
 }
 
-pub(crate) async fn fetch_from_config(
-    config_dir: &Path,
+pub(crate) fn load_registry(config_dir: &Path, default_home: Option<&Path>) -> Registry {
+    match read_regular_config(&config_dir.join(CONFIG_FILE)) {
+        ConfigFile::Missing => empty_registry(),
+        ConfigFile::Content(content) => {
+            parse_registry(content, StateProvenance::Primary, default_home)
+        }
+        ConfigFile::Unavailable => unavailable_registry(StateProvenance::Primary),
+    }
+}
+
+pub(crate) fn load_registry_with_legacy(
+    primary_dir: &Path,
+    legacy_dir: &Path,
+    default_home: Option<&Path>,
+) -> Registry {
+    match read_regular_config(&primary_dir.join(CONFIG_FILE)) {
+        ConfigFile::Content(content) => {
+            parse_registry(content, StateProvenance::Primary, default_home)
+        }
+        ConfigFile::Unavailable => unavailable_registry(StateProvenance::Primary),
+        ConfigFile::Missing => match read_regular_config(&legacy_dir.join(CONFIG_FILE)) {
+            ConfigFile::Missing => empty_registry(),
+            ConfigFile::Content(content) => {
+                parse_registry(content, StateProvenance::Legacy, default_home)
+            }
+            ConfigFile::Unavailable => unavailable_registry(StateProvenance::Legacy),
+        },
+    }
+}
+
+pub(crate) async fn fetch_from_locations(
+    primary_dir: &Path,
+    legacy_dir: &Path,
     default_home: Option<&Path>,
 ) -> CodexProfilesResponse {
-    let registry = load_registry(config_dir, default_home);
+    let registry = load_registry_with_legacy(primary_dir, legacy_dir, default_home);
     let mut profiles = Vec::with_capacity(registry.entries.len());
     for entry in registry.entries {
         match entry {
@@ -204,6 +272,7 @@ pub(crate) async fn fetch_from_config(
     CodexProfilesResponse {
         profiles,
         registry_error: registry.error,
+        registry_provenance: registry.provenance,
     }
 }
 
@@ -212,7 +281,10 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("quotabar-p4a-{name}-{}", std::process::id()))
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("quotabar-p4a-{name}-{}", std::process::id()))
     }
     fn write(dir: &Path, value: serde_json::Value) {
         fs::create_dir_all(dir).unwrap();
@@ -484,6 +556,115 @@ mod tests {
         assert!(
             matches!(&registry.entries[7], RegistryEntry::Valid { alias, .. } if alias == "last")
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn primary_registry_precedence_only_falls_back_when_primary_is_missing() {
+        let dir = temp("location-precedence");
+        let primary = dir.join("primary");
+        let legacy = dir.join("legacy");
+        let primary_home = dir.join("primary-home");
+        let legacy_home = dir.join("legacy-home");
+        fs::create_dir_all(&primary_home).unwrap();
+        fs::create_dir_all(&legacy_home).unwrap();
+        write(
+            &legacy,
+            serde_json::json!({ "version": 1, "profiles": [entry("legacy", &legacy_home)] }),
+        );
+        let fallback = load_registry_with_legacy(&primary, &legacy, None);
+        assert_eq!(fallback.provenance, StateProvenance::Legacy);
+        assert!(
+            matches!(&fallback.entries[0], RegistryEntry::Valid { alias, .. } if alias == "legacy")
+        );
+
+        write(
+            &primary,
+            serde_json::json!({ "version": 1, "profiles": [entry("primary", &primary_home)] }),
+        );
+        let selected = load_registry_with_legacy(&primary, &legacy, None);
+        assert_eq!(selected.provenance, StateProvenance::Primary);
+        assert!(
+            matches!(&selected.entries[0], RegistryEntry::Valid { alias, .. } if alias == "primary")
+        );
+
+        fs::write(primary.join(CONFIG_FILE), "{").unwrap();
+        let invalid = load_registry_with_legacy(&primary, &legacy, None);
+        assert_eq!(invalid.provenance, StateProvenance::Primary);
+        assert_eq!(
+            invalid.error.as_deref(),
+            Some("Profile configuration is invalid")
+        );
+        assert!(invalid.entries.is_empty());
+
+        let empty = load_registry_with_legacy(&dir.join("absent"), &dir.join("also-absent"), None);
+        assert_eq!(empty.provenance, StateProvenance::None);
+        assert!(empty.entries.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn primary_symlink_and_non_regular_file_fail_closed_without_legacy_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp("location-file-safety");
+        let primary = dir.join("primary");
+        let legacy = dir.join("legacy");
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        write(
+            &legacy,
+            serde_json::json!({ "version": 1, "profiles": [entry("legacy", &home)] }),
+        );
+
+        fs::create_dir_all(&primary).unwrap();
+        symlink(legacy.join(CONFIG_FILE), primary.join(CONFIG_FILE)).unwrap();
+        let linked = load_registry_with_legacy(&primary, &legacy, None);
+        assert_eq!(linked.provenance, StateProvenance::Primary);
+        assert_eq!(
+            linked.error.as_deref(),
+            Some("Profile configuration is unavailable")
+        );
+
+        fs::remove_file(primary.join(CONFIG_FILE)).unwrap();
+        fs::create_dir(primary.join(CONFIG_FILE)).unwrap();
+        let non_regular = load_registry_with_legacy(&primary, &legacy, None);
+        assert_eq!(non_regular.provenance, StateProvenance::Primary);
+        assert_eq!(
+            non_regular.error.as_deref(),
+            Some("Profile configuration is unavailable")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_primary_is_reported_without_legacy_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp("location-permissions");
+        let primary = dir.join("primary");
+        let legacy = dir.join("legacy");
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        write(
+            &primary,
+            serde_json::json!({ "version": 1, "profiles": [entry("primary", &home)] }),
+        );
+        write(
+            &legacy,
+            serde_json::json!({ "version": 1, "profiles": [entry("legacy", &home)] }),
+        );
+        let config = primary.join(CONFIG_FILE);
+        fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let registry = load_registry_with_legacy(&primary, &legacy, None);
+        assert_eq!(registry.provenance, StateProvenance::Primary);
+        assert_eq!(
+            registry.error.as_deref(),
+            Some("Profile configuration is unavailable")
+        );
+        fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 }

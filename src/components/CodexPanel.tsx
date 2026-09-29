@@ -317,7 +317,9 @@ export default function CodexPanel({
   const fetchData = useCallback(async () => {
     const generation = request_generation.begin();
     pendingTrayCoordination.current = { generation };
-    const profilesPromise = backend.getCodexProfiles().catch(() => ({ profiles: [], registryError: null }));
+    const profilesPromise = backend
+      .getCodexProfiles()
+      .catch(() => ({ profiles: [], registryError: null, registryProvenance: 'none' as const }));
     void profilesPromise.then((profiles) => {
       if (!request_generation.isCurrent(generation)) return;
       setCustomProfiles(profiles.profiles);

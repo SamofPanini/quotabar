@@ -152,6 +152,7 @@ pub(crate) struct CodexProfilePublicQuota {
 pub(crate) struct CodexProfilesResponse {
     pub(crate) profiles: Vec<CodexProfilePublicQuota>,
     pub(crate) registry_error: Option<String>,
+    pub(crate) registry_provenance: crate::services::state_location::StateProvenance,
 }
 
 impl CodexProfilePublicQuota {

@@ -39,6 +39,7 @@ export interface ClaudeCurrentSlot {
 
 export interface ClaudeCurrentSnapshots {
   slots: ClaudeCurrentSlot[];
+  provenance: 'none' | 'primary' | 'legacy';
 }
 
 export interface CodexData {
@@ -102,6 +103,7 @@ export interface CodexProfileQuota {
 export interface CodexProfilesResponse {
   profiles: CodexProfileQuota[];
   registryError?: string | null;
+  registryProvenance: 'none' | 'primary' | 'legacy';
 }
 
 export type CodexQuotaStatus = 'on_track' | 'watch' | 'likely_exhausted' | 'exhausted';

@@ -102,15 +102,42 @@ The Default account remains implicit; additional accounts come only from a
 QuotaBar-owned registry. There is currently no UI for creating or editing that
 registry.
 
-### Registry location
+### Durable location and precedence
 
-The logical location is `<Tauri app_config_dir>/codex-profiles.json`. This
-release uses Tauri 2 with bundle identifier `com.majiayu.quotabar`; on macOS,
-that resolves to:
+QuotaBar-owned registry and Claude current-state data use this durable,
+non-bundle-owned macOS location:
+
+```text
+~/.config/quotabar-custom/
+```
+
+The Codex registry is `codex-profiles.json` in that directory. Claude's
+current-state store is the `claude-current-state/` subdirectory. Neither path
+contains a provider credential and neither changes `~/.codex/auth.json`.
+
+For each file/store, QuotaBar checks the durable primary first. It reads the
+previous bundle-ID-derived app-config location only when the corresponding
+primary location is absent. A present but unreadable, malformed, symlinked, or
+non-regular primary fails closed and does not fall back. When neither location
+exists, the result is an empty baseline. Backend responses may identify only
+`none`, `primary`, or `legacy`; they never expose an absolute home path.
+
+The legacy registry location remains:
 
 ```text
 ~/Library/Application Support/com.majiayu.quotabar/codex-profiles.json
 ```
+
+The legacy Claude state root is:
+
+```text
+~/Library/Application Support/com.majiayu.quotabar/claude-current-state/
+```
+
+QuotaBar does not automatically move, overwrite, or delete either legacy
+location. An app uninstall or reset may remove bundle-owned app-config data,
+whereas the custom-owned directory is outside that location; retain a backup
+before changing either path.
 
 ### Schema and validation
 
@@ -158,15 +185,23 @@ only generic unavailable information, so it may not distinguish the precise
 cause (for example, an invalid registry row, a missing auth file, or a duplicate
 canonical home).
 
-### Safe setup and rollback
+### Safe setup, migration, and rollback
 
 1. Fully quit QuotaBar.
 2. Confirm that the additional Codex home already exists and was established
    legally outside QuotaBar.
-3. Create or update only `codex-profiles.json` using the schema above.
-4. Restart QuotaBar and check the Codex account tabs.
-5. To roll back, restore or remove only `codex-profiles.json`, then restart
-   QuotaBar.
+3. To migrate the registry, create
+   `~/.config/quotabar-custom/codex-profiles.json` with the same validated
+   schema. Do not symlink it to the legacy file.
+4. Restart QuotaBar and check the Codex account tabs. The durable primary is
+   now preferred; leaving the legacy file in place is safe.
+5. To roll back, remove or restore only the durable registry file, then restart
+   QuotaBar; legacy fallback resumes only when the primary is absent.
+
+Claude current-state migration is likewise manual and should be performed only
+while QuotaBar is stopped. Do not copy, edit, or delete live state while the
+app is running; a malformed durable primary intentionally blocks legacy reads
+until it is repaired or removed.
 
 Do not open, print, copy, summarize, hash, or link an `auth.json` file. Do not
 copy bearer tokens, JWTs, cookies, account identifiers, or email addresses into
