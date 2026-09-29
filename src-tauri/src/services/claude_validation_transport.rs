@@ -246,6 +246,7 @@ enum OwnedChildMode {
     RefillHundred,
     TruncatedHeader,
     BlockAfterHandshakeByte,
+    BlockAfterAuthenticatedAccept,
     RevokeThenExit,
     SubmitAvailable,
     SubmitUnavailable,
@@ -275,6 +276,7 @@ impl OwnedChildMode {
             Self::RefillHundred => "refill-hundred",
             Self::TruncatedHeader => "truncated-header",
             Self::BlockAfterHandshakeByte => "block-after-handshake-byte",
+            Self::BlockAfterAuthenticatedAccept => "block-after-authenticated-accept",
             Self::RevokeThenExit => "revoke-then-exit",
             Self::SubmitAvailable => "submit-available",
             Self::SubmitUnavailable => "submit-unavailable",
@@ -314,10 +316,10 @@ enum CleanupKillFault {
     Error,
 }
 
-/// Test-only plan for the shared cleanup state machine.  Production always
-/// executes the real syscalls; faults alter only the observable result after
-/// those actions have been attempted, so later bounded actions are never
-/// skipped by the harness.
+/// Test-only plan for the shared cleanup state machine. Production always
+/// executes the real syscalls. In tests, each entry replaces exactly the
+/// syscall result at that decision point, so a kill error is never simulated
+/// by first killing the child and merely relabelling the result afterwards.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CleanupFaultPlan {
@@ -394,6 +396,11 @@ struct TestLaunchAudit {
     child_live: std::sync::atomic::AtomicBool,
     child_unknown: std::sync::atomic::AtomicBool,
     generation: std::sync::atomic::AtomicU64,
+    first_wait_timed_out: std::sync::atomic::AtomicBool,
+    first_wait_errored: std::sync::atomic::AtomicBool,
+    kill_errored: std::sync::atomic::AtomicBool,
+    final_wait_timed_out: std::sync::atomic::AtomicBool,
+    final_wait_errored: std::sync::atomic::AtomicBool,
     ready_sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<UnixStream>>>,
     ready_receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<UnixStream>>>,
     revoke_sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<UnixStream>>>,
@@ -402,6 +409,8 @@ struct TestLaunchAudit {
     persisted_receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<PersistedEvent>>>,
     progress_sender: std::sync::mpsc::Sender<usize>,
     progress_receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<usize>>>,
+    reaped_sender: std::sync::mpsc::Sender<ReapedEvent>,
+    reaped_receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<ReapedEvent>>>,
 }
 
 #[cfg(test)]
@@ -413,12 +422,20 @@ struct PersistedEvent {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReapedEvent {
+    generation: u64,
+    parent_fds_closed: bool,
+}
+
+#[cfg(test)]
 impl Default for TestLaunchAudit {
     fn default() -> Self {
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
         let (revoke_sender, revoke_receiver) = std::sync::mpsc::sync_channel(1);
         let (persisted_sender, persisted_receiver) = std::sync::mpsc::channel();
         let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
+        let (reaped_sender, reaped_receiver) = std::sync::mpsc::channel();
         Self {
             prepared_sources_closed: std::sync::atomic::AtomicBool::new(false),
             originals_closed_in_parent: std::sync::atomic::AtomicBool::new(false),
@@ -432,6 +449,11 @@ impl Default for TestLaunchAudit {
             child_live: std::sync::atomic::AtomicBool::new(false),
             child_unknown: std::sync::atomic::AtomicBool::new(false),
             generation: std::sync::atomic::AtomicU64::new(0),
+            first_wait_timed_out: std::sync::atomic::AtomicBool::new(false),
+            first_wait_errored: std::sync::atomic::AtomicBool::new(false),
+            kill_errored: std::sync::atomic::AtomicBool::new(false),
+            final_wait_timed_out: std::sync::atomic::AtomicBool::new(false),
+            final_wait_errored: std::sync::atomic::AtomicBool::new(false),
             ready_sender: std::sync::Mutex::new(Some(ready_sender)),
             ready_receiver: std::sync::Mutex::new(Some(ready_receiver)),
             revoke_sender: std::sync::Mutex::new(Some(revoke_sender)),
@@ -440,6 +462,8 @@ impl Default for TestLaunchAudit {
             persisted_receiver: std::sync::Mutex::new(Some(persisted_receiver)),
             progress_sender,
             progress_receiver: std::sync::Mutex::new(Some(progress_receiver)),
+            reaped_sender,
+            reaped_receiver: std::sync::Mutex::new(Some(reaped_receiver)),
         }
     }
 }
@@ -613,16 +637,10 @@ fn cleanup_child(
     let _revoke_signal = revoke.write_all(b"revoke");
     let mut cleanup_failed = false;
     #[cfg(test)]
-    let first_wait = match faults.first_wait {
-        CleanupObservationFault::None => wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE),
-        CleanupObservationFault::Timeout => Ok(None),
-        CleanupObservationFault::Error => {
-            Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed))
-        }
-    };
+    let first_wait = observe_child_exit_for_cleanup(child, CHILD_CLEANUP_GRACE, faults.first_wait);
     #[cfg(not(test))]
     let first_wait = wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE);
-    #[cfg_attr(not(test), allow(unused_assignments))]
+    #[cfg(test)]
     let mut exit = match first_wait {
         Ok(Some(exit)) => Some(exit),
         Ok(None) => None,
@@ -631,11 +649,31 @@ fn cleanup_child(
             None
         }
     };
+    #[cfg(not(test))]
+    let exit = match first_wait {
+        Ok(Some(exit)) => Some(exit),
+        Ok(None) => None,
+        Err(_) => {
+            cleanup_failed = true;
+            None
+        }
+    };
     #[cfg(test)]
-    if faults.first_wait != CleanupObservationFault::None {
-        cleanup_failed = true;
+    if let Some(audit) = audit {
+        match faults.first_wait {
+            CleanupObservationFault::Timeout => audit
+                .first_wait_timed_out
+                .store(true, std::sync::atomic::Ordering::SeqCst),
+            CleanupObservationFault::Error => audit
+                .first_wait_errored
+                .store(true, std::sync::atomic::Ordering::SeqCst),
+            CleanupObservationFault::None => {}
+        }
     }
     #[cfg(test)]
+    if faults.first_wait == CleanupObservationFault::Error {
+        cleanup_failed = true;
+    }
     if exit.is_none() {
         #[cfg(test)]
         if let Some(audit) = audit {
@@ -643,49 +681,73 @@ fn cleanup_child(
                 .child_killed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let kill_result = child.kill();
         #[cfg(test)]
-        if faults.kill == CleanupKillFault::Error {
-            cleanup_failed = true;
-        }
+        let kill_result = kill_child_for_cleanup(child, faults.kill);
+        #[cfg(not(test))]
+        let kill_result = child.kill();
         if let Err(error) = kill_result {
+            #[cfg(test)]
+            if let Some(audit) = audit {
+                audit
+                    .kill_errored
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if error.kind() != std::io::ErrorKind::InvalidInput {
                 cleanup_failed = true;
             }
         }
         #[cfg(test)]
-        if faults.final_wait != CleanupObservationFault::None {
-            cleanup_failed = true;
-            // Fix the production-return snapshot before any harness work.
-            // The test-only reap below prevents a synthetic zombie, but it is
-            // deliberately not a successful final observation and never
-            // changes the live/unknown state reported to the caller.
-            exit = None;
-            if let Some(audit) = audit {
-                match faults.final_wait {
-                    CleanupObservationFault::Timeout => audit
+        let final_wait =
+            observe_child_exit_for_cleanup(child, CHILD_CLEANUP_GRACE, faults.final_wait);
+        #[cfg(not(test))]
+        let final_wait = wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE);
+        match final_wait {
+            Ok(Some(observed)) => {
+                #[cfg(test)]
+                {
+                    exit = Some(observed);
+                }
+                #[cfg(not(test))]
+                let _ = observed;
+            }
+            Ok(None) => {
+                cleanup_failed = true;
+                #[cfg(test)]
+                if let Some(audit) = audit {
+                    audit
                         .child_live
-                        .store(true, std::sync::atomic::Ordering::SeqCst),
-                    CleanupObservationFault::Error => audit
-                        .child_unknown
-                        .store(true, std::sync::atomic::Ordering::SeqCst),
-                    CleanupObservationFault::None => {}
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    if faults.final_wait == CleanupObservationFault::Timeout {
+                        audit
+                            .final_wait_timed_out
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             }
-            // Separate harness teardown: its result is intentionally ignored
-            // and cannot be used as evidence that production observed a
-            // terminal child status.
-            let _ = wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE);
-        } else {
-            match wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE) {
-                Ok(Some(observed)) => exit = Some(observed),
-                Ok(None) | Err(_) => cleanup_failed = true,
+            Err(_) => {
+                cleanup_failed = true;
+                #[cfg(test)]
+                if let Some(audit) = audit {
+                    audit
+                        .child_unknown
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    if faults.final_wait == CleanupObservationFault::Error {
+                        audit
+                            .final_wait_errored
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
             }
         }
-        #[cfg(not(test))]
-        match wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE) {
-            Ok(Some(observed)) => exit = Some(observed),
-            Ok(None) | Err(_) => cleanup_failed = true,
+        #[cfg(test)]
+        if exit.is_none() {
+            // The production-return snapshot is fixed above. This independent
+            // harness teardown is needed both for an injected final-observe
+            // failure and for a real final timeout after injected kill error;
+            // it only avoids synthetic zombies and never upgrades a
+            // live/unknown snapshot to reaped evidence.
+            let _ = child.kill();
+            let _ = wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE);
         }
     }
     #[cfg(test)]
@@ -705,6 +767,32 @@ fn cleanup_child(
         Err(TransportError::Ended(SessionEnd::CleanupFailed))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+fn observe_child_exit_for_cleanup(
+    child: &mut Child,
+    budget: Duration,
+    fault: CleanupObservationFault,
+) -> Result<Option<std::process::ExitStatus>, TransportError> {
+    match fault {
+        CleanupObservationFault::None => wait_for_child_exit_bounded(child, budget),
+        CleanupObservationFault::Timeout => Ok(None),
+        CleanupObservationFault::Error => {
+            Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed))
+        }
+    }
+}
+
+#[cfg(test)]
+fn kill_child_for_cleanup(child: &mut Child, fault: CleanupKillFault) -> std::io::Result<()> {
+    match fault {
+        CleanupKillFault::None => child.kill(),
+        CleanupKillFault::Error => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "test cleanup kill syscall failure",
+        )),
     }
 }
 
@@ -2055,6 +2143,18 @@ mod tests {
         let handshake = synthetic_handshake(slot, token);
         write_frame(&mut data, &handshake);
         assert_eq!(read_frame_for_test(&mut data), br#"{"result":"accepted"}"#);
+        if stage == OwnedChildMode::BlockAfterAuthenticatedAccept.name() {
+            // This barrier is emitted only after the real private bootstrap,
+            // authenticated consume, and accepted result have all completed.
+            // The child then stays in an authenticated session until the
+            // owner revokes it, so the paired test can inspect the pairing
+            // lock boundary without substituting a partial header.
+            ready.write_all(b"A").unwrap();
+            let mut signal = [0u8; 1];
+            revoke.read_exact(&mut signal).unwrap();
+            revoke.write_all(b"R").unwrap();
+            return;
+        }
         if stage == OwnedChildMode::CooperativeEof.name() {
             data.shutdown(Shutdown::Write).unwrap();
             let mut cleanup = [0u8; 1];
@@ -2235,6 +2335,17 @@ mod tests {
             .unwrap_or_else(|_| panic!("{label} did not reach parent ingress"))
     }
 
+    fn take_reaped_event(audit: &TestLaunchAudit, label: &str) -> ReapedEvent {
+        audit
+            .reaped_receiver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("reaped receiver was not installed")
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{label} did not report bounded child reap"))
+    }
+
     fn run_top_level_owned_session_for_test(
         store: &ClaudeSnapshotStore,
         pairing: &PairingRegistry,
@@ -2283,9 +2394,15 @@ mod tests {
         TEST_CLOCK_STEP_PER_FRAME.store(0, Ordering::SeqCst);
         TEST_CLOCK_ARMED.store(false, Ordering::SeqCst);
         TEST_UNREGISTERED_CLEANUP_FAULTS.with(|faults| faults.set(CleanupFaultPlan::NONE));
-        // The top-level call owns the last parent data/revoke endpoints.  This
+        // The top-level call owns the last parent data/revoke endpoints. This
         // marker is set only after it returns and those locals have dropped.
         audit.parent_fds_closed.store(true, Ordering::SeqCst);
+        if audit.child_reaped.load(Ordering::SeqCst) {
+            let _ = audit.reaped_sender.send(ReapedEvent {
+                generation: audit.generation.load(Ordering::SeqCst),
+                parent_fds_closed: true,
+            });
+        }
         result
     }
 
@@ -2505,7 +2622,12 @@ mod tests {
             ),
             (
                 "registered-primary-success",
-                OwnedChildMode::AuthenticatedIgnoreRevokeAfterDataEof,
+                // A real authenticated/consumed child has already chosen
+                // CleanEof and cooperates with the private revoke. This lets
+                // the kill-error seam return Err without performing kill,
+                // while the same production final observation still sees a
+                // genuine child exit.
+                OwnedChildMode::CooperativeEof,
                 OwnedLaunchFault::None,
                 false,
                 SessionEnd::CleanEof,
@@ -2532,14 +2654,32 @@ mod tests {
                         };
                         let spec = OwnedLaunchSpec::test(mode, fault).with_cleanup_faults(faults);
                         let audit = spec.audit.clone();
-                        let first_observation_exited = state == "unregistered-primary-child-exit"
-                            && first_wait == CleanupObservationFault::None;
-                        let expected =
-                            if faults == CleanupFaultPlan::NONE || first_observation_exited {
-                                primary_result
-                            } else {
-                                SessionEnd::CleanupFailed
-                            };
+                        // If the real first bounded observation sees exit,
+                        // kill and final-observation cells are N/A. S1 exited
+                        // before registration; S4 consumed authority and its
+                        // cooperative child exits after the revoke signal.
+                        let first_observation_exited = matches!(
+                            state,
+                            "unregistered-primary-child-exit" | "registered-primary-success"
+                        ) && first_wait
+                            == CleanupObservationFault::None;
+                        let child_preexited = state == "unregistered-primary-child-exit";
+                        // Oracle versus the shared production cleanup state
+                        // machine: a first timeout is not itself a cleanup
+                        // error. It must still kill and make one final bounded
+                        // observation; if both succeed, the original primary
+                        // success/failure remains authoritative. A first
+                        // observation error, kill error, or failed final
+                        // observation is fail-closed.
+                        let cleanup_is_clean = first_observation_exited
+                            || (first_wait != CleanupObservationFault::Error
+                                && kill == CleanupKillFault::None
+                                && final_wait == CleanupObservationFault::None);
+                        let expected = if cleanup_is_clean {
+                            primary_result
+                        } else {
+                            SessionEnd::CleanupFailed
+                        };
                         assert_eq!(
                             run_top_level_owned_session_for_test(
                                 &store,
@@ -2564,19 +2704,73 @@ mod tests {
                         if state == "registered-primary-success" {
                             assert!(audit.generation_consumed.load(Ordering::SeqCst));
                         }
-                        if !first_observation_exited
-                            && final_wait == CleanupObservationFault::Timeout
-                        {
-                            assert!(audit.child_live.load(Ordering::SeqCst));
-                            assert!(!audit.child_reaped.load(Ordering::SeqCst));
-                        } else if !first_observation_exited
-                            && final_wait == CleanupObservationFault::Error
-                        {
-                            assert!(audit.child_unknown.load(Ordering::SeqCst));
-                            assert!(!audit.child_reaped.load(Ordering::SeqCst));
+                        assert_eq!(
+                            audit.first_wait_timed_out.load(Ordering::SeqCst),
+                            !first_observation_exited
+                                && first_wait == CleanupObservationFault::Timeout,
+                            "{state}: {faults:?}"
+                        );
+                        assert_eq!(
+                            audit.first_wait_errored.load(Ordering::SeqCst),
+                            !first_observation_exited
+                                && first_wait == CleanupObservationFault::Error,
+                            "{state}: {faults:?}"
+                        );
+                        assert_eq!(
+                            audit.kill_errored.load(Ordering::SeqCst),
+                            !first_observation_exited && kill == CleanupKillFault::Error,
+                            "{state}: {faults:?}"
+                        );
+                        // In S1/S2 the child is still blocked before an
+                        // authenticated revoke reader exists. Therefore a
+                        // true injected kill error followed by a real final
+                        // observation is honestly live. S4 is different: its
+                        // authenticated cooperative child consumes revoke and
+                        // lets that same final observation report reaped.
+                        let expected_live = (!first_observation_exited
+                            && final_wait == CleanupObservationFault::Timeout)
+                            || (!child_preexited
+                                && final_wait == CleanupObservationFault::None
+                                && kill == CleanupKillFault::Error
+                                && state != "registered-primary-success");
+                        let expected_unknown = !first_observation_exited
+                            && final_wait == CleanupObservationFault::Error;
+                        if expected_live {
+                            assert!(
+                                audit.child_live.load(Ordering::SeqCst),
+                                "{state}: {faults:?}"
+                            );
+                            assert!(
+                                !audit.child_reaped.load(Ordering::SeqCst),
+                                "{state}: {faults:?}"
+                            );
+                        } else if expected_unknown {
+                            assert!(
+                                audit.child_unknown.load(Ordering::SeqCst),
+                                "{state}: {faults:?}"
+                            );
+                            assert!(
+                                !audit.child_reaped.load(Ordering::SeqCst),
+                                "{state}: {faults:?}"
+                            );
                         } else {
-                            assert!(audit.child_reaped.load(Ordering::SeqCst));
+                            assert!(
+                                audit.child_reaped.load(Ordering::SeqCst),
+                                "{state}: {faults:?}"
+                            );
                         }
+                        assert_eq!(
+                            audit.final_wait_timed_out.load(Ordering::SeqCst),
+                            !first_observation_exited
+                                && final_wait == CleanupObservationFault::Timeout,
+                            "{state}: {faults:?}"
+                        );
+                        assert_eq!(
+                            audit.final_wait_errored.load(Ordering::SeqCst),
+                            !first_observation_exited
+                                && final_wait == CleanupObservationFault::Error,
+                            "{state}: {faults:?}"
+                        );
                         assert_eq!(pairing.pending_count_for_test(), 0);
                         let _ = std::fs::remove_dir_all(root);
                     }
@@ -2807,7 +3001,7 @@ mod tests {
             let pairing = std::sync::Arc::new(PairingRegistry::new());
 
             let a_spec = OwnedLaunchSpec::test(
-                OwnedChildMode::BlockAfterHandshakeByte,
+                OwnedChildMode::BlockAfterAuthenticatedAccept,
                 OwnedLaunchFault::None,
             );
             let a_audit = a_spec.audit.clone();
@@ -2825,7 +3019,7 @@ mod tests {
             wait_until_readable(ready_receiver.as_raw_fd());
             let mut ready = [0u8; 1];
             ready_receiver.read_exact(&mut ready).unwrap();
-            assert_eq!(ready, *b"B");
+            assert_eq!(ready, *b"A");
             let mut revoke_a = take_test_control_stream(&a_audit.revoke_receiver, "A revoke");
 
             let b_mode = if iteration % 2 == 0 {
@@ -2836,6 +3030,10 @@ mod tests {
             let b_spec = OwnedLaunchSpec::test(b_mode, OwnedLaunchFault::None);
             let b_audit = b_spec.audit.clone();
             let before_b = store.persisted_state_bytes_for_test().unwrap();
+            // The A barrier is emitted by the real child only after it has
+            // received the accepted response. `consume` happened before that
+            // response was written, so this is an authenticated long-session
+            // lock-boundary check, not a partial-header surrogate.
             assert!(pairing.try_lock_available_for_test());
 
             let b_store = store.clone();
@@ -2860,6 +3058,20 @@ mod tests {
             }
 
             revoke_a.write_all(b"R").unwrap();
+            let a_reaped = take_reaped_event(&a_audit, "A bounded reap");
+            let b_reaped = take_reaped_event(&b_audit, "B bounded reap");
+            for (label, event, audit) in [("A", a_reaped, &a_audit), ("B", b_reaped, &b_audit)] {
+                assert_eq!(
+                    event.generation,
+                    audit.generation.load(Ordering::SeqCst),
+                    "iteration {iteration}: {label} generation"
+                );
+                assert!(event.parent_fds_closed, "iteration {iteration}: {label} FD");
+                assert!(
+                    audit.child_reaped.load(Ordering::SeqCst),
+                    "iteration {iteration}: {label} reaped"
+                );
+            }
             assert_eq!(
                 a_worker.join().unwrap(),
                 Err(TransportError::Ended(SessionEnd::Revoked))
