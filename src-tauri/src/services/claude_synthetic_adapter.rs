@@ -37,22 +37,49 @@ pub(crate) struct SyntheticDesktopObservation {
     pub(crate) disposition: SyntheticDisposition,
 }
 
-/// Normalizes only fixed safe fields then delegates all durable-state policy to C3-A.
-pub(crate) fn submit_synthetic_observation(
+/// Source-neutral, crate-private correlated ingress seam.  Both the existing
+/// synthetic fixture adapter and the validation UDS adapter must pass through
+/// this function so neither can reach an uncorrelated store mutation.
+#[derive(Clone, Debug)]
+pub(crate) enum CorrelatedDisposition {
+    Available {
+        source: SourceClass,
+        windows: Vec<SyntheticWindow>,
+    },
+    Unavailable {
+        error: SafeErrorCode,
+    },
+    ContinuityUncertain,
+    IdentityChanged,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CorrelatedObservation {
+    pub(crate) slot_id: AccountSlotId,
+    pub(crate) capability: BindingCapability,
+    pub(crate) binding_epoch: u64,
+    pub(crate) sequence: u64,
+    pub(crate) observed_at: DateTime<Utc>,
+    pub(crate) plan: Option<PlanMetadata>,
+    pub(crate) disposition: CorrelatedDisposition,
+}
+
+pub(crate) fn submit_correlated_observation(
     store: &ClaudeSnapshotStore,
-    input: SyntheticDesktopObservation,
+    input: CorrelatedObservation,
     received_at: DateTime<Utc>,
 ) -> Result<(), SnapshotError> {
     match input.disposition {
-        SyntheticDisposition::ContinuityUncertain | SyntheticDisposition::IdentityChanged => store
-            .apply_correlated_lifecycle_transition(
+        CorrelatedDisposition::ContinuityUncertain | CorrelatedDisposition::IdentityChanged => {
+            store.apply_correlated_lifecycle_transition(
                 &input.capability,
                 &input.slot_id,
                 input.binding_epoch,
                 input.sequence,
                 received_at,
-            ),
-        SyntheticDisposition::Available { windows } => store.apply_correlated_observation(
+            )
+        }
+        CorrelatedDisposition::Available { source, windows } => store.apply_correlated_observation(
             &input.capability,
             ObservationEnvelopeV1 {
                 slot_id: input.slot_id,
@@ -60,7 +87,7 @@ pub(crate) fn submit_synthetic_observation(
                 sequence: input.sequence,
                 observed_at: input.observed_at,
                 status: ObservationStatus::Available,
-                source: Some(SourceClass::SyntheticFixture),
+                source: Some(source),
                 windows: windows
                     .into_iter()
                     .map(|window| ObservationWindow {
@@ -74,7 +101,7 @@ pub(crate) fn submit_synthetic_observation(
             input.plan,
             received_at,
         ),
-        SyntheticDisposition::Unavailable { error } => store.apply_correlated_observation(
+        CorrelatedDisposition::Unavailable { error } => store.apply_correlated_observation(
             &input.capability,
             ObservationEnvelopeV1 {
                 slot_id: input.slot_id,
@@ -90,6 +117,37 @@ pub(crate) fn submit_synthetic_observation(
             received_at,
         ),
     }
+}
+
+/// Normalizes only fixed safe fixture fields then delegates all durable-state
+/// policy to the source-neutral correlated seam.
+pub(crate) fn submit_synthetic_observation(
+    store: &ClaudeSnapshotStore,
+    input: SyntheticDesktopObservation,
+    received_at: DateTime<Utc>,
+) -> Result<(), SnapshotError> {
+    let disposition = match input.disposition {
+        SyntheticDisposition::Available { windows } => CorrelatedDisposition::Available {
+            source: SourceClass::SyntheticFixture,
+            windows,
+        },
+        SyntheticDisposition::Unavailable { error } => CorrelatedDisposition::Unavailable { error },
+        SyntheticDisposition::ContinuityUncertain => CorrelatedDisposition::ContinuityUncertain,
+        SyntheticDisposition::IdentityChanged => CorrelatedDisposition::IdentityChanged,
+    };
+    submit_correlated_observation(
+        store,
+        CorrelatedObservation {
+            slot_id: input.slot_id,
+            capability: input.capability,
+            binding_epoch: input.binding_epoch,
+            sequence: input.sequence,
+            observed_at: input.observed_at,
+            plan: input.plan,
+            disposition,
+        },
+        received_at,
+    )
 }
 
 #[cfg(test)]

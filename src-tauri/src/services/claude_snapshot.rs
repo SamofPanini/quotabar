@@ -244,6 +244,10 @@ impl AccountSlotId {
             .map(|_| Self(value))
             .ok_or(SnapshotError::InvalidInput)
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,6 +457,30 @@ impl fmt::Debug for BindingCapability {
     }
 }
 
+/// Crate-private, non-serializable result of a foreground validation bind.
+/// The transport layer may use it only while constructing its in-memory
+/// session table; neither field is part of a DTO or persisted projection.
+pub(crate) struct ValidationBindingIssuance {
+    capability: BindingCapability,
+    epoch: u64,
+}
+
+impl fmt::Debug for ValidationBindingIssuance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ValidationBindingIssuance(<redacted>)")
+    }
+}
+
+impl ValidationBindingIssuance {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn capability(&self) -> BindingCapability {
+        self.capability.clone()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WindowRecord {
@@ -606,6 +634,83 @@ impl ClaudeSnapshotStore {
             Ok(())
         })?;
         Ok(BindingCapability { binding_id })
+    }
+
+    /// Foreground-validation-only issuance seam.  It deliberately wraps the
+    /// existing C3-A registration transaction rather than exposing durable
+    /// binding IDs or adding any persistent transport state.
+    pub(crate) fn register_validation_slot(
+        &self,
+        slot_id: AccountSlotId,
+        alias: String,
+        plan: Option<PlanMetadata>,
+        now: DateTime<Utc>,
+    ) -> Result<ValidationBindingIssuance, SnapshotError> {
+        let capability = self.register_slot(slot_id, alias, plan, now)?;
+        Ok(ValidationBindingIssuance {
+            capability,
+            epoch: 1,
+        })
+    }
+
+    /// Transactionally selects first registration or an explicit foreground
+    /// rebind from durable slot state.  In-memory transport sessions are never
+    /// consulted: process restart must invalidate old authority while leaving
+    /// the slot eligible for a fresh foreground bind.
+    pub(crate) fn register_or_rebind_validation_slot(
+        &self,
+        slot_id: AccountSlotId,
+        alias: String,
+        plan: PlanMetadata,
+        now: DateTime<Utc>,
+    ) -> Result<ValidationBindingIssuance, SnapshotError> {
+        if !safe_alias(&alias) {
+            return Err(SnapshotError::InvalidInput);
+        }
+        let binding_id = BindingId::generate();
+        let mut issued_epoch = 0;
+        self.mutate(now, |aggregate| {
+            if let Some(slot) = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| slot.slot_id == slot_id)
+            {
+                if slot.plan != Some(plan) {
+                    return Err(SnapshotError::Rejected);
+                }
+                if slot.binding_state != BindingState::Unverified {
+                    slot.binding_epoch = slot
+                        .binding_epoch
+                        .checked_add(1)
+                        .ok_or(SnapshotError::Rejected)?;
+                }
+                slot.binding_id = Some(binding_id.clone());
+                slot.binding_state = BindingState::Bound;
+                slot.next_sequence = 1;
+                slot.windows.clear();
+                issued_epoch = slot.binding_epoch;
+                return Ok(());
+            }
+            if aggregate.slots.len() == MAX_SLOTS {
+                return Err(SnapshotError::InvalidInput);
+            }
+            aggregate.slots.push(SlotState {
+                slot_id,
+                alias,
+                plan: Some(plan),
+                binding_id: Some(binding_id.clone()),
+                binding_state: BindingState::Bound,
+                binding_epoch: 1,
+                next_sequence: 1,
+                windows: vec![],
+            });
+            issued_epoch = 1;
+            Ok(())
+        })?;
+        Ok(ValidationBindingIssuance {
+            capability: BindingCapability { binding_id },
+            epoch: issued_epoch,
+        })
     }
 
     fn apply_observation(
@@ -784,6 +889,40 @@ impl ClaudeSnapshotStore {
             Ok(())
         })?;
         Ok(BindingCapability { binding_id })
+    }
+
+    /// Reissues the current in-memory authority and captures the epoch in the
+    /// same durable mutation.  This is intentionally not an IPC-facing API.
+    pub(crate) fn rebind_validation_slot(
+        &self,
+        slot_id: &AccountSlotId,
+        now: DateTime<Utc>,
+    ) -> Result<ValidationBindingIssuance, SnapshotError> {
+        let binding_id = BindingId::generate();
+        let mut issued_epoch = 0;
+        self.mutate(now, |aggregate| {
+            let slot = aggregate
+                .slots
+                .iter_mut()
+                .find(|slot| &slot.slot_id == slot_id)
+                .ok_or(SnapshotError::InvalidInput)?;
+            if slot.binding_state != BindingState::Unverified {
+                slot.binding_epoch = slot
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or(SnapshotError::Rejected)?;
+            }
+            slot.binding_id = Some(binding_id.clone());
+            slot.binding_state = BindingState::Bound;
+            slot.next_sequence = 1;
+            slot.windows.clear();
+            issued_epoch = slot.binding_epoch;
+            Ok(())
+        })?;
+        Ok(ValidationBindingIssuance {
+            capability: BindingCapability { binding_id },
+            epoch: issued_epoch,
+        })
     }
 
     pub(crate) fn unpair(
