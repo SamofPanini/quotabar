@@ -35,7 +35,10 @@ const CHILD_TEST_READY_FD: RawFd = 200;
 // two target mappings have been installed.
 const CHILD_SAFE_FD_MIN: RawFd = 256;
 const CHILD_EXIT_POLL_TICK: Duration = Duration::from_millis(25);
-const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(100);
+// Cleanup is still an absolute, finite observation budget.  One second keeps
+// the failure matrix deterministic when the test runner is under concurrent
+// compile/load pressure without turning cleanup into an unbounded wait.
+const CHILD_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const CHILD_STAGE_ENV: &str = "QUOTABAR_C3B1_SYNTHETIC_CHILD_STAGE";
 const PRIVATE_SYNTHETIC_CHILD_ARG: &str = "--quotabar-private-synthetic-child";
 #[cfg(test)]
@@ -106,27 +109,32 @@ impl FixedDeadline {
 fn monotonic_now() -> Instant {
     #[cfg(test)]
     {
-        return TEST_CLOCK_OFFSET
-            .with(|offset| Instant::now() + Duration::from_millis(offset.get()));
+        return Instant::now()
+            + Duration::from_millis(TEST_CLOCK_OFFSET.load(std::sync::atomic::Ordering::SeqCst));
     }
     #[cfg(not(test))]
     Instant::now()
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_CLOCK_OFFSET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static TEST_CLOCK_ADVANCE_ON_EXACT_WAIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    static TEST_CLOCK_STEP_PER_FRAME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
+static TEST_CLOCK_OFFSET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static TEST_CLOCK_ADVANCE_ON_EXACT_WAIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static TEST_CLOCK_STEP_PER_FRAME: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static TEST_CLOCK_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 fn advance_test_clock_on_exact_wait() {
-    TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.with(|advance| {
-        if let Some(millis) = advance.take() {
-            TEST_CLOCK_OFFSET.with(|offset| offset.set(offset.get().saturating_add(millis)));
+    if TEST_CLOCK_ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        let millis = TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if millis != 0 {
+            TEST_CLOCK_OFFSET.fetch_add(millis, std::sync::atomic::Ordering::SeqCst);
         }
-    });
+    }
 }
 
 #[cfg(not(test))]
@@ -134,9 +142,10 @@ fn advance_test_clock_on_exact_wait() {}
 
 #[cfg(test)]
 fn advance_test_clock_for_frame() {
-    TEST_CLOCK_STEP_PER_FRAME.with(|step| {
-        TEST_CLOCK_OFFSET.with(|offset| offset.set(offset.get().saturating_add(step.get())));
-    });
+    TEST_CLOCK_OFFSET.fetch_add(
+        TEST_CLOCK_STEP_PER_FRAME.load(std::sync::atomic::Ordering::SeqCst),
+        std::sync::atomic::Ordering::SeqCst,
+    );
 }
 
 #[cfg(not(test))]
@@ -168,7 +177,7 @@ struct SpawnOwnedSession {
     #[cfg(test)]
     audit: Option<std::sync::Arc<TestLaunchAudit>>,
     #[cfg(test)]
-    inject_cleanup_failure: bool,
+    cleanup_fault: Option<CleanupFaultPoint>,
 }
 
 /// An already-prepared child descriptor plan.  Construction occurs before
@@ -216,8 +225,8 @@ enum OwnedChildMode {
     ExitAfterDataEof,
     CooperativeEof,
     IgnoreRevokeAfterDataEof,
-    LongFirstByteSilence,
-    SlowDrip,
+    AuthenticatedSlowDrip,
+    FirstByteSilenceCommit,
     BurstFive,
     RefillHundred,
     TruncatedHeader,
@@ -242,8 +251,8 @@ impl OwnedChildMode {
             Self::ExitAfterDataEof => "exit-after-data-eof",
             Self::CooperativeEof => "cooperative-eof",
             Self::IgnoreRevokeAfterDataEof => "ignore-revoke-after-data-eof",
-            Self::LongFirstByteSilence => "long-first-byte-silence",
-            Self::SlowDrip => "slow-drip",
+            Self::AuthenticatedSlowDrip => "authenticated-slow-drip",
+            Self::FirstByteSilenceCommit => "first-byte-silence-commit",
             Self::BurstFive => "burst-five",
             Self::RefillHundred => "refill-hundred",
             Self::TruncatedHeader => "truncated-header",
@@ -267,8 +276,48 @@ enum OwnedLaunchFault {
     MissingExecutable,
     PreExec,
     RegisterFailure,
+    RegisterCleanup(CleanupFaultPoint),
     BootstrapPartial,
-    BootstrapCleanupFailure,
+    BootstrapCleanup(CleanupFaultPoint),
+    #[cfg(test)]
+    BootstrapWriteOffset(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupFaultPoint {
+    FirstWait,
+    Kill,
+    FinalWait,
+}
+
+/// Test-only forwarding writer used to inject a real I/O failure by absolute
+/// bootstrap byte offset while preserving PairingBootstrapV1::write_private_payload
+/// and all four of its production write_all calls.
+#[cfg(test)]
+struct BootstrapFaultWriter<'a> {
+    inner: &'a mut UnixStream,
+    fail_at: usize,
+    written: usize,
+}
+
+#[cfg(test)]
+impl Write for BootstrapFaultWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.written >= self.fail_at {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "test bootstrap byte-offset failure",
+            ));
+        }
+        let permitted = (self.fail_at - self.written).min(bytes.len());
+        let written = self.inner.write(&bytes[..permitted])?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -284,7 +333,7 @@ struct OwnedLaunchSpec {
 }
 
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TestLaunchAudit {
     prepared_sources_closed: std::sync::atomic::AtomicBool,
     originals_closed_in_parent: std::sync::atomic::AtomicBool,
@@ -293,8 +342,43 @@ struct TestLaunchAudit {
     child_exit_nonzero: std::sync::atomic::AtomicBool,
     child_killed: std::sync::atomic::AtomicBool,
     generation_revoked: std::sync::atomic::AtomicBool,
-    ready_receiver: std::sync::Mutex<Option<UnixStream>>,
-    revoke_sender: std::sync::Mutex<Option<UnixStream>>,
+    ready_sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<UnixStream>>>,
+    ready_receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<UnixStream>>>,
+    revoke_sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<UnixStream>>>,
+    revoke_receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<UnixStream>>>,
+    persisted_sender: std::sync::mpsc::Sender<PersistedEvent>,
+    persisted_receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<PersistedEvent>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedEvent {
+    epoch: u64,
+    sequence: u64,
+}
+
+#[cfg(test)]
+impl Default for TestLaunchAudit {
+    fn default() -> Self {
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+        let (revoke_sender, revoke_receiver) = std::sync::mpsc::sync_channel(1);
+        let (persisted_sender, persisted_receiver) = std::sync::mpsc::channel();
+        Self {
+            prepared_sources_closed: std::sync::atomic::AtomicBool::new(false),
+            originals_closed_in_parent: std::sync::atomic::AtomicBool::new(false),
+            child_reaped: std::sync::atomic::AtomicBool::new(false),
+            child_exit_success: std::sync::atomic::AtomicBool::new(false),
+            child_exit_nonzero: std::sync::atomic::AtomicBool::new(false),
+            child_killed: std::sync::atomic::AtomicBool::new(false),
+            generation_revoked: std::sync::atomic::AtomicBool::new(false),
+            ready_sender: std::sync::Mutex::new(Some(ready_sender)),
+            ready_receiver: std::sync::Mutex::new(Some(ready_receiver)),
+            revoke_sender: std::sync::Mutex::new(Some(revoke_sender)),
+            revoke_receiver: std::sync::Mutex::new(Some(revoke_receiver)),
+            persisted_sender,
+            persisted_receiver: std::sync::Mutex::new(Some(persisted_receiver)),
+        }
+    }
 }
 
 impl OwnedLaunchSpec {
@@ -317,6 +401,14 @@ thread_local! {
     static TEST_TOP_LEVEL_LAUNCH: std::cell::RefCell<Option<OwnedLaunchSpec>> = const {
         std::cell::RefCell::new(None)
     };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PERSISTED_SENDER: std::cell::RefCell<Option<std::sync::mpsc::Sender<PersistedEvent>>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_UNREGISTERED_CLEANUP_FAULT: std::cell::Cell<Option<CleanupFaultPoint>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -385,7 +477,7 @@ impl SpawnOwnedSession {
             #[cfg(test)]
             audit: None,
             #[cfg(test)]
-            inject_cleanup_failure: false,
+            cleanup_fault: None,
         }
     }
 
@@ -397,69 +489,14 @@ impl SpawnOwnedSession {
                 .generation_revoked
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        // This control endpoint is intentionally private to the spawn owner.
-        // A best-effort byte wakes a cooperating child; failure is harmless
-        // because the owned child is subsequently terminated and reaped.
-        let _ = self.revoke.write_all(b"revoke");
-        #[cfg(test)]
-        let first_wait = if self.inject_cleanup_failure {
-            // This fault is injected at the bounded-reap seam, not at the
-            // terminal classification seam.  The fallback below must still
-            // establish final child state before this error can escape.
-            Err(TransportError::Ended(SessionEnd::CleanupFailed))
-        } else {
-            wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)
-        };
-        #[cfg(not(test))]
-        let first_wait = wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE);
-        let exit = match first_wait {
-            Ok(Some(exit)) => exit,
-            Ok(None) => self.terminate_and_reap()?,
-            Err(cleanup_error) => {
-                // A failed first reap observation may not be treated as a
-                // final state.  Force bounded termination/reap first, then
-                // surface the original cleanup failure deterministically.
-                let exit = self.terminate_and_reap()?;
-                self.record_reaped_exit(exit);
-                return Err(cleanup_error);
-            }
-        };
-        self.record_reaped_exit(exit);
-        Ok(())
-    }
-
-    fn terminate_and_reap(&mut self) -> Result<std::process::ExitStatus, TransportError> {
-        #[cfg(test)]
-        if let Some(audit) = &self.audit {
-            audit
-                .child_killed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        if let Err(error) = self.child.kill() {
-            if error.kind() != std::io::ErrorKind::InvalidInput {
-                return Err(TransportError::Ended(SessionEnd::CleanupFailed));
-            }
-        }
-        wait_for_child_exit_bounded(&mut self.child, CHILD_CLEANUP_GRACE)?
-            .ok_or(TransportError::Ended(SessionEnd::CleanupFailed))
-    }
-
-    fn record_reaped_exit(&self, exit: std::process::ExitStatus) {
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let _exit = exit;
-        #[cfg(test)]
-        if let Some(audit) = &self.audit {
-            audit
-                .child_reaped
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            audit
-                .child_exit_success
-                .store(_exit.success(), std::sync::atomic::Ordering::SeqCst);
-            audit.child_exit_nonzero.store(
-                _exit.code().is_some_and(|code| code != 0),
-                std::sync::atomic::Ordering::SeqCst,
-            );
-        }
+        cleanup_child(
+            &mut self.child,
+            &mut self.revoke,
+            #[cfg(test)]
+            self.audit.as_ref(),
+            #[cfg(test)]
+            self.cleanup_fault,
+        )
     }
 }
 
@@ -468,24 +505,82 @@ fn reap_unregistered_child(
     revoke: &mut UnixStream,
     #[cfg(test)] audit: &std::sync::Arc<TestLaunchAudit>,
 ) -> Result<(), TransportError> {
-    let _ = revoke.write_all(b"revoke");
-    #[cfg_attr(not(test), allow(unused_variables))]
-    let exit = match wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE)? {
-        Some(exit) => exit,
-        None => {
-            #[cfg(test)]
-            audit
-                .child_killed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            child
-                .kill()
-                .map_err(|_| TransportError::Ended(SessionEnd::CleanupFailed))?;
-            wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE)?
-                .ok_or(TransportError::Ended(SessionEnd::CleanupFailed))?
+    cleanup_child(
+        child,
+        revoke,
+        #[cfg(test)]
+        Some(audit),
+        #[cfg(test)]
+        TEST_UNREGISTERED_CLEANUP_FAULT.with(|fault| fault.get()),
+    )
+}
+
+/// The same bounded cleanup transition is used before and after pairing
+/// registration.  A failed syscall is diagnostic, not permission to skip the
+/// remaining bounded actions: the final observation is always attempted and
+/// only an observed exit is recorded as reaped.
+fn cleanup_child(
+    child: &mut Child,
+    revoke: &mut UnixStream,
+    #[cfg(test)] audit: Option<&std::sync::Arc<TestLaunchAudit>>,
+    #[cfg(test)] fault: Option<CleanupFaultPoint>,
+) -> Result<(), TransportError> {
+    // The private byte is only a cooperative wake-up.  A child which already
+    // exited can legitimately make this write fail; final child observation,
+    // not this advisory write, determines cleanup finality.
+    let _revoke_signal = revoke.write_all(b"revoke");
+    let mut cleanup_failed = false;
+    #[cfg(test)]
+    let first_wait = wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE);
+    #[cfg(not(test))]
+    let first_wait = wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE);
+    #[cfg_attr(not(test), allow(unused_assignments))]
+    let mut exit = match first_wait {
+        Ok(Some(exit)) => Some(exit),
+        Ok(None) => None,
+        Err(_) => {
+            cleanup_failed = true;
+            None
         }
     };
     #[cfg(test)]
-    {
+    if fault == Some(CleanupFaultPoint::FirstWait) {
+        cleanup_failed = true;
+        exit = None;
+    }
+    if exit.is_none() {
+        #[cfg(test)]
+        if let Some(audit) = audit {
+            audit
+                .child_killed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let kill_result = child.kill();
+        #[cfg(test)]
+        if fault == Some(CleanupFaultPoint::Kill) {
+            cleanup_failed = true;
+        }
+        if let Err(error) = kill_result {
+            if error.kind() != std::io::ErrorKind::InvalidInput {
+                cleanup_failed = true;
+            }
+        }
+        match wait_for_child_exit_bounded(child, CHILD_CLEANUP_GRACE) {
+            Ok(Some(observed)) => exit = Some(observed),
+            Ok(None) | Err(_) => cleanup_failed = true,
+        }
+        #[cfg(test)]
+        if fault == Some(CleanupFaultPoint::FinalWait) {
+            cleanup_failed = true;
+            // The injected final-observation error is authoritative for the
+            // caller: even if this harness also consumed an OS exit status to
+            // avoid leaking its synthetic process, it must not report that
+            // the contracted final observation succeeded.
+            exit = None;
+        }
+    }
+    #[cfg(test)]
+    if let (Some(audit), Some(exit)) = (audit, exit) {
         audit
             .child_reaped
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -497,7 +592,11 @@ fn reap_unregistered_child(
             std::sync::atomic::Ordering::SeqCst,
         );
     }
-    Ok(())
+    if cleanup_failed {
+        Err(TransportError::Ended(SessionEnd::CleanupFailed))
+    } else {
+        Ok(())
+    }
 }
 
 fn wait_for_child_exit_bounded(
@@ -696,8 +795,22 @@ fn spawn_owned_session(
         let revoke_for_audit = test_revoke_sender
             .try_clone()
             .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
-        *spec.audit.ready_receiver.lock().unwrap() = Some(ready_for_audit);
-        *spec.audit.revoke_sender.lock().unwrap() = Some(revoke_for_audit);
+        spec.audit
+            .ready_sender
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?
+            .send(ready_for_audit)
+            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+        spec.audit
+            .revoke_sender
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?
+            .send(revoke_for_audit)
+            .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
     }
 
     if spec.mode == OwnedChildMode::ExitBeforeRegistration {
@@ -710,7 +823,10 @@ fn spawn_owned_session(
         return Err(TransportError::Ended(SessionEnd::ChildExited));
     }
 
-    let bootstrap = match if spec.fault == OwnedLaunchFault::RegisterFailure {
+    let bootstrap = match if matches!(
+        spec.fault,
+        OwnedLaunchFault::RegisterFailure | OwnedLaunchFault::RegisterCleanup(_)
+    ) {
         Err(())
     } else {
         pairing.register_or_rebind(store, plan, now).map_err(|_| ())
@@ -735,20 +851,30 @@ fn spawn_owned_session(
         #[cfg(test)]
         audit: Some(spec.audit.clone()),
         #[cfg(test)]
-        inject_cleanup_failure: spec.fault == OwnedLaunchFault::BootstrapCleanupFailure,
+        cleanup_fault: match spec.fault {
+            OwnedLaunchFault::BootstrapCleanup(point) => Some(point),
+            _ => None,
+        },
     };
-    let bootstrap_result = if matches!(
-        spec.fault,
-        OwnedLaunchFault::BootstrapPartial | OwnedLaunchFault::BootstrapCleanupFailure
-    ) {
-        owner.parent.write_all(&[0, 0]).and_then(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "fixed partial bootstrap failure",
-            ))
-        })
-    } else {
-        bootstrap.write_private_payload(&mut owner.parent)
+    let bootstrap_result = match spec.fault {
+        OwnedLaunchFault::BootstrapPartial | OwnedLaunchFault::BootstrapCleanup(_) => {
+            owner.parent.write_all(&[0, 0]).and_then(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "fixed partial bootstrap failure",
+                ))
+            })
+        }
+        #[cfg(test)]
+        OwnedLaunchFault::BootstrapWriteOffset(offset) => {
+            let mut writer = BootstrapFaultWriter {
+                inner: &mut owner.parent,
+                fail_at: offset,
+                written: 0,
+            };
+            bootstrap.write_private_payload(&mut writer)
+        }
+        _ => bootstrap.write_private_payload(&mut owner.parent),
     };
     if bootstrap_result.is_err() {
         return match owner.revoke_and_reap(pairing) {
@@ -1032,6 +1158,8 @@ fn handle_session_loop_monitored(
     stream
         .set_read_timeout(None)
         .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+    #[cfg(test)]
+    TEST_CLOCK_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut bucket = FrameBucket::new(monotonic_now());
     let mut next_sequence = 1u64;
     loop {
@@ -1068,6 +1196,15 @@ fn handle_session_loop_monitored(
             Utc::now(),
         )
         .map_err(|_| TransportError::Ended(SessionEnd::WorkerOrStoreFailed))?;
+        #[cfg(test)]
+        TEST_PERSISTED_SENDER.with(|sender| {
+            if let Some(sender) = sender.borrow().as_ref() {
+                let _ = sender.send(PersistedEvent {
+                    epoch: authority.epoch,
+                    sequence: event.sequence,
+                });
+            }
+        });
         // Test-only controllable monotonic time advances only at the same
         // production commit boundary that governs the real frame bucket.
         advance_test_clock_for_frame();
@@ -1751,19 +1888,6 @@ mod tests {
             data.shutdown(Shutdown::Write).unwrap();
             return;
         }
-        if stage == OwnedChildMode::LongFirstByteSilence.name() {
-            ready.write_all(b"S").unwrap();
-            let mut signal = [0u8; 1];
-            revoke.read_exact(&mut signal).unwrap();
-            revoke.write_all(b"R").unwrap();
-            return;
-        }
-        if stage == OwnedChildMode::SlowDrip.name() {
-            data.write_all(&[0]).unwrap();
-            let mut cleanup = [0u8; 1];
-            let _ = revoke.read(&mut cleanup);
-            return;
-        }
         if stage == OwnedChildMode::IgnoreRevokeAfterDataEof.name() {
             data.shutdown(Shutdown::Write).unwrap();
             loop {
@@ -1804,6 +1928,34 @@ mod tests {
         write_frame(&mut data, &handshake);
         assert_eq!(read_frame_for_test(&mut data), br#"{"result":"accepted"}"#);
         if stage == OwnedChildMode::CooperativeEof.name() {
+            data.shutdown(Shutdown::Write).unwrap();
+            let mut cleanup = [0u8; 1];
+            let _ = revoke.read(&mut cleanup);
+            return;
+        }
+        if stage == OwnedChildMode::AuthenticatedSlowDrip.name() {
+            let slot = std::str::from_utf8(slot).unwrap();
+            let payload = ingress(slot, epoch, 1, "identity_changed");
+            let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            // These are deliberately separate writes after authentication:
+            // the parent creates its fixed framing deadline after the first
+            // byte, then consumes the remaining valid ingress bytes through
+            // the normal parser and durable submission path.
+            data.write_all(&wire[..1]).unwrap();
+            data.write_all(&wire[1..2]).unwrap();
+            data.write_all(&wire[2..]).unwrap();
+            data.shutdown(Shutdown::Write).unwrap();
+            let mut cleanup = [0u8; 1];
+            let _ = revoke.read(&mut cleanup);
+            return;
+        }
+        if stage == OwnedChildMode::FirstByteSilenceCommit.name() {
+            ready.write_all(b"S").unwrap();
+            let mut signal = [0u8; 1];
+            revoke.read_exact(&mut signal).unwrap();
+            let slot = std::str::from_utf8(slot).unwrap();
+            write_frame(&mut data, &ingress(slot, epoch, 1, "identity_changed"));
             data.shutdown(Shutdown::Write).unwrap();
             let mut cleanup = [0u8; 1];
             let _ = revoke.read(&mut cleanup);
@@ -1923,30 +2075,15 @@ mod tests {
         assert_ne!(watched.revents & libc::POLLIN, 0);
     }
 
-    fn wait_until_store_appears(store: &ClaudeSnapshotStore) -> Vec<u8> {
-        let watchdog = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(bytes) = store.persisted_state_bytes_for_test() {
-                return bytes;
-            }
-            assert!(
-                Instant::now() < watchdog,
-                "store appearance watchdog expired"
-            );
-            std::thread::park_timeout(Duration::from_millis(1));
-        }
-    }
-
-    fn wait_until_store_changes(store: &ClaudeSnapshotStore, before: &[u8]) -> Vec<u8> {
-        let watchdog = Instant::now() + Duration::from_secs(5);
-        loop {
-            let observed = store.persisted_state_bytes_for_test().unwrap();
-            if observed != before {
-                return observed;
-            }
-            assert!(Instant::now() < watchdog, "store change watchdog expired");
-            std::thread::park_timeout(Duration::from_millis(1));
-        }
+    fn take_persisted_event(audit: &TestLaunchAudit, label: &str) -> PersistedEvent {
+        audit
+            .persisted_receiver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("persisted receiver was not installed")
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{label} did not persist"))
     }
 
     fn run_top_level_owned_session_for_test(
@@ -1957,32 +2094,50 @@ mod tests {
     ) -> Result<(), TransportError> {
         let exact_wait_advance = spec.exact_wait_clock_advance;
         let frame_step = spec.frame_clock_step;
+        let unregistered_cleanup_fault = match spec.fault {
+            OwnedLaunchFault::RegisterCleanup(point) => Some(point),
+            _ => None,
+        };
         TEST_TOP_LEVEL_LAUNCH.with(|slot| *slot.borrow_mut() = Some(spec));
-        TEST_CLOCK_OFFSET.with(|offset| offset.set(0));
-        TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.with(|advance| {
-            advance.set(exact_wait_advance.map(|duration| duration.as_millis() as u64));
+        TEST_TOP_LEVEL_LAUNCH.with(|slot| {
+            let persisted_sender = slot
+                .borrow()
+                .as_ref()
+                .expect("test launch spec missing")
+                .audit
+                .persisted_sender
+                .clone();
+            TEST_PERSISTED_SENDER.with(|sender| *sender.borrow_mut() = Some(persisted_sender));
         });
-        TEST_CLOCK_STEP_PER_FRAME.with(|step| step.set(frame_step.as_millis() as u64));
+        TEST_CLOCK_OFFSET.store(0, Ordering::SeqCst);
+        TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.store(
+            exact_wait_advance.map_or(0, |duration| duration.as_millis() as u64),
+            Ordering::SeqCst,
+        );
+        TEST_CLOCK_STEP_PER_FRAME.store(frame_step.as_millis() as u64, Ordering::SeqCst);
+        TEST_CLOCK_ARMED.store(false, Ordering::SeqCst);
+        TEST_UNREGISTERED_CLEANUP_FAULT.with(|fault| fault.set(unregistered_cleanup_fault));
         let result = run_owned_validation_session(store, pairing, plan, Utc::now());
         TEST_TOP_LEVEL_LAUNCH.with(|slot| *slot.borrow_mut() = None);
-        TEST_CLOCK_OFFSET.with(|offset| offset.set(0));
-        TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.with(|advance| advance.set(None));
-        TEST_CLOCK_STEP_PER_FRAME.with(|step| step.set(0));
+        TEST_PERSISTED_SENDER.with(|sender| *sender.borrow_mut() = None);
+        TEST_CLOCK_OFFSET.store(0, Ordering::SeqCst);
+        TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.store(0, Ordering::SeqCst);
+        TEST_CLOCK_STEP_PER_FRAME.store(0, Ordering::SeqCst);
+        TEST_CLOCK_ARMED.store(false, Ordering::SeqCst);
+        TEST_UNREGISTERED_CLEANUP_FAULT.with(|fault| fault.set(None));
         result
     }
 
     fn take_test_control_stream(
-        slot: &std::sync::Mutex<Option<UnixStream>>,
+        slot: &std::sync::Mutex<Option<std::sync::mpsc::Receiver<UnixStream>>>,
         label: &str,
     ) -> UnixStream {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(stream) = slot.lock().unwrap().take() {
-                return stream;
-            }
-            assert!(Instant::now() < deadline, "{label} was not published");
-            std::thread::park_timeout(Duration::from_millis(1));
-        }
+        slot.lock()
+            .unwrap()
+            .take()
+            .expect("test control receiver was already consumed")
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{label} was not published"))
     }
 
     #[test]
@@ -2079,7 +2234,7 @@ mod tests {
         let mut marker = [0u8; 1];
         ready.read_exact(&mut marker).unwrap();
         assert_eq!(marker, *b"B");
-        let mut revoke = take_test_control_stream(&audit.revoke_sender, "revoke/exit sender");
+        let mut revoke = take_test_control_stream(&audit.revoke_receiver, "revoke/exit sender");
         revoke.write_all(b"R").unwrap();
         assert_eq!(
             worker.join().unwrap(),
@@ -2120,15 +2275,45 @@ mod tests {
                 SessionEnd::WorkerOrStoreFailed,
             ),
             (
+                "unregistered-first-wait-cleanup-error-precedence",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::RegisterCleanup(CleanupFaultPoint::FirstWait),
+                SessionEnd::CleanupFailed,
+            ),
+            (
+                "unregistered-kill-cleanup-error-precedence",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::RegisterCleanup(CleanupFaultPoint::Kill),
+                SessionEnd::CleanupFailed,
+            ),
+            (
+                "unregistered-final-wait-cleanup-error-precedence",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::RegisterCleanup(CleanupFaultPoint::FinalWait),
+                SessionEnd::CleanupFailed,
+            ),
+            (
                 "bootstrap-partial",
                 OwnedChildMode::Session,
                 OwnedLaunchFault::BootstrapPartial,
                 SessionEnd::WorkerOrStoreFailed,
             ),
             (
-                "bootstrap-cleanup-failure-precedence",
+                "registered-first-wait-cleanup-error-precedence",
                 OwnedChildMode::Session,
-                OwnedLaunchFault::BootstrapCleanupFailure,
+                OwnedLaunchFault::BootstrapCleanup(CleanupFaultPoint::FirstWait),
+                SessionEnd::CleanupFailed,
+            ),
+            (
+                "registered-kill-cleanup-error-precedence",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::BootstrapCleanup(CleanupFaultPoint::Kill),
+                SessionEnd::CleanupFailed,
+            ),
+            (
+                "registered-final-wait-cleanup-error-precedence",
+                OwnedChildMode::Session,
+                OwnedLaunchFault::BootstrapCleanup(CleanupFaultPoint::FinalWait),
                 SessionEnd::CleanupFailed,
             ),
         ] {
@@ -2141,13 +2326,22 @@ mod tests {
                 Err(TransportError::Ended(expected)),
                 "{label}"
             );
+            let final_wait_fault = matches!(
+                fault,
+                OwnedLaunchFault::RegisterCleanup(CleanupFaultPoint::FinalWait)
+                    | OwnedLaunchFault::BootstrapCleanup(CleanupFaultPoint::FinalWait)
+            );
             if !matches!(
                 fault,
                 OwnedLaunchFault::ExecutableResolution
                     | OwnedLaunchFault::MissingExecutable
                     | OwnedLaunchFault::PreExec
-            ) {
+            ) && !final_wait_fault
+            {
                 assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
+            }
+            if final_wait_fault {
+                assert!(!audit.child_reaped.load(Ordering::SeqCst), "{label}");
             }
             if fault == OwnedLaunchFault::ExecutableResolution {
                 assert!(
@@ -2157,7 +2351,7 @@ mod tests {
             }
             if matches!(
                 fault,
-                OwnedLaunchFault::BootstrapPartial | OwnedLaunchFault::BootstrapCleanupFailure
+                OwnedLaunchFault::BootstrapPartial | OwnedLaunchFault::BootstrapCleanup(_)
             ) {
                 assert!(audit.generation_revoked.load(Ordering::SeqCst), "{label}");
             }
@@ -2167,27 +2361,89 @@ mod tests {
     }
 
     #[test]
+    fn top_level_bootstrap_real_write_all_offsets_revoke_and_reap() {
+        let _guard = owned_child_test_lock();
+        // PairingBootstrapV1 has exactly four production write_all segments:
+        // length(4), slot(36), epoch(8), token(43).  Each segment gets its
+        // start and an in-segment partial fault through the forwarding writer.
+        for offset in [0usize, 1, 4, 5, 40, 41, 48, 49] {
+            let (root, store) = fresh_store("bootstrap-write-offset");
+            let pairing = PairingRegistry::new();
+            let spec = OwnedLaunchSpec::test(
+                OwnedChildMode::Session,
+                OwnedLaunchFault::BootstrapWriteOffset(offset),
+            );
+            let audit = spec.audit.clone();
+            assert_eq!(
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
+                Err(TransportError::Ended(SessionEnd::WorkerOrStoreFailed)),
+                "offset {offset}"
+            );
+            assert!(
+                audit.generation_revoked.load(Ordering::SeqCst),
+                "offset {offset}"
+            );
+            assert!(audit.child_reaped.load(Ordering::SeqCst), "offset {offset}");
+            assert_eq!(pairing.pending_count_for_test(), 0, "offset {offset}");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn top_level_slow_drip_silence_burst_and_refill_use_real_child_seam() {
         let _guard = owned_child_test_lock();
 
-        let (root, store) = fresh_store("slow-drip");
-        let pairing = PairingRegistry::new();
-        let spec = OwnedLaunchSpec::test(OwnedChildMode::SlowDrip, OwnedLaunchFault::None)
-            .with_clock(Some(Duration::from_secs(6)), Duration::ZERO);
-        let audit = spec.audit.clone();
-        assert_eq!(
-            run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
-            Err(TransportError::Ended(SessionEnd::DeadlineExpired))
-        );
-        assert!(audit.child_reaped.load(Ordering::SeqCst));
-        assert_eq!(pairing.pending_count_for_test(), 0);
-        let _ = std::fs::remove_dir_all(root);
+        for (label, advance, expected, persists) in [
+            (
+                "authenticated-slow-drip-near-budget",
+                4_999,
+                SessionEnd::CleanEof,
+                true,
+            ),
+            (
+                "authenticated-slow-drip-over-budget",
+                5_000,
+                SessionEnd::DeadlineExpired,
+                false,
+            ),
+        ] {
+            let (root, store) = fresh_store(label);
+            let pairing = PairingRegistry::new();
+            let spec = OwnedLaunchSpec::test(
+                OwnedChildMode::AuthenticatedSlowDrip,
+                OwnedLaunchFault::None,
+            )
+            .with_clock(Some(Duration::from_millis(advance)), Duration::ZERO);
+            let audit = spec.audit.clone();
+            assert_eq!(
+                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Paid, spec),
+                Err(TransportError::Ended(expected)),
+                "{label}"
+            );
+            if persists {
+                assert_eq!(take_persisted_event(&audit, label).sequence, 1, "{label}");
+            } else {
+                assert!(audit
+                    .persisted_receiver
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .try_recv()
+                    .is_err());
+            }
+            assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
+            assert_eq!(pairing.pending_count_for_test(), 0, "{label}");
+            let _ = std::fs::remove_dir_all(root);
+        }
 
         let (root, store) = fresh_store("first-byte-silence");
         let store = std::sync::Arc::new(store);
         let pairing = std::sync::Arc::new(PairingRegistry::new());
-        let spec =
-            OwnedLaunchSpec::test(OwnedChildMode::LongFirstByteSilence, OwnedLaunchFault::None);
+        let spec = OwnedLaunchSpec::test(
+            OwnedChildMode::FirstByteSilenceCommit,
+            OwnedLaunchFault::None,
+        );
         let audit = spec.audit.clone();
         let worker_store = store.clone();
         let worker_pairing = pairing.clone();
@@ -2205,12 +2461,20 @@ mod tests {
         let mut marker = [0u8; 1];
         ready.read_exact(&mut marker).unwrap();
         assert_eq!(marker, *b"S");
+        // The handler is authenticated and parked in its first-byte wait.
+        // Advancing past a framing budget must remain harmless until the
+        // first ingress byte arrives, because no framing deadline exists yet.
+        TEST_CLOCK_OFFSET.fetch_add(6_000, Ordering::SeqCst);
         let mut revoke =
-            take_test_control_stream(&audit.revoke_sender, "first-byte silence revoke");
-        revoke.write_all(b"R").unwrap();
+            take_test_control_stream(&audit.revoke_receiver, "first-byte silence release");
+        revoke.write_all(b"G").unwrap();
         assert_eq!(
             worker.join().unwrap(),
-            Err(TransportError::Ended(SessionEnd::Revoked))
+            Err(TransportError::Ended(SessionEnd::CleanEof))
+        );
+        assert_eq!(
+            take_persisted_event(&audit, "first-byte silence").sequence,
+            1
         );
         assert!(audit.child_reaped.load(Ordering::SeqCst));
         assert_eq!(pairing.pending_count_for_test(), 0);
@@ -2275,7 +2539,7 @@ mod tests {
             let mut ready = [0u8; 1];
             ready_receiver.read_exact(&mut ready).unwrap();
             assert_eq!(ready, *b"B");
-            let mut revoke_a = take_test_control_stream(&a_audit.revoke_sender, "A revoke");
+            let mut revoke_a = take_test_control_stream(&a_audit.revoke_receiver, "A revoke");
 
             let b_mode = if iteration % 2 == 0 {
                 OwnedChildMode::SubmitAvailable
@@ -2287,8 +2551,31 @@ mod tests {
             let before_b = store.persisted_state_bytes_for_test().unwrap();
             assert!(pairing.try_lock_available_for_test());
 
-            let b_result =
-                run_top_level_owned_session_for_test(&store, &pairing, PlanMetadata::Free, b_spec);
+            let b_store = store.clone();
+            let b_pairing = pairing.clone();
+            let b_worker = std::thread::spawn(move || {
+                run_top_level_owned_session_for_test(
+                    &b_store,
+                    &b_pairing,
+                    PlanMetadata::Free,
+                    b_spec,
+                )
+            });
+            let persisted = take_persisted_event(&b_audit, "B durable commit");
+            assert_eq!(persisted.sequence, 1);
+            if b_mode == OwnedChildMode::SubmitUnavailable {
+                assert_eq!(
+                    take_persisted_event(&b_audit, "B second durable commit").sequence,
+                    2
+                );
+            }
+
+            revoke_a.write_all(b"R").unwrap();
+            assert_eq!(
+                a_worker.join().unwrap(),
+                Err(TransportError::Ended(SessionEnd::Revoked))
+            );
+            let b_result = b_worker.join().unwrap();
             assert!(
                 matches!(b_result, Err(TransportError::Ended(SessionEnd::CleanEof))),
                 "iteration {iteration}: unexpected B result {b_result:?}"
@@ -2299,11 +2586,6 @@ mod tests {
                 "iteration {iteration}: B did not persist"
             );
 
-            revoke_a.write_all(b"R").unwrap();
-            assert_eq!(
-                a_worker.join().unwrap(),
-                Err(TransportError::Ended(SessionEnd::Revoked))
-            );
             assert_eq!(
                 store.persisted_state_bytes_for_test().unwrap(),
                 after_b,
@@ -2393,9 +2675,11 @@ mod tests {
                 spec,
             )
         });
-        let registered = wait_until_store_appears(&store);
-        let after_first = wait_until_store_changes(&store, &registered);
-        let mut continue_child = take_test_control_stream(&audit.revoke_sender, "replay continue");
+        let persisted = take_persisted_event(&audit, "replay first commit");
+        assert_eq!(persisted.sequence, 1);
+        let after_first = store.persisted_state_bytes_for_test().unwrap();
+        let mut continue_child =
+            take_test_control_stream(&audit.revoke_receiver, "replay continue");
         continue_child.write_all(b"C").unwrap();
         assert_eq!(
             worker.join().unwrap(),
