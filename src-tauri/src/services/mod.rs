@@ -21,6 +21,7 @@ pub mod grok;
 mod grok_local;
 pub mod http;
 pub mod link;
+pub(crate) mod state_location;
 pub mod tray;
 pub mod tray_icon;
 pub mod window;

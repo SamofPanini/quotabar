@@ -22,15 +22,18 @@ pub async fn get_quota() -> Result<QuotaData, String> {
 pub fn get_claude_current_snapshots(
     app: AppHandle,
 ) -> Result<claude_snapshot::ClaudeCurrentSnapshotsDto, String> {
-    let config_dir = app
+    let legacy_config_dir = app
         .path()
         .app_config_dir()
         .map_err(|_| "Claude snapshot unavailable")?;
-    let store = claude_snapshot::ClaudeSnapshotStore::in_app_config(&config_dir)
+    let primary_config_dir = crate::services::state_location::primary_state_dir()
         .map_err(|_| "Claude snapshot unavailable")?;
-    store
-        .project(chrono::Utc::now())
-        .map_err(|_| "Claude snapshot unavailable".to_string())
+    claude_snapshot::ClaudeSnapshotStore::project_from_locations(
+        primary_config_dir.join("claude-current-state"),
+        legacy_config_dir.join("claude-current-state"),
+        chrono::Utc::now(),
+    )
+    .map_err(|_| "Claude snapshot unavailable".to_string())
 }
 
 #[tauri::command]
@@ -52,11 +55,18 @@ pub async fn get_codex_reset_credits() -> Result<CodexResetCredits, String> {
 /// The webview cannot provide profile descriptors or credential paths.
 #[tauri::command]
 pub async fn get_codex_profiles(app: AppHandle) -> Result<CodexProfilesResponse, String> {
-    let config_dir = app
+    let legacy_dir = app
         .path()
         .app_config_dir()
         .map_err(|_| "Profile configuration is unavailable")?;
-    Ok(codex_profiles::fetch_from_config(&config_dir, codex::get_codex_home().as_deref()).await)
+    let primary_dir = crate::services::state_location::primary_state_dir()
+        .map_err(|_| "Profile configuration is unavailable")?;
+    Ok(codex_profiles::fetch_from_locations(
+        &primary_dir,
+        &legacy_dir,
+        codex::get_codex_home().as_deref(),
+    )
+    .await)
 }
 
 #[tauri::command]
