@@ -118,9 +118,14 @@ contains a provider credential and neither changes `~/.codex/auth.json`.
 For each file/store, QuotaBar checks the durable primary first. It reads the
 previous bundle-ID-derived app-config location only when the corresponding
 primary location is absent. A present but unreadable, malformed, symlinked, or
-non-regular primary fails closed and does not fall back. When neither location
-exists, the result is an empty baseline. Backend responses may identify only
-`none`, `primary`, or `legacy`; they never expose an absolute home path.
+non-regular primary fails closed and does not fall back. An existing empty
+primary root is still primary and masks legacy state; this makes a deliberate
+primary initialization authoritative. When neither location exists, a refresh
+returns an in-memory empty baseline without creating a primary directory or
+lock. Legacy Claude projections are read-only: they do not chmod the legacy
+root or create locks, temporary files, cleanup entries, or updated state.
+Backend responses may identify only `none`, `primary`, or `legacy`; they never
+expose an absolute home path.
 
 The legacy registry location remains:
 

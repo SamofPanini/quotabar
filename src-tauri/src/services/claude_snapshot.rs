@@ -591,17 +591,21 @@ impl ClaudeSnapshotStore {
 
     /// Resolves a durable primary root before the legacy bundle-owned root.
     /// A malformed primary is an authority failure, not a reason to consult
-    /// legacy state.  Legacy reads deliberately use the read-only projection
-    /// path so an ordinary refresh cannot modify or migrate old data.
-    pub(crate) fn for_projection(
+    /// legacy state. Neither missing root creates any filesystem state; only
+    /// an explicit writer using `at_root` initializes the primary directory.
+    pub(crate) fn project_from_locations(
         primary_root: PathBuf,
         legacy_root: PathBuf,
-    ) -> Result<(Self, StateProvenance), SnapshotError> {
-        match Self::open_existing(primary_root.clone())? {
-            Some(store) => Ok((store, StateProvenance::Primary)),
+        now: DateTime<Utc>,
+    ) -> Result<ClaudeCurrentSnapshotsDto, SnapshotError> {
+        match Self::open_existing(primary_root)? {
+            Some(store) => store.project(now),
             None => match Self::open_existing(legacy_root)? {
-                Some(store) => Ok((store, StateProvenance::Legacy)),
-                None => Ok((Self::at_root(primary_root)?, StateProvenance::None)),
+                Some(store) => store.project_read_only(now, StateProvenance::Legacy),
+                None => Ok(ClaudeCurrentSnapshotsDto {
+                    slots: vec![],
+                    provenance: StateProvenance::None,
+                }),
             },
         }
     }
@@ -617,7 +621,26 @@ impl ClaudeSnapshotStore {
             }
             Ok(_) => {}
         }
-        Self::at_root(root).map(Some)
+        let parent = root.parent().ok_or(SnapshotError::InvalidInput)?;
+        let name = root.file_name().ok_or(SnapshotError::InvalidInput)?;
+        let root = parent
+            .canonicalize()
+            .map_err(|_| SnapshotError::Io)?
+            .join(name);
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => return Err(SnapshotError::InvalidState),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(SnapshotError::Io),
+        }
+        #[cfg(unix)]
+        let root_dir = open_directory(&root)?;
+        Ok(Some(Self {
+            root,
+            #[cfg(unix)]
+            root_dir,
+        }))
     }
 
     pub(crate) fn at_root(root: PathBuf) -> Result<Self, SnapshotError> {
@@ -2715,6 +2738,9 @@ mod tests {
 
     #[test]
     fn durable_location_precedence_is_fail_closed_and_legacy_projection_is_read_only() {
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
         let parent = root("durable-location");
         fs::create_dir_all(&parent).unwrap();
         let primary_root = parent.join("primary");
@@ -2737,41 +2763,119 @@ mod tests {
                 now(),
             )
             .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&legacy.root, fs::Permissions::from_mode(0o500)).unwrap();
         let before = fs::read(legacy.root.join(STATE_FILE)).unwrap();
-        let (selected, provenance) =
-            ClaudeSnapshotStore::for_projection(primary_root.clone(), legacy_root.clone()).unwrap();
-        assert_eq!(provenance, StateProvenance::Legacy);
-        let projected = selected
-            .project_read_only(now() + FRESH_FOR + Duration::seconds(1), provenance)
-            .unwrap();
+        let before_metadata = fs::metadata(&legacy.root).unwrap();
+        let before_entries = fs::read_dir(&legacy.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        let projected = ClaudeSnapshotStore::project_from_locations(
+            primary_root.clone(),
+            legacy_root.clone(),
+            now() + FRESH_FOR + Duration::seconds(1),
+        )
+        .unwrap();
         assert_eq!(projected.provenance, StateProvenance::Legacy);
         assert_eq!(projected.slots[0].five_hour.used_percent, Some(42.0));
         assert_eq!(fs::read(legacy.root.join(STATE_FILE)).unwrap(), before);
+        let after_metadata = fs::metadata(&legacy.root).unwrap();
+        let after_entries = fs::read_dir(&legacy.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        #[cfg(unix)]
+        {
+            assert_eq!(before_metadata.mode() & 0o777, 0o500);
+            assert_eq!(after_metadata.mode() & 0o777, 0o500);
+            assert_eq!(
+                (before_metadata.ctime(), before_metadata.ctime_nsec()),
+                (after_metadata.ctime(), after_metadata.ctime_nsec())
+            );
+        }
+        assert_eq!(before_entries, after_entries);
 
         let primary = ClaudeSnapshotStore::at_root(primary_root.clone()).unwrap();
-        let (selected, provenance) =
-            ClaudeSnapshotStore::for_projection(primary_root.clone(), legacy_root.clone()).unwrap();
-        assert_eq!(provenance, StateProvenance::Primary);
-        assert_eq!(selected.root, primary.root);
-
-        let empty_parent = parent.join("empty");
-        fs::create_dir_all(&empty_parent).unwrap();
-        let (empty, provenance) = ClaudeSnapshotStore::for_projection(
-            empty_parent.join("primary"),
-            empty_parent.join("legacy"),
+        let projected = ClaudeSnapshotStore::project_from_locations(
+            primary_root.clone(),
+            legacy_root.clone(),
+            now(),
         )
         .unwrap();
-        assert_eq!(provenance, StateProvenance::None);
-        assert!(!empty.root.join(STATE_FILE).exists());
+        assert_eq!(projected.provenance, StateProvenance::Primary);
+        assert_eq!(primary.root, primary_root);
 
         let blocked_parent = parent.join("blocked");
         fs::create_dir_all(&blocked_parent).unwrap();
         fs::write(blocked_parent.join("primary"), b"not-a-directory").unwrap();
         let fallback = ClaudeSnapshotStore::at_root(blocked_parent.join("legacy")).unwrap();
         assert!(matches!(
-            ClaudeSnapshotStore::for_projection(blocked_parent.join("primary"), fallback.root),
+            ClaudeSnapshotStore::project_from_locations(
+                blocked_parent.join("primary"),
+                fallback.root,
+                now()
+            ),
             Err(SnapshotError::InvalidState)
         ));
+        #[cfg(unix)]
+        fs::set_permissions(&legacy.root, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn empty_location_reads_do_not_initialize_primary_and_later_legacy_is_visible() {
+        let parent = root("fresh-location");
+        let primary_root = parent.join("primary");
+        let legacy_root = parent.join("legacy");
+        for _ in 0..2 {
+            let empty = ClaudeSnapshotStore::project_from_locations(
+                primary_root.clone(),
+                legacy_root.clone(),
+                now(),
+            )
+            .unwrap();
+            assert!(empty.slots.is_empty());
+            assert_eq!(empty.provenance, StateProvenance::None);
+            assert!(!parent.exists());
+        }
+
+        fs::create_dir_all(&parent).unwrap();
+        let legacy = ClaudeSnapshotStore::at_root(legacy_root.clone()).unwrap();
+        let id = slot("123e4567-e89b-42d3-a456-426614174040");
+        register(&legacy, id, now());
+        let selected =
+            ClaudeSnapshotStore::project_from_locations(primary_root.clone(), legacy_root, now())
+                .unwrap();
+        assert_eq!(selected.provenance, StateProvenance::Legacy);
+        assert_eq!(selected.slots.len(), 1);
+        assert!(!primary_root.exists());
+
+        let primary = ClaudeSnapshotStore::at_root(primary_root.clone()).unwrap();
+        assert!(primary.root.exists());
+        let selected =
+            ClaudeSnapshotStore::project_from_locations(primary_root, parent.join("legacy"), now())
+                .unwrap();
+        assert_eq!(selected.provenance, StateProvenance::Primary);
+        assert!(selected.slots.is_empty());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn selected_legacy_root_removal_fails_closed_without_recreation() {
+        let parent = root("selected-root-removal");
+        fs::create_dir_all(&parent).unwrap();
+        let legacy_root = parent.join("legacy");
+        let legacy = ClaudeSnapshotStore::at_root(legacy_root.clone()).unwrap();
+        let selected = ClaudeSnapshotStore::open_existing(legacy_root.clone())
+            .unwrap()
+            .expect("existing legacy store must select");
+        fs::remove_dir_all(&legacy.root).unwrap();
+        assert!(matches!(
+            selected.project_read_only(now(), StateProvenance::Legacy),
+            Err(SnapshotError::Io)
+        ));
+        assert!(!legacy_root.exists());
         let _ = fs::remove_dir_all(parent);
     }
 
@@ -2787,7 +2891,7 @@ mod tests {
         let linked_primary = parent.join("linked-primary");
         symlink(&legacy_root, &linked_primary).unwrap();
         assert!(matches!(
-            ClaudeSnapshotStore::for_projection(linked_primary, legacy_root.clone()),
+            ClaudeSnapshotStore::project_from_locations(linked_primary, legacy_root.clone(), now()),
             Err(SnapshotError::InvalidState)
         ));
 
@@ -2796,11 +2900,8 @@ mod tests {
         let state = primary.root.join(STATE_FILE);
         fs::write(&state, b"{").unwrap();
         fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let (selected, provenance) =
-            ClaudeSnapshotStore::for_projection(primary_root, legacy.root).unwrap();
-        assert_eq!(provenance, StateProvenance::Primary);
         assert!(matches!(
-            selected.project_read_only(now(), provenance),
+            ClaudeSnapshotStore::project_from_locations(primary_root, legacy.root, now()),
             Err(SnapshotError::Io)
         ));
         fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();

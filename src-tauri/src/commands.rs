@@ -28,23 +28,12 @@ pub fn get_claude_current_snapshots(
         .map_err(|_| "Claude snapshot unavailable")?;
     let primary_config_dir = crate::services::state_location::primary_state_dir()
         .map_err(|_| "Claude snapshot unavailable")?;
-    let (store, provenance) = claude_snapshot::ClaudeSnapshotStore::for_projection(
+    claude_snapshot::ClaudeSnapshotStore::project_from_locations(
         primary_config_dir.join("claude-current-state"),
         legacy_config_dir.join("claude-current-state"),
+        chrono::Utc::now(),
     )
-    .map_err(|_| "Claude snapshot unavailable")?;
-    match provenance {
-        crate::services::state_location::StateProvenance::Legacy => store
-            .project_read_only(chrono::Utc::now(), provenance)
-            .map_err(|_| "Claude snapshot unavailable".to_string()),
-        _ => store
-            .project(chrono::Utc::now())
-            .map(|mut snapshots| {
-                snapshots.provenance = provenance;
-                snapshots
-            })
-            .map_err(|_| "Claude snapshot unavailable".to_string()),
-    }
+    .map_err(|_| "Claude snapshot unavailable".to_string())
 }
 
 #[tauri::command]

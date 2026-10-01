@@ -7,6 +7,7 @@ import SmartTip from './SmartTip';
 import type {
   CodexData,
   CodexProfileQuota,
+  CodexProfilesResponse,
   CodexRateLimitWindow,
   CodexRateLimits,
   CodexResetCredit,
@@ -260,6 +261,8 @@ export default function CodexPanel({
   const [error, setError] = useState<string | null>(null);
   const [rateLimitsError, setRateLimitsError] = useState<string | null>(null);
   const [customProfiles, setCustomProfiles] = useState<CodexProfileQuota[]>([]);
+  const [registryError, setRegistryError] = useState<string | null>(null);
+  const [registryProvenance, setRegistryProvenance] = useState<CodexProfilesResponse['registryProvenance'] | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState('default');
   const hasResolvedData = useRef(false);
   const pendingTrayCoordination = useRef<PendingTrayCoordination | null>(null);
@@ -319,10 +322,16 @@ export default function CodexPanel({
     pendingTrayCoordination.current = { generation };
     const profilesPromise = backend
       .getCodexProfiles()
-      .catch(() => ({ profiles: [], registryError: null, registryProvenance: 'none' as const }));
+      .catch(() => ({
+        profiles: [],
+        registryError: 'Profile configuration is unavailable',
+        registryProvenance: 'none' as const,
+      }));
     void profilesPromise.then((profiles) => {
       if (!request_generation.isCurrent(generation)) return;
       setCustomProfiles(profiles.profiles);
+      setRegistryError(profiles.registryError ?? null);
+      setRegistryProvenance(profiles.registryProvenance ?? 'none');
       if (pendingTrayCoordination.current?.generation !== generation) return;
       pendingTrayCoordination.current.profiles = profiles.profiles;
       publishTraySnapshots(generation);
@@ -438,6 +447,19 @@ export default function CodexPanel({
     { id: 'default', label: 'Default' },
     ...customProfiles.map((profile) => ({ id: profile.alias, label: profile.alias })),
   ];
+  const registryMessage = registryError
+    ? 'Custom profile registry unavailable.'
+    : registryProvenance === 'legacy'
+      ? 'Using legacy custom profile registry.'
+      : registryProvenance === 'primary'
+        ? 'Custom profile registry loaded.'
+        : 'No custom profile registry configured.';
+  const renderRegistryStatus = registryProvenance !== null ? (
+    <div className={registryError ? 'error-banner' : 'codex-updated'} role={registryError ? 'alert' : 'status'}>
+      {registryError && <span className="error-icon">!</span>}
+      <span className={registryError ? 'error-text' : undefined}>{registryMessage}</span>
+    </div>
+  ) : null;
   // Cost data is always owned by the default account. Keep its component mounted
   // while a custom quota tab is selected so tab navigation cannot retrigger its
   // local IPC-backed initial load.
@@ -634,6 +656,7 @@ export default function CodexPanel({
 
     return (
       <div className="codex-panel">
+        {renderRegistryStatus}
         <div className="codex-content">
           {renderAccountTabs}
           <ProviderDetailHeader
@@ -679,6 +702,8 @@ export default function CodexPanel({
           </span>
         </div>
       )}
+
+      {renderRegistryStatus}
 
       {(connected || customProfiles.length > 0) && (
         <div className="codex-content">

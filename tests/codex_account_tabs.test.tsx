@@ -71,7 +71,11 @@ async function renderPanel(options: {
   sections?: typeof hiddenSections;
 } = {}): Promise<ReactTestRenderer> {
   mockDefaultCalls(options.defaultRateLimits);
-  vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue(options.profiles ?? { profiles: [], registryError: null });
+  vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue(options.profiles ?? {
+    profiles: [],
+    registryError: null,
+    registryProvenance: 'none',
+  });
   let renderer!: ReactTestRenderer;
   await act(async () => {
     renderer = create(createElement(CodexPanel, {
@@ -109,6 +113,93 @@ describe('Codex account tabs', () => {
     expect(renderer.root.findAllByProps({ role: 'tab' })).toHaveLength(0);
     expect(JSON.stringify(renderer.toJSON())).toContain('Connected');
     expect(backend.getCodexProfiles).toHaveBeenCalledTimes(1);
+    await act(async () => renderer.unmount());
+  });
+
+  it('shows safe registry state for primary, legacy, and no-registry responses', async () => {
+    for (const [registryProvenance, expected] of [
+      ['primary', 'Custom profile registry loaded.'],
+      ['legacy', 'Using legacy custom profile registry.'],
+      ['none', 'No custom profile registry configured.'],
+    ] as const) {
+      const renderer = await renderPanel({
+        profiles: { profiles: [], registryError: null, registryProvenance },
+      });
+      expect(JSON.stringify(renderer.toJSON())).toContain(expected);
+      await act(async () => renderer.unmount());
+    }
+  });
+
+  it('keeps the default quota visible when the custom registry is malformed', async () => {
+    const renderer = await renderPanel({
+      profiles: {
+        profiles: [],
+        registryError: 'primary registry parse failed at /private/synthetic',
+        registryProvenance: 'primary',
+      },
+    });
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain('Connected');
+    expect(text).toContain('Custom profile registry unavailable.');
+    expect(text).not.toContain('primary registry parse failed');
+    expect(text).not.toContain('/private/synthetic');
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps a safe loading failure visible when the profile IPC rejects', async () => {
+    mockDefaultCalls();
+    vi.spyOn(backend, 'getCodexProfiles').mockRejectedValue(new Error('/private/raw registry failure'));
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        showCostSummary: false,
+        sections: hiddenSections,
+      }));
+      await flush();
+    });
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain('Connected');
+    expect(text).toContain('Custom profile registry unavailable.');
+    expect(text).not.toContain('/private/raw registry failure');
+    await act(async () => renderer.unmount());
+  });
+
+  it('clears a prior registry error after a successful refresh', async () => {
+    mockDefaultCalls();
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({
+        profiles: [],
+        registryError: 'malformed primary',
+        registryProvenance: 'primary',
+      })
+      .mockResolvedValueOnce({
+        profiles: [],
+        registryError: null,
+        registryProvenance: 'none',
+      });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        showCostSummary: false,
+        sections: hiddenSections,
+      }));
+      await flush();
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain('Custom profile registry unavailable.');
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        manualRefreshNonce: 1,
+        showCostSummary: false,
+        sections: hiddenSections,
+      }));
+      await flush();
+    });
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain('No custom profile registry configured.');
+    expect(text).not.toContain('Custom profile registry unavailable.');
     await act(async () => renderer.unmount());
   });
 
