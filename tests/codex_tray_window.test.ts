@@ -87,6 +87,23 @@ describe('Codex menu-bar quota window', () => {
     ], 'five_hour')).toBe(0);
   });
 
+  it('does not infer quota recovery from a passed reset timestamp', () => {
+    const pastReset = Math.floor(Date.now() / 1000) - 60;
+    const futureReset = Math.floor(Date.now() / 1000) + 60;
+    expect(getCodexTrayUsedPercent([
+      {
+        accountId: 'past-reset', connected: true,
+        primary: { usedPercent: 100, windowMinutes: 300, resetsAt: pastReset },
+      },
+    ], 'five_hour')).toBe(100);
+    expect(getCodexTrayUsedPercent([
+      {
+        accountId: 'future-reset', connected: true,
+        primary: { usedPercent: 0, windowMinutes: 300, resetsAt: futureReset },
+      },
+    ], 'five_hour')).toBe(0);
+  });
+
   it('defaults malformed persistence to weekly and saves validated changes', () => {
     const values = installStorage({ [MENU_BAR_QUOTA_WINDOW_STORAGE_KEY]: 'monthly' });
     expect(getSavedMenuBarQuotaWindow()).toBe('weekly');
