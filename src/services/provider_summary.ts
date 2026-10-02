@@ -54,7 +54,11 @@ export function getCodexTrayUsedPercent(
 ): number | null {
   let highest: number | null = null;
   for (const account of accounts) {
-    if (!account.connected || account.ordinaryUsageAllowed !== true) continue;
+    if (!account.connected) continue;
+    // `ordinaryUsageAllowed` is the provider's permission result, not a
+    // freshness or validity marker for a returned usage window. In
+    // particular, a saturated five-hour window can be reported alongside
+    // `false`; hiding it would turn a real 100% into an unknown tray state.
     // The provider contract identifies primary as five-hour and secondary as weekly.
     const limit = window === 'five_hour' ? account.primary : account.secondary;
     if (!isValidUsedPercent(limit?.usedPercent)) continue;

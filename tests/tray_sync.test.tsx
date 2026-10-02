@@ -168,10 +168,12 @@ describe('tray icon sync', () => {
     await unmount(renderer);
   });
 
-  test('keeps the Codex percent unavailable when permission is unknown', async () => {
+  test('projects a saturated five-hour quota despite a blocked ordinary-usage result', async () => {
+    localStorage.setItem('menuBarQuotaWindow', 'five_hour');
     vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
       connected: true,
-      primary: { usedPercent: 18, windowMinutes: 300 },
+      ordinaryUsageAllowed: false,
+      primary: { usedPercent: 100, windowMinutes: 300 },
       secondary: { usedPercent: 52, windowMinutes: 10_080 },
     });
     const renderer = await render_app();
@@ -180,7 +182,8 @@ describe('tray icon sync', () => {
     const codexUpdate = vi.mocked(backend.updateTrayIcon).mock.calls
       .filter((call) => call[0] === 'codex')
       .at(-1);
-    expect(codexUpdate?.[1]).toBeNull();
+    expect(codexUpdate?.[1]).toBe(100);
+    expect(JSON.stringify(renderer.toJSON())).toContain('100%');
     await unmount(renderer);
   });
 });
