@@ -54,14 +54,37 @@ describe('Codex menu-bar quota window', () => {
     expect(getCodexTrayUsedPercent(invalid, 'five_hour')).toBe(91);
   });
 
-  it('uses only accounts explicitly permitted for ordinary usage', () => {
-    const unavailable: CodexTrayAccountSnapshot[] = [
-      { accountId: 'blocked', connected: true, ordinaryUsageAllowed: false, secondary: { usedPercent: 99, windowMinutes: 10_080 } },
-      { accountId: 'unknown', connected: true, ordinaryUsageAllowed: null, secondary: { usedPercent: 98, windowMinutes: 10_080 } },
+  it('keeps connected quota observations independent from ordinary-usage permission', () => {
+    const observed: CodexTrayAccountSnapshot[] = [
+      // Sanitized provider fixture: a denied ordinary request with a real,
+      // saturated five-hour quota is still a usable display observation.
+      {
+        accountId: 'saturated', connected: true, ordinaryUsageAllowed: false,
+        primary: { usedPercent: 100, windowMinutes: 300 },
+        secondary: { usedPercent: 0, windowMinutes: 10_080 },
+      },
+      { accountId: 'unknown-permission', connected: true, ordinaryUsageAllowed: null, secondary: { usedPercent: 98, windowMinutes: 10_080 } },
       { accountId: 'permitted', connected: true, ordinaryUsageAllowed: true, secondary: { usedPercent: 40, windowMinutes: 10_080 } },
     ];
-    expect(getCodexTrayUsedPercent(unavailable, 'weekly')).toBe(40);
-    expect(getCodexTrayUsedPercent(unavailable.slice(0, 2), 'weekly')).toBeNull();
+    expect(getCodexTrayUsedPercent(observed, 'five_hour')).toBe(100);
+    expect(getCodexTrayUsedPercent(observed, 'weekly')).toBe(98);
+  });
+
+  it('keeps absent selected-window usage unknown instead of converting it to zero', () => {
+    const missing: CodexTrayAccountSnapshot[] = [
+      { accountId: 'missing-primary', connected: true, ordinaryUsageAllowed: false, secondary: { usedPercent: 100, windowMinutes: 10_080 } },
+      { accountId: 'null-permission', connected: true, ordinaryUsageAllowed: null, secondary: { usedPercent: 75, windowMinutes: 10_080 } },
+    ];
+    expect(getCodexTrayUsedPercent(missing, 'five_hour')).toBeNull();
+  });
+
+  it('preserves an explicit zero percent observation', () => {
+    expect(getCodexTrayUsedPercent([
+      {
+        accountId: 'fresh-zero', connected: true, ordinaryUsageAllowed: true,
+        primary: { usedPercent: 0, windowMinutes: 300 },
+      },
+    ], 'five_hour')).toBe(0);
   });
 
   it('defaults malformed persistence to weekly and saves validated changes', () => {
