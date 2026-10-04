@@ -43,6 +43,9 @@ try {
   expectFail('--manifest', manifest);
   write(manifest, `[package]\nname = "quotabar"\nautobins = false\ndefault-run = "quotabar"\n\n[features]\ndefault = []\ntask-smoke = []\n\n[[bin]]\nname = "quotabar"\npath = "src/main.rs"\n\n[[bin]]\nname = "qbi_p1_r2_smoke"\npath = "task-bin/qbi_p1_r2_smoke.rs"\nrequired-features = ["task-smoke"]\n`);
   expectPass('--bundle', bundle);
+  chmodSync(join(macos, 'quotabar'), 0o644);
+  expectFail('--bundle', bundle);
+  chmodSync(join(macos, 'quotabar'), 0o755);
   write(join(contents, 'Info.plist'), '<?xml version="1.0"?><plist><dict><key>CFBundleExecutable</key><string>qbi_p1_r2_smoke</string></dict></plist>');
   expectFail('--bundle', bundle);
   write(join(contents, 'Info.plist'), '<?xml version="1.0"?><plist><dict><key>CFBundleExecutable</key><string>quotabar</string></dict></plist>');

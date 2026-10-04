@@ -16,6 +16,7 @@ on:
       - ".github/workflows/release-artifacts.yml"
       - "package.json"
       - "package-lock.json"
+      - "scripts/**"
       - "src-tauri/**"
       - "src/**"
       - "docs/release.md"
