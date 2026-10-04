@@ -27,7 +27,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "qbi_p1_r2_smoke"
-path = "src/bin/qbi_p1_r2_smoke.rs"
+path = "task-bin/qbi_p1_r2_smoke.rs"
 required-features = ["task-smoke"]
 
 [build-dependencies]

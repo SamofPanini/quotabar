@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 const PRODUCT_BIN = 'quotabar';
 const SMOKE_BIN = 'qbi_p1_r2_smoke';
@@ -24,7 +24,7 @@ function tomlStringArray(block, key) {
   return [...match[1].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]);
 }
 
-function verifyManifest(path) {
+function verifyManifest(path, requireSourceLayout) {
   const source = readFileSync(path, 'utf8');
   const packageBlock = source.split(/^\[lib\]/m, 1)[0];
   if (!/^autobins\s*=\s*false\s*$/m.test(packageBlock)) {
@@ -55,9 +55,18 @@ function verifyManifest(path) {
     fail('product bin must be quotabar at src/main.rs without required features');
   }
   const smoke = bins.find((bin) => bin.name === SMOKE_BIN);
-  if (!smoke || smoke.path !== 'src/bin/qbi_p1_r2_smoke.rs'
+  if (!smoke || smoke.path !== 'task-bin/qbi_p1_r2_smoke.rs'
       || JSON.stringify(smoke.requiredFeatures) !== JSON.stringify(['task-smoke'])) {
-    fail('task smoke bin must require only the opt-in task-smoke feature');
+    fail('task smoke bin must live outside src/bin and require only the opt-in task-smoke feature');
+  }
+  if (requireSourceLayout) {
+    const smokeSource = join(dirname(path), smoke.path);
+    if (!existsSync(smokeSource) || !statSync(smokeSource).isFile()) {
+      fail(`task smoke source is missing: ${smokeSource}`);
+    }
+    if (existsSync(join(dirname(path), 'src', 'bin', `${SMOKE_BIN}.rs`))) {
+      fail('task smoke source must not reside under src/bin');
+    }
   }
 }
 
@@ -93,10 +102,11 @@ function verifyBuiltTarget(path) {
 const manifest = option('--manifest');
 const bundle = option('--bundle');
 const builtTarget = option('--built-target');
+const requireSourceLayout = process.argv.includes('--require-source-layout');
 if (!manifest && !bundle && !builtTarget) {
   fail('provide --manifest, --bundle, or --built-target');
 }
-if (manifest) verifyManifest(manifest);
+if (manifest) verifyManifest(manifest, requireSourceLayout);
 if (bundle) verifyBundle(bundle);
 if (builtTarget) verifyBuiltTarget(builtTarget);
 process.stdout.write('product entrypoint guard passed\n');

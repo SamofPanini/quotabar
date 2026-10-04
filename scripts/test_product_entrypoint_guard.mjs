@@ -27,7 +27,7 @@ function expectFail(...args) {
 
 try {
   const manifest = join(root, 'Cargo.toml');
-  write(manifest, `[package]\nname = "quotabar"\nautobins = false\ndefault-run = "quotabar"\n\n[features]\ndefault = []\ntask-smoke = []\n\n[[bin]]\nname = "quotabar"\npath = "src/main.rs"\n\n[[bin]]\nname = "qbi_p1_r2_smoke"\npath = "src/bin/qbi_p1_r2_smoke.rs"\nrequired-features = ["task-smoke"]\n`);
+  write(manifest, `[package]\nname = "quotabar"\nautobins = false\ndefault-run = "quotabar"\n\n[features]\ndefault = []\ntask-smoke = []\n\n[[bin]]\nname = "quotabar"\npath = "src/main.rs"\n\n[[bin]]\nname = "qbi_p1_r2_smoke"\npath = "task-bin/qbi_p1_r2_smoke.rs"\nrequired-features = ["task-smoke"]\n`);
   const bundle = join(root, 'QuotaBar.app');
   const contents = join(bundle, 'Contents');
   const macos = join(contents, 'MacOS');
@@ -37,9 +37,11 @@ try {
   chmodSync(join(macos, 'quotabar'), 0o755);
 
   expectPass('--manifest', manifest);
-  write(manifest, `[package]\nname = "quotabar"\nautobins = false\ndefault-run = "quotabar"\n\n[features]\ndefault = []\ntask-smoke = []\n\n[[bin]]\nname = "quotabar"\npath = "src/main.rs"\n\n[[bin]]\nname = "qbi_p1_r2_smoke"\npath = "src/bin/qbi_p1_r2_smoke.rs"\n`);
+  write(manifest, `[package]\nname = "quotabar"\nautobins = false\ndefault-run = "quotabar"\n\n[features]\ndefault = []\ntask-smoke = []\n\n[[bin]]\nname = "quotabar"\npath = "src/main.rs"\n\n[[bin]]\nname = "qbi_p1_r2_smoke"\npath = "task-bin/qbi_p1_r2_smoke.rs"\n`);
   expectFail('--manifest', manifest);
   write(manifest, `[package]\nname = "quotabar"\nautobins = false\ndefault-run = "quotabar"\n\n[features]\ndefault = []\ntask-smoke = []\n\n[[bin]]\nname = "quotabar"\npath = "src/main.rs"\n\n[[bin]]\nname = "qbi_p1_r2_smoke"\npath = "src/bin/qbi_p1_r2_smoke.rs"\nrequired-features = ["task-smoke"]\n`);
+  expectFail('--manifest', manifest);
+  write(manifest, `[package]\nname = "quotabar"\nautobins = false\ndefault-run = "quotabar"\n\n[features]\ndefault = []\ntask-smoke = []\n\n[[bin]]\nname = "quotabar"\npath = "src/main.rs"\n\n[[bin]]\nname = "qbi_p1_r2_smoke"\npath = "task-bin/qbi_p1_r2_smoke.rs"\nrequired-features = ["task-smoke"]\n`);
   expectPass('--bundle', bundle);
   write(join(contents, 'Info.plist'), '<?xml version="1.0"?><plist><dict><key>CFBundleExecutable</key><string>qbi_p1_r2_smoke</string></dict></plist>');
   expectFail('--bundle', bundle);
