@@ -85,7 +85,7 @@ function verifyBundle(path) {
   if (!existsSync(executablePath) || !statSync(executablePath).isFile()) {
     fail(`bundle product executable is missing: ${executablePath}`);
   }
-  if ((statSync(executablePath).mode & 0o111) === 0) {
+  if (process.platform !== 'win32' && (statSync(executablePath).mode & 0o111) === 0) {
     fail(`bundle product executable is not executable: ${executablePath}`);
   }
   if (existsSync(join(path, 'Contents', 'MacOS', SMOKE_BIN))) {
