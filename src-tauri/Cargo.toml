@@ -5,6 +5,8 @@ description = "Quota and cost monitor for Claude Code and Codex"
 authors = ["QuotaBar Contributors"]
 edition = "2021"
 license = "MIT"
+autobins = false
+default-run = "quotabar"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,6 +16,19 @@ license = "MIT"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "quotabar_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+task-smoke = []
+
+[[bin]]
+name = "quotabar"
+path = "src/main.rs"
+
+[[bin]]
+name = "qbi_p1_r2_smoke"
+path = "src/bin/qbi_p1_r2_smoke.rs"
+required-features = ["task-smoke"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
