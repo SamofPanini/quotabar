@@ -5,11 +5,11 @@
 //! provider request. The caller must provide an isolated HOME strictly below
 //! the named task root.
 
-#[path = "../commands.rs"]
+#[path = "../src/commands.rs"]
 mod commands;
-#[path = "../domain/mod.rs"]
+#[path = "../src/domain/mod.rs"]
 mod domain;
-#[path = "../services/mod.rs"]
+#[path = "../src/services/mod.rs"]
 mod services;
 
 #[cfg(target_os = "macos")]

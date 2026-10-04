@@ -34,7 +34,8 @@ npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
-npm run tauri build -- --bundles app
+npm run release:entrypoint:check
+npm run tauri build -- --bundles app -- --bin quotabar
 ```
 
 Refresh the browser-preview visual proof only when the UI has changed:
@@ -108,9 +109,20 @@ Get-FileHash -Algorithm SHA256 .\QuotaBar_*.msi
 For a local macOS smoke test, build the app bundle and install it:
 
 ```bash
-npm run tauri build -- --bundles app
+npm run tauri build -- --bundles app -- --bin quotabar
 ./scripts/reinstall_and_run.sh
 ```
+
+The release entrypoint is explicitly the `quotabar` binary. The PR #19
+diagnostic harness remains available only as an opt-in task command and must
+never be selected for a release bundle:
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml --bin qbi_p1_r2_smoke --features task-smoke
+```
+
+That command requires its documented isolated task environment; it is not a
+desktop-app smoke and must not be used for consumer validation.
 
 ## Publishing
 
