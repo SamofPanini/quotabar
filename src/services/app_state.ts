@@ -164,7 +164,6 @@ export function getClaudeTrayUsedPercentForWindow(
   return typeof percentage === 'number'
     && Number.isFinite(percentage)
     && percentage >= 0
-    && percentage <= 100
     ? percentage
     : null;
 }
