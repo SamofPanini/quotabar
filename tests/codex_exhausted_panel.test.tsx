@@ -1,11 +1,18 @@
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import CodexPanel from '../src/components/CodexPanel';
 import { backend } from '../src/services/backend';
 
 function rendered_text(renderer: ReactTestRenderer): string {
   return JSON.stringify(renderer.toJSON());
+}
+
+function credit_value(renderer: ReactTestRenderer): string {
+  const label = renderer.root.findAllByProps({ className: 'quota-label' }).find(
+    (item) => item.children.includes('Credits'),
+  );
+  return label!.parent!.findByProps({ className: 'quota-value' }).children.join('');
 }
 
 async function unmount(renderer: ReactTestRenderer): Promise<void> {
@@ -21,6 +28,8 @@ async function render_exhausted(options?: {
   valueResetsAt?: string;
   ordinaryUsageAllowed?: boolean | null;
   onOpenDashboard?: () => void;
+  creditBalance?: unknown;
+  creditsUnlimited?: boolean;
 }): Promise<ReactTestRenderer> {
   const usedPercent = options?.usedPercent ?? 100;
   const bonusCount = options?.bonusCount ?? 1;
@@ -36,6 +45,11 @@ async function render_exhausted(options?: {
       usedPercent,
       windowMinutes: 10_080,
       resetsAt: WEEKLY_RESET,
+    },
+    credits: {
+      hasCredits: true,
+      unlimited: options?.creditsUnlimited ?? false,
+      ...(options?.creditBalance === undefined ? {} : { balance: options.creditBalance as string }),
     },
   });
   vi.spyOn(backend, 'getCodexResetCredits').mockResolvedValue({
@@ -84,8 +98,16 @@ async function render_exhausted(options?: {
 }
 
 describe('Codex exhausted panel', () => {
+  beforeAll(() => {
+    (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  afterAll(() => {
+    delete (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT;
   });
 
   it('keeps a blocked 100% meter distinct from exhaustion and bonus readiness', async () => {
@@ -181,5 +203,34 @@ describe('Codex exhausted panel', () => {
     expect(text).not.toContain('Weekly exhausted');
     expect(text).not.toContain('Weekly is used up.');
     await unmount(renderer);
+  });
+
+  it('formats only valid finite Codex credit balances with the explicit en-US locale', async () => {
+    for (const [creditBalance, expected] of [
+      [undefined, 'n/a'],
+      [null, 'n/a'],
+      ['', 'n/a'],
+      ['   ', 'n/a'],
+      ['0', '0'],
+      ['1200.0000', '1,200'],
+      ['60975.9865140000', '60,975.99'],
+      ['0.004', '0'],
+      ['invalid', 'n/a'],
+      ['NaN', 'n/a'],
+      ['Infinity', 'n/a'],
+      ['-1', 'n/a'],
+    ] as const) {
+      const renderer = await render_exhausted({ creditBalance });
+      expect(credit_value(renderer)).toBe(expected);
+      await unmount(renderer);
+      vi.restoreAllMocks();
+    }
+
+    const unlimited = await render_exhausted({
+      creditBalance: '60975.9865140000',
+      creditsUnlimited: true,
+    });
+    expect(credit_value(unlimited)).toBe('Unlimited');
+    await unmount(unlimited);
   });
 });

@@ -125,6 +125,14 @@ function formatGrantDate(value?: string): string {
   });
 }
 
+function formatCreditBalance(balance?: string): string {
+  if (balance == null || balance.trim() === '') return 'n/a';
+  if (!/^\d+(?:\.\d+)?$/.test(balance)) return 'n/a';
+  const value = Number(balance);
+  if (!Number.isFinite(value) || value < 0) return 'n/a';
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(value);
+}
+
 const USD_FORMAT = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -845,7 +853,7 @@ export default function CodexPanel({
                       <span className="quota-value">
                         {rateLimits.credits.unlimited
                           ? 'Unlimited'
-                          : rateLimits.credits.balance || '0'}
+                          : formatCreditBalance(rateLimits.credits.balance)}
                       </span>
                     </div>
                   </div>
