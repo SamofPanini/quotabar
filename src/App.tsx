@@ -228,6 +228,7 @@ export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const windowVisible = usePopoverWindow(containerRef, [activeView, quota, connected]);
   const lastTrayIconRequestRef = useRef<Partial<Record<TrayServiceName, TrayIconRequest>>>({});
+  const trayIconGenerationRef = useRef<Partial<Record<TrayServiceName, number>>>({});
 
   const setServiceConnected = useCallback((service: TrayServiceName, value: boolean) => {
     setConnected((prev) => (prev[service] === value ? prev : { ...prev, [service]: value }));
@@ -324,8 +325,12 @@ export default function App() {
       return;
     }
 
+    const generation = (trayIconGenerationRef.current[service] ?? 0) + 1;
+    trayIconGenerationRef.current[service] = generation;
+
     try {
       await backend.updateTrayIcon(service, percentage, visible, force, style);
+      if (trayIconGenerationRef.current[service] !== generation) return;
       lastTrayIconRequestRef.current[service] = { percentage, visible, style };
     } catch (err) {
       console.error(`Failed to update ${service} tray icon:`, err);

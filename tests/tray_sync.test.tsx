@@ -1,10 +1,11 @@
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi, type Mock } from 'vitest';
 import { backend } from '../src/services/backend';
 import { SERVICES } from '../src/services/service_meta';
 import type { TrayServiceName } from '../src/services/tray_visibility';
 import type { CodexProfilesResponse } from '../src/types/models';
+import type { QuotaData } from '../src/types/models';
 import SettingsView from '../src/components/SettingsView';
 import { CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY } from '../src/services/codex_tray_window';
 
@@ -59,6 +60,19 @@ function visible_calls(update: ReturnType<typeof vi.spyOn>) {
     visible.set(service, args[2] as boolean);
   }
   return visible;
+}
+
+function quota_with_percent(percentage: number): QuotaData {
+  return {
+    connected: true,
+    weeklyTotal: { used: percentage, limit: 100, percentage },
+  };
+}
+
+function claude_visible_calls(): unknown[][] {
+  return (backend.updateTrayIcon as unknown as Mock).mock.calls.filter(
+    (args) => args[0] === 'claude' && args[2] === true,
+  );
 }
 
 beforeAll(() => {
@@ -222,6 +236,88 @@ describe('tray icon sync', () => {
       .at(-1);
     expect(codexUpdate?.[1]).toBe(100);
     expect(JSON.stringify(renderer.toJSON())).toContain('100%');
+    await unmount(renderer);
+  });
+
+  test('keeps the newest tray completion cached per service and retries rejected requests', async () => {
+    (globalThis as Record<string, unknown>).localStorage = memoryStorage({
+      'claude-tray-enabled': 'true',
+      'codex-tray-enabled': 'false',
+      'cursor-tray-enabled': 'false',
+      'grok-tray-enabled': 'true',
+      'antigravity-tray-enabled': 'false',
+      'claude-quota-tray-cycle': 'false',
+    });
+    const hung = () => new Promise<never>(() => {});
+    vi.spyOn(backend, 'getCodexInfo').mockImplementation(hung);
+    vi.spyOn(backend, 'getCodexRateLimits').mockImplementation(hung);
+    vi.spyOn(backend, 'getCodexResetCredits').mockImplementation(hung);
+    vi.spyOn(backend, 'getCodexWeeklyQuota').mockImplementation(hung);
+    vi.spyOn(backend, 'getCursorInfo').mockImplementation(hung);
+    vi.spyOn(backend, 'getAntigravityInfo').mockImplementation(hung);
+
+    let quotaPercent = 10;
+    vi.spyOn(backend, 'getQuota').mockImplementation(async () => quota_with_percent(quotaPercent));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const inflight: Array<{ percentage: number; resolve(): void }> = [];
+    let rejectThirty = true;
+    vi.spyOn(backend, 'updateTrayIcon').mockImplementation((service, percentage, visible) => {
+      if (service === 'grok') return Promise.resolve();
+      if (service !== 'claude' || !visible || percentage == null) return Promise.resolve();
+      if (percentage === 30 && rejectThirty) {
+        rejectThirty = false;
+        return Promise.reject(new Error('synthetic tray failure'));
+      }
+      return new Promise((resolve) => {
+        inflight.push({ percentage, resolve: () => resolve(undefined) });
+      });
+    });
+
+    const renderer = await render_app();
+    await act(flush);
+    expect(inflight.some((call) => call.percentage === 10)).toBe(true);
+    expect(vi.mocked(backend.updateTrayIcon).mock.calls.some((call) => call[0] === 'grok')).toBe(true);
+
+    quotaPercent = 20;
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Refresh current provider' }).props.onClick();
+      await flush();
+    });
+    const newest = inflight.at(-1)!;
+    expect(newest.percentage).toBe(20);
+    await act(async () => {
+      newest.resolve();
+      await flush();
+    });
+    for (const call of inflight.filter((call) => call !== newest)) {
+      await act(async () => {
+        call.resolve();
+        await flush();
+      });
+    }
+    const callsAfterRace = claude_visible_calls().length;
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Refresh current provider' }).props.onClick();
+      await flush();
+    });
+    expect(claude_visible_calls()).toHaveLength(callsAfterRace);
+
+    quotaPercent = 30;
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Refresh current provider' }).props.onClick();
+      await flush();
+    });
+    const callsAfterReject = claude_visible_calls().length;
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Refresh current provider' }).props.onClick();
+      await flush();
+    });
+    expect(claude_visible_calls()).toHaveLength(callsAfterReject + 1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(claude_visible_calls().length).toBeGreaterThanOrEqual(callsAfterReject + 2);
     await unmount(renderer);
   });
 });
