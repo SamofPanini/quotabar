@@ -4,6 +4,7 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Ignore stale tray IPC completions when updating each service's skip-cache.
 - Add independent Codex and Claude menu-bar icon window selectors for weekly and 5-hour quota views.
 - Add an opt-in Ping footer action for opening the selected Codex or Claude 5-hour window with one minimal CLI turn.
 - Add a Settings Launch at Login toggle backed by the OS login item.
