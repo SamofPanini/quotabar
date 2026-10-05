@@ -53,7 +53,9 @@ import {
   type QuotaWindowSummary,
 } from './services/provider_summary';
 import {
+  getSavedClaudeMenuBarQuotaWindow,
   getSavedMenuBarQuotaWindow,
+  saveClaudeMenuBarQuotaWindow,
   saveMenuBarQuotaWindow,
   type MenuBarQuotaWindow,
 } from './services/codex_tray_window';
@@ -83,6 +85,7 @@ import {
   defaultServiceMap,
   getClaudeRefreshIntervalMs,
   getClaudeTrayUsedPercent,
+  getClaudeTrayUsedPercentForWindow,
   keepClaudeQuotaOnError,
   getInitialTrayEnabledState,
   getSavedDockHidden,
@@ -121,6 +124,7 @@ export {
   BACKGROUND_REFRESH_INTERVAL_MS,
   getClaudeRefreshIntervalMs,
   getClaudeTrayUsedPercent,
+  getClaudeTrayUsedPercentForWindow,
   keepClaudeQuotaOnError,
   providerRefreshIntervalMs,
 } from './services/app_state';
@@ -212,6 +216,9 @@ export default function App() {
   const [trayCycle, setTrayCycle] = useState<boolean>(getSavedTrayCycle);
   const [menuBarQuotaWindow, setMenuBarQuotaWindow] = useState<MenuBarQuotaWindow>(
     getSavedMenuBarQuotaWindow,
+  );
+  const [claudeMenuBarQuotaWindow, setClaudeMenuBarQuotaWindow] = useState<MenuBarQuotaWindow>(
+    getSavedClaudeMenuBarQuotaWindow,
   );
   const [trayCycleIndex, setTrayCycleIndex] = useState(0);
   const [events, setEvents] = useState<AppEvent[]>(getSavedEvents);
@@ -395,7 +402,7 @@ export default function App() {
 
     for (const svc of SERVICES) {
       const pct = svc === 'claude'
-        ? getClaudeTrayUsedPercent(quota)
+        ? getClaudeTrayUsedPercentForWindow(quota, claudeMenuBarQuotaWindow)
         : svc === 'codex'
           ? getCodexTrayUsedPercent(codexTraySnapshots, menuBarQuotaWindow)
           : usedPercent[svc];
@@ -408,6 +415,7 @@ export default function App() {
     usedPercent,
     codexTraySnapshots,
     menuBarQuotaWindow,
+    claudeMenuBarQuotaWindow,
     trayEnabled,
     trayCycle,
     trayCycleIndex,
@@ -551,6 +559,11 @@ export default function App() {
   const handleMenuBarQuotaWindowChange = useCallback((window: MenuBarQuotaWindow) => {
     saveMenuBarQuotaWindow(window);
     setMenuBarQuotaWindow(window);
+  }, []);
+
+  const handleClaudeMenuBarQuotaWindowChange = useCallback((window: MenuBarQuotaWindow) => {
+    saveClaudeMenuBarQuotaWindow(window);
+    setClaudeMenuBarQuotaWindow(window);
   }, []);
 
   const handleThemeChange = useCallback((newTheme: ThemeName) => {
@@ -884,6 +897,7 @@ export default function App() {
               trayStyle={trayStyle}
               trayCycle={trayCycle}
               menuBarQuotaWindow={menuBarQuotaWindow}
+              claudeMenuBarQuotaWindow={claudeMenuBarQuotaWindow}
               events={events}
               notificationSettings={notifSettings}
               switcherVisibility={switcherVisibility}
@@ -895,6 +909,7 @@ export default function App() {
               onTrayStyleChange={handleTrayStyleChange}
               onTrayCycleToggle={handleTrayCycleToggle}
               onMenuBarQuotaWindowChange={handleMenuBarQuotaWindowChange}
+              onClaudeMenuBarQuotaWindowChange={handleClaudeMenuBarQuotaWindowChange}
               onNotificationToggle={handleNotificationToggle}
               onSwitcherToggle={handleSwitcherToggle}
               onApplyPreset={applyProviderPreset}

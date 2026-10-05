@@ -36,6 +36,7 @@ function settingsProps(overrides: Partial<Parameters<typeof SettingsView>[0]> = 
     trayStyle: 'percent' as const,
     trayCycle: false,
     menuBarQuotaWindow: 'weekly' as const,
+    claudeMenuBarQuotaWindow: 'weekly' as const,
     events: [],
     notificationSettings: { q80: true, q95: true, q100: true, bonusReady: true, bonus: false },
     switcherVisibility: { claude: true, codex: true, cursor: true, grok: true, antigravity: true },
@@ -47,6 +48,7 @@ function settingsProps(overrides: Partial<Parameters<typeof SettingsView>[0]> = 
     onTrayStyleChange: () => {},
     onTrayCycleToggle: () => {},
     onMenuBarQuotaWindowChange: () => {},
+    onClaudeMenuBarQuotaWindowChange: () => {},
     onNotificationToggle: () => {},
     onSwitcherToggle: () => {},
     onApplyPreset: () => {},
@@ -70,6 +72,31 @@ afterEach(() => {
 });
 
 describe('Launch at Login settings row', () => {
+  it('renders independent Codex and Claude window controls', async () => {
+    const onCodexChange = vi.fn();
+    const onClaudeChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(SettingsView, settingsProps({
+        menuBarQuotaWindow: 'five_hour',
+        claudeMenuBarQuotaWindow: 'weekly',
+        onMenuBarQuotaWindowChange: onCodexChange,
+        onClaudeMenuBarQuotaWindowChange: onClaudeChange,
+      })));
+      await Promise.resolve();
+    });
+
+    const codexWindow = renderer.root.findByProps({ 'aria-label': 'Codex menu-bar icon window' });
+    const claudeWindow = renderer.root.findByProps({ 'aria-label': 'Claude menu-bar icon window' });
+    expect(codexWindow.findAllByType('button').map((button) => button.props['aria-pressed'])).toEqual([false, true]);
+    expect(claudeWindow.findAllByType('button').map((button) => button.props['aria-pressed'])).toEqual([true, false]);
+
+    await act(async () => claudeWindow.findAllByType('button')[1]?.props.onClick());
+    expect(onClaudeChange).toHaveBeenCalledExactlyOnceWith('five_hour');
+    expect(onCodexChange).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
   it('reflects an existing OS login item after load', async () => {
     autostart.readAutostartEnabled.mockResolvedValue({ status: 'ok', enabled: true });
     let renderer!: ReactTestRenderer;

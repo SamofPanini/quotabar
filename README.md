@@ -40,10 +40,11 @@ This `v0.4.0` screenshot was refreshed on 2026-08-31 from the production React U
 
 ## Quota Semantics
 
-- Claude tray value:
-  - prefers `weeklyTotal`
+- Claude tray value (Settings → Claude menu-bar icon window):
+  - Weekly (default): prefers `weeklyTotal`
   - falls back to max of `weeklyOpus`, `weeklySonnet`, `weeklyDesign`, and `weeklyFable5`
   - falls back to current session usage
+  - 5-hour: uses current session usage only; without it the icon shows no data instead of a weekly value
 - Codex tray value:
   - prefers `secondary_window.used_percent`
   - falls back to `primary_window.used_percent`

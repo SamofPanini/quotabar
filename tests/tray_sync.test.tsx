@@ -6,6 +6,7 @@ import { SERVICES } from '../src/services/service_meta';
 import type { TrayServiceName } from '../src/services/tray_visibility';
 import type { CodexProfilesResponse } from '../src/types/models';
 import SettingsView from '../src/components/SettingsView';
+import { CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY } from '../src/services/codex_tray_window';
 
 vi.mock('../src/hooks/use_popover_window', () => ({
   usePopoverWindow: () => false,
@@ -104,6 +105,43 @@ afterAll(() => {
 });
 
 describe('tray icon sync', () => {
+  test('uses Claude session usage for the tray while the overview stays weekly', async () => {
+    localStorage.setItem('claude-quota-tab', 'all');
+    localStorage.setItem(CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY, 'five_hour');
+    vi.mocked(backend.getQuota).mockResolvedValue({
+      connected: true,
+      session: { used: 37, limit: 100, percentage: 37 },
+      weeklyTotal: { used: 82, limit: 100, percentage: 82 },
+    });
+
+    const renderer = await render_app();
+    await act(flush);
+
+    const claudeUpdate = vi.mocked(backend.updateTrayIcon).mock.calls
+      .filter((call) => call[0] === 'claude')
+      .at(-1);
+    expect(claudeUpdate?.[1]).toBe(37);
+    expect(JSON.stringify(renderer.toJSON())).toContain('82% used');
+    await unmount(renderer);
+  });
+
+  test('keeps Claude tray usage unknown when five-hour session data is absent', async () => {
+    localStorage.setItem(CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY, 'five_hour');
+    vi.mocked(backend.getQuota).mockResolvedValue({
+      connected: true,
+      weeklyTotal: { used: 88, limit: 100, percentage: 88 },
+    });
+
+    const renderer = await render_app();
+    await act(flush);
+
+    const claudeUpdate = vi.mocked(backend.updateTrayIcon).mock.calls
+      .filter((call) => call[0] === 'claude')
+      .at(-1);
+    expect(claudeUpdate?.[1]).toBeNull();
+    await unmount(renderer);
+  });
+
   test('keeps every enabled provider tray visible when cycle is off', async () => {
     const renderer = await render_app();
     const visible = visible_calls(backend.updateTrayIcon as unknown as ReturnType<typeof vi.spyOn>);

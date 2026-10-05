@@ -38,6 +38,7 @@ interface SettingsViewProps {
   trayStyle: TrayStyle;
   trayCycle: boolean;
   menuBarQuotaWindow: MenuBarQuotaWindow;
+  claudeMenuBarQuotaWindow: MenuBarQuotaWindow;
   events: AppEvent[];
   notificationSettings: NotificationSettings;
   switcherVisibility: SwitcherVisibility;
@@ -49,6 +50,7 @@ interface SettingsViewProps {
   onTrayStyleChange: (style: TrayStyle) => void;
   onTrayCycleToggle: () => void;
   onMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
+  onClaudeMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
   onNotificationToggle: (key: NotificationKey) => void;
   onSwitcherToggle: (service: TrayServiceName) => void;
   onApplyPreset: (preset: ProviderPreset) => void;
@@ -65,6 +67,7 @@ export default function SettingsView({
   trayStyle,
   trayCycle,
   menuBarQuotaWindow,
+  claudeMenuBarQuotaWindow,
   events,
   notificationSettings,
   switcherVisibility,
@@ -76,6 +79,7 @@ export default function SettingsView({
   onTrayStyleChange,
   onTrayCycleToggle,
   onMenuBarQuotaWindowChange,
+  onClaudeMenuBarQuotaWindowChange,
   onNotificationToggle,
   onSwitcherToggle,
   onApplyPreset,
@@ -203,6 +207,25 @@ export default function SettingsView({
             className={`settings-seg-btn ${menuBarQuotaWindow === 'five_hour' ? 'active' : ''}`}
             onClick={() => onMenuBarQuotaWindowChange('five_hour')}
             aria-pressed={menuBarQuotaWindow === 'five_hour'}
+          >
+            5-hour
+          </button>
+        </div>
+        <div className="settings-subsection-title">Claude menu-bar icon window</div>
+        <div className="settings-seg" aria-label="Claude menu-bar icon window">
+          <button
+            type="button"
+            className={`settings-seg-btn ${claudeMenuBarQuotaWindow === 'weekly' ? 'active' : ''}`}
+            onClick={() => onClaudeMenuBarQuotaWindowChange('weekly')}
+            aria-pressed={claudeMenuBarQuotaWindow === 'weekly'}
+          >
+            Weekly
+          </button>
+          <button
+            type="button"
+            className={`settings-seg-btn ${claudeMenuBarQuotaWindow === 'five_hour' ? 'active' : ''}`}
+            onClick={() => onClaudeMenuBarQuotaWindowChange('five_hour')}
+            aria-pressed={claudeMenuBarQuotaWindow === 'five_hour'}
           >
             5-hour
           </button>
