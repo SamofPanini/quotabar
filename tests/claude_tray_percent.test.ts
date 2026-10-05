@@ -5,6 +5,7 @@ import {
   BACKOFF_REFRESH_INTERVAL_MS,
   getClaudeRefreshIntervalMs,
   getClaudeTrayUsedPercent,
+  getClaudeTrayUsedPercentForWindow,
   keepClaudeQuotaOnError,
 } from '../src/App';
 import type { QuotaData, UsageInfo } from '../src/types/models';
@@ -55,6 +56,52 @@ describe('getClaudeTrayUsedPercent', () => {
 
     expect(getClaudeTrayUsedPercent(null)).toBeNull();
     expect(getClaudeTrayUsedPercent(quota)).toBeNull();
+  });
+});
+
+describe('getClaudeTrayUsedPercentForWindow', () => {
+  test.each([
+    ['weekly total', { connected: true, weeklyTotal: usage(42), weeklyDesign: usage(91) }],
+    ['weekly buckets', { connected: true, weeklyOpus: usage(36), weeklyDesign: usage(84) }],
+    ['session fallback', { connected: true, session: usage(27) }],
+    ['no windows', { connected: true }],
+    ['null quota', null],
+  ] as const)('weekly matches the existing Claude value for %s', (_name, quota) => {
+    expect(getClaudeTrayUsedPercentForWindow(quota, 'weekly')).toBe(getClaudeTrayUsedPercent(quota));
+  });
+
+  test('returns only the session value for five-hour mode', () => {
+    expect(getClaudeTrayUsedPercentForWindow({
+      connected: true,
+      session: usage(31),
+      weeklyTotal: usage(88),
+    }, 'five_hour')).toBe(31);
+  });
+
+  test('does not fall back to weekly data when five-hour session data is absent', () => {
+    expect(getClaudeTrayUsedPercentForWindow({
+      connected: true,
+      weeklyTotal: usage(88),
+    }, 'five_hour')).toBeNull();
+  });
+
+  test.each([Number.NaN, -1, 101])('rejects invalid five-hour session percentages: %s', (percentage) => {
+    expect(getClaudeTrayUsedPercentForWindow({
+      connected: true,
+      session: usage(percentage),
+    }, 'five_hour')).toBeNull();
+  });
+
+  test('keeps showing retained quota while disconnected (429 backoff), like the weekly helper', () => {
+    const quota = { connected: false, weeklyTotal: usage(42), session: usage(31) };
+    expect(getClaudeTrayUsedPercentForWindow(quota, 'weekly')).toBe(getClaudeTrayUsedPercent(quota));
+    expect(getClaudeTrayUsedPercentForWindow(quota, 'weekly')).toBe(42);
+    expect(getClaudeTrayUsedPercentForWindow(quota, 'five_hour')).toBe(31);
+  });
+
+  test('returns null without quota in either mode', () => {
+    expect(getClaudeTrayUsedPercentForWindow(null, 'weekly')).toBeNull();
+    expect(getClaudeTrayUsedPercentForWindow(null, 'five_hour')).toBeNull();
   });
 });
 

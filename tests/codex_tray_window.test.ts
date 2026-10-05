@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY,
+  getSavedClaudeMenuBarQuotaWindow,
   getSavedMenuBarQuotaWindow,
   MENU_BAR_QUOTA_WINDOW_STORAGE_KEY,
+  saveClaudeMenuBarQuotaWindow,
   saveMenuBarQuotaWindow,
 } from '../src/services/codex_tray_window';
 import { getCodexTrayUsedPercent, type CodexTrayAccountSnapshot } from '../src/services/provider_summary';
@@ -109,5 +112,24 @@ describe('Codex menu-bar quota window', () => {
     expect(getSavedMenuBarQuotaWindow()).toBe('weekly');
     expect(saveMenuBarQuotaWindow('five_hour')).toBe(true);
     expect(values.get(MENU_BAR_QUOTA_WINDOW_STORAGE_KEY)).toBe('five_hour');
+  });
+
+  it('stores Claude and Codex window choices independently', () => {
+    const values = installStorage({ [MENU_BAR_QUOTA_WINDOW_STORAGE_KEY]: 'five_hour' });
+
+    expect(getSavedClaudeMenuBarQuotaWindow()).toBe('weekly');
+    expect(saveClaudeMenuBarQuotaWindow('five_hour')).toBe(true);
+    expect(getSavedClaudeMenuBarQuotaWindow()).toBe('five_hour');
+    expect(values.get(MENU_BAR_QUOTA_WINDOW_STORAGE_KEY)).toBe('five_hour');
+
+    expect(saveMenuBarQuotaWindow('weekly')).toBe(true);
+    expect(getSavedMenuBarQuotaWindow()).toBe('weekly');
+    expect(values.get(CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY)).toBe('five_hour');
+  });
+
+  it('defaults an invalid Claude window choice to weekly', () => {
+    installStorage({ [CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY]: 'monthly' });
+
+    expect(getSavedClaudeMenuBarQuotaWindow()).toBe('weekly');
   });
 });

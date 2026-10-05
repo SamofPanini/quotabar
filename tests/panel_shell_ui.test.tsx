@@ -119,6 +119,7 @@ describe('panel shell UI', () => {
         trayStyle="percent"
         trayCycle={false}
         menuBarQuotaWindow="weekly"
+        claudeMenuBarQuotaWindow="weekly"
         events={[]}
         notificationSettings={{
           q80: true,
@@ -136,6 +137,7 @@ describe('panel shell UI', () => {
         onTrayStyleChange={() => {}}
         onTrayCycleToggle={() => {}}
         onMenuBarQuotaWindowChange={() => {}}
+        onClaudeMenuBarQuotaWindowChange={() => {}}
         onNotificationToggle={() => {}}
         onSwitcherToggle={() => {}}
         onApplyPreset={() => {}}

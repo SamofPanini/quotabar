@@ -5,6 +5,7 @@ import type { AppTabName } from './provider_summary';
 import { readStorageValue, writeStorageItem } from './storage';
 import { getSavedTrayEnabled, saveTrayEnabled, type TrayServiceName } from './tray_visibility';
 import type { TrayStyle } from './tray_style';
+import type { MenuBarQuotaWindow } from './codex_tray_window';
 
 export const THEME_STORAGE_KEY = 'claude-quota-theme';
 export const DOCK_HIDDEN_KEY = 'claude-quota-dock-hidden';
@@ -148,6 +149,24 @@ export function getClaudeTrayUsedPercent(quota: QuotaData | null): number | null
   }
 
   return null;
+}
+
+export function getClaudeTrayUsedPercentForWindow(
+  quota: QuotaData | null,
+  window: MenuBarQuotaWindow,
+): number | null {
+  // Like getClaudeTrayUsedPercent, ignore `connected`: a 429 keeps the last
+  // quota with connected=false, and the tray should keep showing it.
+  if (!quota) return null;
+  if (window === 'weekly') return getClaudeTrayUsedPercent(quota);
+
+  const percentage = quota.session?.percentage;
+  return typeof percentage === 'number'
+    && Number.isFinite(percentage)
+    && percentage >= 0
+    && percentage <= 100
+    ? percentage
+    : null;
 }
 
 function isClaudeAuthError(error: string): boolean {
