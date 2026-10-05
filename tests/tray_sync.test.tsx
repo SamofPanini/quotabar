@@ -124,7 +124,7 @@ describe('tray icon sync', () => {
     localStorage.setItem(CLAUDE_MENU_BAR_QUOTA_WINDOW_STORAGE_KEY, 'five_hour');
     vi.mocked(backend.getQuota).mockResolvedValue({
       connected: true,
-      session: { used: 37, limit: 100, percentage: 37 },
+      session: { used: 120, limit: 100, percentage: 120 },
       weeklyTotal: { used: 82, limit: 100, percentage: 82 },
     });
 
@@ -134,7 +134,7 @@ describe('tray icon sync', () => {
     const claudeUpdate = vi.mocked(backend.updateTrayIcon).mock.calls
       .filter((call) => call[0] === 'claude')
       .at(-1);
-    expect(claudeUpdate?.[1]).toBe(37);
+    expect(claudeUpdate?.[1]).toBe(120);
     expect(JSON.stringify(renderer.toJSON())).toContain('82% used');
     await unmount(renderer);
   });
@@ -220,12 +220,12 @@ describe('tray icon sync', () => {
     await unmount(renderer);
   });
 
-  test('projects a saturated five-hour quota despite a blocked ordinary-usage result', async () => {
+  test.each([100, 120])('projects a %s%% five-hour quota despite a blocked ordinary-usage result', async (usedPercent) => {
     localStorage.setItem('menuBarQuotaWindow', 'five_hour');
     vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
       connected: true,
       ordinaryUsageAllowed: false,
-      primary: { usedPercent: 100, windowMinutes: 300 },
+      primary: { usedPercent, windowMinutes: 300 },
       secondary: { usedPercent: 52, windowMinutes: 10_080 },
     });
     const renderer = await render_app();
@@ -234,8 +234,13 @@ describe('tray icon sync', () => {
     const codexUpdate = vi.mocked(backend.updateTrayIcon).mock.calls
       .filter((call) => call[0] === 'codex')
       .at(-1);
-    expect(codexUpdate?.[1]).toBe(100);
-    expect(JSON.stringify(renderer.toJSON())).toContain('100%');
+    expect(codexUpdate?.[1]).toBe(usedPercent);
+    expect(JSON.stringify(renderer.toJSON())).toContain(`${usedPercent}%`);
+    const progress = renderer.root.findAll((node) => (
+      node.props['aria-valuetext'] === `${usedPercent}% used`
+    ));
+    expect(progress).toHaveLength(1);
+    expect(progress[0].props['aria-valuenow']).toBe(100);
     await unmount(renderer);
   });
 

@@ -85,11 +85,18 @@ describe('getClaudeTrayUsedPercentForWindow', () => {
     }, 'five_hour')).toBeNull();
   });
 
-  test.each([Number.NaN, -1, 101])('rejects invalid five-hour session percentages: %s', (percentage) => {
+  test.each([Number.NaN, -1])('rejects invalid five-hour session percentages: %s', (percentage) => {
     expect(getClaudeTrayUsedPercentForWindow({
       connected: true,
       session: usage(percentage),
     }, 'five_hour')).toBeNull();
+  });
+
+  test('preserves over-limit five-hour session percentages', () => {
+    expect(getClaudeTrayUsedPercentForWindow({
+      connected: true,
+      session: usage(120),
+    }, 'five_hour')).toBe(120);
   });
 
   test('keeps showing retained quota while disconnected (429 backoff), like the weekly helper', () => {

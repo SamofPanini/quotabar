@@ -4,6 +4,7 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Keep Codex and Claude 5-hour usage above 100% as the real value in labels and menu-bar values; progress bars and icons still fill to 100%, and usage never implies permission.
 - Show unavailable or invalid Codex credit balances as n/a while preserving zero and Unlimited.
 - Ignore stale tray IPC completions when updating each service's skip-cache.
 - Add independent Codex and Claude menu-bar icon window selectors for weekly and 5-hour quota views.

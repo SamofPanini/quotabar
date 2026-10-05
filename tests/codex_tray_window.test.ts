@@ -73,6 +73,16 @@ describe('Codex menu-bar quota window', () => {
     expect(getCodexTrayUsedPercent(observed, 'weekly')).toBe(98);
   });
 
+  it.each([true, false, null])('keeps an over-limit 120%% five-hour quota for ordinaryUsageAllowed=%s on its own', (allowed) => {
+    // One account per aggregation, so dropping any single permission state fails.
+    const only: CodexTrayAccountSnapshot[] = [{
+      accountId: 'only', connected: true, ordinaryUsageAllowed: allowed,
+      primary: { usedPercent: 120, windowMinutes: 300 },
+      secondary: { usedPercent: 0, windowMinutes: 10_080 },
+    }];
+    expect(getCodexTrayUsedPercent(only, 'five_hour')).toBe(120);
+  });
+
   it('keeps absent selected-window usage unknown instead of converting it to zero', () => {
     const missing: CodexTrayAccountSnapshot[] = [
       { accountId: 'missing-primary', connected: true, ordinaryUsageAllowed: false, secondary: { usedPercent: 100, windowMinutes: 10_080 } },

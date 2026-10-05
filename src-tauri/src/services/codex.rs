@@ -173,7 +173,7 @@ fn parse_used_percent(window: &serde_json::Value) -> Option<f64> {
     window
         .get("used_percent")
         .and_then(|value| value.as_f64().or_else(|| value.as_i64().map(|v| v as f64)))
-        .map(|value| value.clamp(0.0, 100.0))
+        .map(|value| value.max(0.0))
 }
 
 fn window_minutes_from_seconds(seconds: i64) -> i64 {
@@ -910,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rate_limit_window_clamps_numeric_used_percent() {
+    fn parse_rate_limit_window_preserves_over_limit_numeric_used_percent() {
         let high = match parse_rate_limit_window(&json!({ "used_percent": 120 })) {
             Some(window) => window,
             None => panic!("numeric used_percent should parse"),
@@ -920,7 +920,7 @@ mod tests {
             None => panic!("numeric used_percent should parse"),
         };
 
-        assert_eq!(high.used_percent, 100.0);
+        assert_eq!(high.used_percent, 120.0);
         assert_eq!(low.used_percent, 0.0);
     }
 
