@@ -8,6 +8,14 @@ interface ActionButtonsProps {
   statusText?: string;
   statusTitle?: string;
   showDashboard?: boolean;
+  showPing?: boolean;
+  onPing?: () => void;
+  pingState?: 'idle' | 'inFlight';
+  pingDisabledReason?: string;
+  pingTitle?: string;
+  pingConfirmText?: string;
+  onPingConfirm?: () => void;
+  onPingCancel?: () => void;
 }
 
 export default function ActionButtons({
@@ -20,9 +28,27 @@ export default function ActionButtons({
   statusText,
   statusTitle,
   showDashboard = true,
+  showPing = false,
+  onPing,
+  pingState = 'idle',
+  pingDisabledReason,
+  pingTitle = 'Ping selected account — start 5-hour window',
+  pingConfirmText,
+  onPingConfirm,
+  onPingCancel,
 }: ActionButtonsProps) {
+  const pingDisabledTitle = pingDisabledReason
+    ?? (loading ? 'Refresh is in progress' : pingState === 'inFlight' ? 'Ping is in progress' : undefined);
+
   return (
     <>
+      {pingConfirmText && (
+        <div className="ping-confirm" role="status">
+          <span className="ping-confirm-text" title={pingConfirmText}>{pingConfirmText}</span>
+          <button type="button" onClick={onPingConfirm}>Send</button>
+          <button type="button" onClick={onPingCancel}>Cancel</button>
+        </div>
+      )}
       <div className="footer-divider" />
       <div className="action-buttons" aria-busy={loading}>
         {loading && (
@@ -41,6 +67,19 @@ export default function ActionButtons({
           <span className="btn-icon">{loading ? '...' : '↻'}</span>
           <span className="btn-text">{loading ? 'Loading' : 'Refresh'}</span>
         </button>
+
+        {showPing && (
+          <button
+            type="button"
+            className="action-btn icon-action ping-btn"
+            onClick={onPing}
+            disabled={Boolean(pingDisabledTitle)}
+            title={pingDisabledTitle ?? pingTitle}
+            aria-label={pingTitle}
+          >
+            <span className="btn-icon">{pingState === 'inFlight' ? '...' : 'P'}</span>
+          </button>
+        )}
 
         {showDashboard && (
           <button

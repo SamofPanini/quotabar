@@ -6,7 +6,7 @@ import SettingsView from './components/SettingsView';
 import type { ThemeName } from './components/ThemeSelector';
 import TabSwitcher, { TabName } from './components/TabSwitcher';
 import ClaudePanel from './components/ClaudePanel';
-import CodexPanel from './components/CodexPanel';
+import CodexPanel, { type CodexPingContext } from './components/CodexPanel';
 import CursorPanel from './components/CursorPanel';
 import GrokPanel from './components/GrokPanel';
 import AntigravityPanel from './components/AntigravityPanel';
@@ -57,7 +57,14 @@ import {
   saveMenuBarQuotaWindow,
   type MenuBarQuotaWindow,
 } from './services/codex_tray_window';
-import type { QuotaData } from './types/models';
+import type { PingOutcome, QuotaData } from './types/models';
+import {
+  claudePingWindowState,
+  codexPingWindowState,
+  formatPingReset,
+  parseRfc3339EpochSeconds,
+  type PingWindowState,
+} from './services/ping_window';
 import './styles/foundation.css';
 import './styles/content.css';
 import './styles/views.css';
@@ -121,6 +128,14 @@ export {
 type ToastValue = string | null;
 type ToastSetter = (value: ToastValue | ((current: ToastValue) => ToastValue)) => void;
 type ToastScheduler = (callback: () => void, delayMs: number) => void;
+type PingProvider = 'codex' | 'claude';
+type PingTarget = { provider: PingProvider; alias: string };
+type PingResult = { message: string; generation: number };
+type PingConfirmation = PingTarget & { message: string };
+
+function pingTargetKey({ provider, alias }: PingTarget): string {
+  return `${provider}/${alias}`;
+}
 
 const SWITCHER_GUARD_MESSAGE = 'At least one provider must stay in the switcher';
 
@@ -146,6 +161,12 @@ export default function App() {
   const [claudeLoading, setClaudeLoading] = useState(false);
   const [claudeError, setClaudeError] = useState<string | null>(null);
   const [claudeCostRefreshNonce, setClaudeCostRefreshNonce] = useState(0);
+  const [codexPingContext, setCodexPingContext] = useState<CodexPingContext | null>(null);
+  const [pingInFlight, setPingInFlight] = useState<Record<string, true>>({});
+  const [pingResults, setPingResults] = useState<Record<string, PingResult>>({});
+  const [pingConfirmations, setPingConfirmations] = useState<Record<string, PingConfirmation>>({});
+  const pingResultTimers = useRef(new Map<string, { timer: ReturnType<typeof setTimeout>; generation: number }>());
+  const pingResultGenerations = useRef(new Map<string, number>());
   const claudeIntervalRef = useRef(AUTO_REFRESH_INTERVAL_MS);
   const claude_request_generation = useLatestRequestGeneration();
 
@@ -631,6 +652,119 @@ export default function App() {
     setRefreshNonces((prev) => ({ ...prev, [activeProvider]: prev[activeProvider] + 1 }));
   }, [activeProvider, activeView, fetchClaudeQuota]);
 
+  const showPingResult = useCallback((target: PingTarget, message: string) => {
+    const key = pingTargetKey(target);
+    const generation = (pingResultGenerations.current.get(key) ?? 0) + 1;
+    pingResultGenerations.current.set(key, generation);
+    const prior = pingResultTimers.current.get(key);
+    if (prior) clearTimeout(prior.timer);
+    setPingResults((previous) => ({ ...previous, [key]: { message, generation } }));
+    const timer = setTimeout(() => {
+      setPingResults((previous) => {
+        if (previous[key]?.generation !== generation) return previous;
+        const { [key]: _expired, ...remaining } = previous;
+        return remaining;
+      });
+      if (pingResultTimers.current.get(key)?.generation === generation) {
+        pingResultTimers.current.delete(key);
+      }
+    }, 8_000);
+    pingResultTimers.current.set(key, { timer, generation });
+  }, []);
+
+  useEffect(() => () => {
+    for (const { timer } of pingResultTimers.current.values()) clearTimeout(timer);
+    pingResultTimers.current.clear();
+  }, []);
+
+  const formatPingOutcome = useCallback((outcome: PingOutcome): string => {
+    switch (outcome.kind) {
+      case 'opened': return `Window started · resets ${formatPingReset(outcome.resetsAt)}`;
+      case 'sentUnconfirmed': return 'Ping sent · window not confirmed yet';
+      case 'alreadyOpen': return `Window already active · resets ${formatPingReset(outcome.resetsAt)}`;
+      case 'blocked': return 'Ordinary usage blocked';
+      case 'cliNotFound': return outcome.cli === 'codex' ? 'Codex CLI not found' : 'Claude Code CLI not found';
+      case 'busy': return 'Ping failed · busy';
+      case 'quotaUnreadable': return 'Ping failed · quota unavailable';
+      case 'profileUnavailable': return 'Ping failed · profile unavailable';
+      case 'cliFailed': return `Ping failed · ${outcome.code}`;
+      case 'confirmationRequired': return "Couldn't confirm window state. Send a ping anyway?";
+    }
+  }, []);
+
+  const pingProvider = activeView === 'codex' || activeView === 'claude' ? activeView : null;
+  const pingAlias = pingProvider === 'codex' ? codexPingContext?.alias ?? 'default' : 'default';
+  const pingTarget = pingProvider == null ? null : { provider: pingProvider, alias: pingAlias };
+  const currentPingKey = pingTarget ? pingTargetKey(pingTarget) : null;
+  const pingWindowState: PingWindowState = pingProvider === 'codex'
+    ? codexPingWindowState(codexPingContext?.limits?.primary, Math.floor(Date.now() / 1000))
+    : pingProvider === 'claude'
+      ? claudePingWindowState(quota?.session, Math.floor(Date.now() / 1000))
+      : 'unknown';
+  const pingDisabledReason = pingProvider === 'codex'
+    ? codexPingContext?.limits?.ordinaryUsageAllowed === false
+      ? 'Ordinary usage blocked — ping would not open a window'
+      : !codexPingContext?.available ? (codexPingContext?.unavailableReason ?? 'Quota unavailable') : undefined
+    : pingProvider === 'claude' && (!quota?.connected || Boolean(claudeError))
+      ? (claudeError ?? 'Claude quota unavailable') : undefined;
+  const pingCurrentInFlight = currentPingKey != null && Boolean(pingInFlight[currentPingKey]);
+
+  useEffect(() => {
+    setPingConfirmations({});
+  }, [currentPingKey]);
+
+  const runPing = useCallback(async (target: PingTarget, force: boolean) => {
+    const key = pingTargetKey(target);
+    if (pingInFlight[key]) return;
+    setPingConfirmations((previous) => {
+      const { [key]: _confirmation, ...remaining } = previous;
+      return remaining;
+    });
+    setPingInFlight((previous) => ({ ...previous, [key]: true }));
+    try {
+      const outcome = target.provider === 'codex'
+        ? await backend.pingCodexWindow(target.alias, force)
+        : await backend.pingClaudeWindow(force);
+      if (outcome.kind === 'confirmationRequired') {
+        setPingConfirmations((previous) => ({
+          ...previous,
+          [key]: { ...target, message: formatPingOutcome(outcome) },
+        }));
+        return;
+      }
+      showPingResult(target, formatPingOutcome(outcome));
+      if (target.provider === 'codex') {
+        setRefreshNonces((prev) => ({ ...prev, codex: prev.codex + 1 }));
+      } else {
+        fetchClaudeQuota();
+        setClaudeCostRefreshNonce((value) => value + 1);
+      }
+    } catch {
+      showPingResult(target, 'Ping failed · unavailable');
+    } finally {
+      setPingInFlight((previous) => {
+        const { [key]: _finished, ...remaining } = previous;
+        return remaining;
+      });
+    }
+  }, [fetchClaudeQuota, formatPingOutcome, pingInFlight, showPingResult]);
+
+  const handlePing = useCallback(() => {
+    if (pingDisabledReason || pingTarget == null) return;
+    if (pingWindowState === 'closed') {
+      void runPing(pingTarget, false);
+      return;
+    }
+    const reset = pingTarget.provider === 'codex'
+      ? codexPingContext?.limits?.primary?.resetsAt
+      : parseRfc3339EpochSeconds(quota?.session?.resetTime);
+    const message = pingWindowState === 'open'
+      ? `5h window is already active and resets at ${formatPingReset(reset)}. Send a ping anyway?`
+      : "Couldn't confirm window state. Send a ping anyway?";
+    const key = pingTargetKey(pingTarget);
+    setPingConfirmations((previous) => ({ ...previous, [key]: { ...pingTarget, message } }));
+  }, [codexPingContext?.limits?.primary?.resetsAt, pingDisabledReason, pingTarget, pingWindowState, quota?.session?.resetTime, runPing]);
+
   const handleOpenDashboard = useCallback(async () => {
     try {
       switch (activeProvider) {
@@ -731,6 +865,9 @@ export default function App() {
   const upcomingResets = sortUpcomingResets(allQuotaWindows).slice(0, 5);
   const providerViewActive = isProviderTab(activeView);
   const overviewCostRefreshKey = claudeCostRefreshNonce + refreshNonces.codex + refreshNonces.cursor;
+  const visiblePingResult = currentPingKey == null ? undefined : pingResults[currentPingKey]?.message;
+  const visiblePingConfirmation = currentPingKey == null ? undefined : pingConfirmations[currentPingKey];
+  const footerPingStatus = visiblePingResult ?? pingDisabledReason ?? footerStatus;
 
   return (
     <div className={`app theme-${theme}`}>
@@ -802,6 +939,7 @@ export default function App() {
                   onBonusExpiring={handleBonusExpiring}
                   onBonusReadyChange={handleBonusReadyChange}
                   onOpenDashboard={handleOpenDashboard}
+                  onPingContextChange={setCodexPingContext}
                 />
               </div>
 
@@ -856,9 +994,25 @@ export default function App() {
               onSettings={handleSettingsViewToggle}
               onQuit={handleQuit}
               loading={activeLoading}
-              statusText={footerStatus}
-              statusTitle={footerStatusTitle}
+              statusText={footerPingStatus}
+              statusTitle={visiblePingResult ?? pingDisabledReason ?? footerStatusTitle}
               showDashboard={providerViewActive}
+              showPing={pingProvider !== null}
+              onPing={handlePing}
+              pingState={pingCurrentInFlight ? 'inFlight' : 'idle'}
+              pingDisabledReason={pingDisabledReason}
+              pingTitle={`Ping ${pingAlias} — start 5-hour window`}
+              pingConfirmText={visiblePingConfirmation?.message}
+              onPingConfirm={() => {
+                if (visiblePingConfirmation) void runPing(visiblePingConfirmation, true);
+              }}
+              onPingCancel={() => {
+                if (!currentPingKey) return;
+                setPingConfirmations((previous) => {
+                  const { [currentPingKey]: _cancelled, ...remaining } = previous;
+                  return remaining;
+                });
+              }}
             />
           </>
         )}

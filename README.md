@@ -28,6 +28,7 @@ Website: https://majiayu000.github.io/quotabar/
 - Notifications: 80%, 95%, 100%, unused bonus reset, and bonus-expiry alerts.
 - Background polling: refreshes every 60 seconds, backs off to 5 minutes on 429, and backs off to 1 hour on Claude auth failures.
 - Read-only Claude OAuth: reads Claude Code credentials from the correct source, but never refreshes or writes OAuth tokens.
+- Manual 5-hour window Ping: a deliberate, per-account footer action can send one fixed minimal CLI turn to start a Codex or Claude window. It is never automatic, never retries, uses no credentials in the app, and reports only a safe outcome and token count.
 - Read-only Grok auth: reads `~/.grok/auth.json`, but never refreshes or writes tokens.
 - Hidden-window polling: disables macOS webview throttling so menubar mode keeps working.
 

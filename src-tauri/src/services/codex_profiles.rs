@@ -248,6 +248,28 @@ pub(crate) fn load_registry_with_legacy(
     }
 }
 
+/// Resolve only a caller-supplied alias; paths remain registry-owned.
+pub(crate) fn resolve_alias_with_locations(
+    alias: &str,
+    primary_dir: &Path,
+    legacy_dir: &Path,
+    default_home: Option<&Path>,
+) -> Option<CodexProfile> {
+    if alias == "default" {
+        return Some(CodexProfile::default());
+    }
+    load_registry_with_legacy(primary_dir, legacy_dir, default_home)
+        .entries
+        .into_iter()
+        .find_map(|entry| match entry {
+            RegistryEntry::Valid {
+                alias: candidate,
+                profile,
+            } if candidate == alias => Some(profile),
+            _ => None,
+        })
+}
+
 pub(crate) async fn fetch_from_locations(
     primary_dir: &Path,
     legacy_dir: &Path,
