@@ -272,7 +272,7 @@ describe('provider status UI', () => {
     await act(async () => renderer.unmount());
   });
 
-  it('keeps parent Codex summaries after a rejected refresh', async () => {
+  it('keeps fresh Codex quota and parent summaries when only account-info rejects', async () => {
     vi.spyOn(backend, 'getCodexInfo')
       .mockResolvedValueOnce({ connected: true, planType: 'pro' })
       .mockRejectedValueOnce(new Error('Codex refresh failed'));
@@ -320,9 +320,70 @@ describe('provider status UI', () => {
     });
 
     const text = renderedText(renderer);
-    expect(text).toContain('Codex refresh failed');
+    expect(text).toContain('Account info unavailable');
+    expect(text).toContain('5h · 64% used');
+    expect(text).not.toContain('Codex refresh failed');
+    expect(text).not.toContain('Stale data');
+    expect(onConnectionChange).toHaveBeenLastCalledWith(true);
+    expect(onUsageChange).toHaveBeenLastCalledWith(64);
+    expect(onQuotaWindowsChange).toHaveBeenLastCalledWith([
+      expect.objectContaining({ label: '5h', usedPercent: 64 }),
+    ]);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps parent Codex summaries after a limits rejection', async () => {
+    vi.spyOn(backend, 'getCodexInfo').mockResolvedValue({ connected: true, planType: 'pro' });
+    vi.spyOn(backend, 'getCodexRateLimits')
+      .mockResolvedValueOnce({
+        connected: true,
+        planType: 'pro',
+        primary: { usedPercent: 64, windowMinutes: 300 },
+      })
+      .mockRejectedValueOnce(new Error('Codex limits refresh failed'));
+    vi.spyOn(backend, 'getCodexResetCredits').mockResolvedValue({
+      connected: true,
+      availableCount: 0,
+      credits: [],
+    });
+    vi.spyOn(backend, 'getCodexWeeklyQuota').mockResolvedValue({});
+    const onConnectionChange = vi.fn();
+    const onUsageChange = vi.fn();
+    const onQuotaWindowsChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        manualRefreshNonce: 0,
+        onConnectionChange,
+        onUsageChange,
+        onQuotaWindowsChange,
+        showCostSummary: false,
+        sections: hiddenSections,
+      }));
+      await Promise.resolve();
+    });
+    onConnectionChange.mockClear();
+    onUsageChange.mockClear();
+    onQuotaWindowsChange.mockClear();
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0,
+        manualRefreshNonce: 1,
+        onConnectionChange,
+        onUsageChange,
+        onQuotaWindowsChange,
+        showCostSummary: false,
+        sections: hiddenSections,
+      }));
+      await Promise.resolve();
+    });
+
+    const text = renderedText(renderer);
+    expect(text).toContain('Quota unavailable');
     expect(text).toContain('Stale data');
     expect(text).toContain('5h · 64% used');
+    expect(text).not.toContain('Codex limits refresh failed');
     expect(onConnectionChange).not.toHaveBeenCalled();
     expect(onUsageChange).not.toHaveBeenCalled();
     expect(onQuotaWindowsChange).not.toHaveBeenCalled();

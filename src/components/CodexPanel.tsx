@@ -60,8 +60,8 @@ export interface CodexPingContext {
 
 interface PendingTrayCoordination {
   generation: number;
-  defaultResult?: { info: CodexData; limits: CodexRateLimits };
-  profiles?: CodexProfileQuota[];
+  defaultSnapshot?: CodexTrayAccountSnapshot;
+  profileSnapshots?: CodexTrayAccountSnapshot[];
 }
 
 function formatSubscriptionDate(dateStr?: string): string {
@@ -215,6 +215,31 @@ function getTrayUsedPercent(limits: CodexRateLimits): number | null {
   return null;
 }
 
+function profileTraySnapshot(profile: CodexProfileQuota): CodexTrayAccountSnapshot {
+  const hasWindows = Boolean(profile.primary || profile.secondary);
+  const freshness = profile.status === 'connected' && !profile.error
+    ? 'fresh'
+    : (profile.status === 'stale' || (Boolean(profile.error) && hasWindows))
+      ? 'last-good-stale'
+      : 'unavailable';
+  return {
+    accountId: profile.alias,
+    connected: profile.status === 'connected' || profile.status === 'stale',
+    freshness,
+    primary: profile.primary,
+    secondary: profile.secondary,
+    ordinaryUsageAllowed: profile.ordinaryUsageAllowed,
+  };
+}
+
+function staleProfile(profile: CodexProfileQuota): CodexProfileQuota {
+  return {
+    ...profile,
+    status: 'stale',
+    error: 'Custom profile registry unavailable',
+  };
+}
+
 function customProfileStatus(profile: CodexProfileQuota): {
   label: string;
   tone: 'online' | 'pending' | 'offline' | 'error';
@@ -277,11 +302,15 @@ export default function CodexPanel({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [rateLimitsError, setRateLimitsError] = useState<string | null>(null);
+  const [accountInfoError, setAccountInfoError] = useState<string | null>(null);
+  const [resetCreditsError, setResetCreditsError] = useState<string | null>(null);
   const [customProfiles, setCustomProfiles] = useState<CodexProfileQuota[]>([]);
   const [registryError, setRegistryError] = useState<string | null>(null);
   const [registryProvenance, setRegistryProvenance] = useState<CodexProfilesResponse['registryProvenance'] | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState('default');
   const hasResolvedData = useRef(false);
+  const defaultConnection = useRef({ info: false, infoSettled: false, limits: false, limitsSucceeded: false });
+  const lastGoodCustomProfiles = useRef<CodexProfileQuota[]>([]);
   const pendingTrayCoordination = useRef<PendingTrayCoordination | null>(null);
   const request_generation = useLatestRequestGeneration();
   const weekly_request_generation = useLatestRequestGeneration();
@@ -291,25 +320,13 @@ export default function CodexPanel({
     if (
       !pending
       || pending.generation !== generation
-      || !pending.defaultResult
-      || !pending.profiles
+      || !pending.defaultSnapshot
+      || !pending.profileSnapshots
       || !request_generation.isCurrent(generation)
     ) return;
     onTrayQuotaSnapshotsChange?.([
-      {
-        accountId: 'default',
-        connected: Boolean(pending.defaultResult.limits.connected || pending.defaultResult.info.connected),
-        primary: pending.defaultResult.limits.primary,
-        secondary: pending.defaultResult.limits.secondary,
-        ordinaryUsageAllowed: pending.defaultResult.limits.ordinaryUsageAllowed,
-      },
-      ...pending.profiles.map((profile) => ({
-        accountId: profile.alias,
-        connected: profile.status === 'connected' || profile.status === 'stale',
-        primary: profile.primary,
-        secondary: profile.secondary,
-        ordinaryUsageAllowed: profile.ordinaryUsageAllowed,
-      })),
+      pending.defaultSnapshot,
+      ...pending.profileSnapshots,
     ]);
     pendingTrayCoordination.current = null;
   }, [onTrayQuotaSnapshotsChange, request_generation]);
@@ -337,75 +354,116 @@ export default function CodexPanel({
   const fetchData = useCallback(async () => {
     const generation = request_generation.begin();
     pendingTrayCoordination.current = { generation };
-    const profilesPromise = backend
-      .getCodexProfiles()
-      .catch(() => ({
-        profiles: [],
-        registryError: 'Profile configuration is unavailable',
-        registryProvenance: 'none' as const,
-      }));
-    void profilesPromise.then((profiles) => {
-      if (!request_generation.isCurrent(generation)) return;
-      setCustomProfiles(profiles.profiles);
-      setRegistryError(profiles.registryError ?? null);
-      setRegistryProvenance(profiles.registryProvenance ?? 'none');
-      if (pendingTrayCoordination.current?.generation !== generation) return;
-      pendingTrayCoordination.current.profiles = profiles.profiles;
-      publishTraySnapshots(generation);
-    });
-    try {
-      setLoading(true);
-      setError(null);
-      setRateLimitsError(null);
-      void fetchWeeklyQuota();
+    defaultConnection.current = { info: false, infoSettled: false, limits: false, limitsSucceeded: false };
+    setLoading(true);
+    setError(null);
+    setRateLimitsError(null);
+    setAccountInfoError(null);
+    setResetCreditsError(null);
+    void fetchWeeklyQuota();
 
-      const [info, limits, credits] = await Promise.all([
-        backend.getCodexInfo(),
-        backend.getCodexRateLimits(),
-        backend.getCodexResetCredits(),
-      ]);
-      if (!request_generation.isCurrent(generation)) return;
+    const profilesPromise = backend.getCodexProfiles()
+      .then((profiles) => {
+        if (!request_generation.isCurrent(generation)) return;
+        lastGoodCustomProfiles.current = profiles.profiles;
+        setCustomProfiles(profiles.profiles);
+        setRegistryError(profiles.registryError ?? null);
+        setRegistryProvenance(profiles.registryProvenance ?? 'none');
+        if (pendingTrayCoordination.current?.generation !== generation) return;
+        pendingTrayCoordination.current.profileSnapshots = profiles.profiles.map(profileTraySnapshot);
+        publishTraySnapshots(generation);
+      })
+      .catch(() => {
+        if (!request_generation.isCurrent(generation)) return;
+        const staleProfiles = lastGoodCustomProfiles.current.map(staleProfile);
+        setCustomProfiles(staleProfiles);
+        setRegistryError('Custom profile registry unavailable');
+        setRegistryProvenance('none');
+        if (pendingTrayCoordination.current?.generation !== generation) return;
+        pendingTrayCoordination.current.profileSnapshots = staleProfiles.map(profileTraySnapshot);
+        publishTraySnapshots(generation);
+      });
 
-      hasResolvedData.current = true;
-      setCodexData(info);
-      setRateLimits(limits);
-      onQuotaWindowsChange?.(buildCodexQuotaWindows(limits));
-      if (pendingTrayCoordination.current?.generation !== generation) return;
-      pendingTrayCoordination.current.defaultResult = { info, limits };
-      publishTraySnapshots(generation);
-      setResetCredits(credits);
-
-      if (limits.error) {
-        setError(limits.error);
-        setRateLimitsError(limits.error);
-      } else {
-        setOfficialUpdatedAt(Date.now());
-        if (info.error) {
-          setError(info.error);
+    const infoPromise = backend.getCodexInfo()
+      .then((info) => {
+        if (!request_generation.isCurrent(generation)) return;
+        setCodexData(info);
+        setAccountInfoError(info.error ?? null);
+        defaultConnection.current.info = Boolean(info.connected);
+        defaultConnection.current.infoSettled = true;
+        if (defaultConnection.current.limitsSucceeded) {
+          onConnectionChange?.(defaultConnection.current.info || defaultConnection.current.limits);
         }
-      }
+      })
+      .catch(() => {
+        if (!request_generation.isCurrent(generation)) return;
+        setAccountInfoError('Account info unavailable');
+        defaultConnection.current.infoSettled = true;
+        if (defaultConnection.current.limitsSucceeded) {
+          onConnectionChange?.(defaultConnection.current.limits);
+        }
+      });
+    const limitsPromise = backend.getCodexRateLimits()
+      .then((limits) => {
+        if (!request_generation.isCurrent(generation)) return;
+        const hasWindows = Boolean(limits.primary || limits.secondary);
+        const freshness = limits.error
+          ? hasWindows ? 'last-good-stale' : 'unavailable'
+          : 'fresh';
+        setRateLimits(limits);
+        hasResolvedData.current = true;
+        setError(limits.error ?? null);
+        setRateLimitsError(limits.error ?? null);
+        if (!limits.error) setOfficialUpdatedAt(Date.now());
+        onQuotaWindowsChange?.(buildCodexQuotaWindows(limits));
+        defaultConnection.current.limits = limits.connected;
+        defaultConnection.current.limitsSucceeded = true;
+        if (defaultConnection.current.infoSettled) {
+          onConnectionChange?.(defaultConnection.current.info || defaultConnection.current.limits);
+        }
+        onUsageChange?.(getTrayUsedPercent(limits));
+        if (pendingTrayCoordination.current?.generation !== generation) return;
+        pendingTrayCoordination.current.defaultSnapshot = {
+          accountId: 'default',
+          connected: limits.connected,
+          freshness,
+          primary: limits.primary,
+          secondary: limits.secondary,
+          ordinaryUsageAllowed: limits.ordinaryUsageAllowed,
+        };
+        publishTraySnapshots(generation);
+      })
+      .catch(() => {
+        if (!request_generation.isCurrent(generation)) return;
+        setError('Quota unavailable');
+        setRateLimitsError('Quota unavailable');
+        if (!hasResolvedData.current) {
+          onConnectionChange?.(false);
+          onUsageChange?.(null);
+          onQuotaWindowsChange?.([]);
+        }
+        if (pendingTrayCoordination.current?.generation !== generation) return;
+        pendingTrayCoordination.current.defaultSnapshot = {
+          accountId: 'default',
+          connected: false,
+          freshness: 'unavailable',
+        };
+        publishTraySnapshots(generation);
+      });
+    const creditsPromise = backend.getCodexResetCredits()
+      .then((credits) => {
+        if (!request_generation.isCurrent(generation)) return;
+        setResetCredits(credits);
+        setResetCreditsError(credits.error ?? null);
+      })
+      .catch(() => {
+        if (!request_generation.isCurrent(generation)) return;
+        setResetCreditsError('Reset credits unavailable');
+      });
 
-      // Notify parent about connection status change
-      const isConnected = limits.connected || info.connected;
-      onConnectionChange?.(isConnected);
-
-      // Use weekly usage for tray when available (secondary window).
-      onUsageChange?.(getTrayUsedPercent(limits));
-    } catch (err) {
-      if (!request_generation.isCurrent(generation)) return;
-      const message = err instanceof Error ? err.message : 'Failed to fetch Codex data';
-      setError(message);
-      setRateLimitsError(message);
-      if (!hasResolvedData.current) {
-        onConnectionChange?.(false);
-        onUsageChange?.(null);
-        onQuotaWindowsChange?.([]);
-        onTrayQuotaSnapshotsChange?.([]);
-      }
-    } finally {
-      if (request_generation.isCurrent(generation)) {
-        setLoading(false);
-      }
+    await Promise.all([profilesPromise, infoPromise, limitsPromise, creditsPromise]);
+    if (request_generation.isCurrent(generation)) {
+      setLoading(false);
     }
   }, [
     fetchWeeklyQuota,
@@ -737,6 +795,14 @@ export default function CodexPanel({
             {showingStaleLimits && <span className="error-context">Showing last known data.</span>}
           </span>
         </div>
+      )}
+
+      {accountInfoError && (
+        <div className="error-banner" role="alert"><span className="error-icon">!</span><span className="error-text">{accountInfoError}</span></div>
+      )}
+
+      {resetCreditsError && (
+        <div className="error-banner" role="alert"><span className="error-icon">!</span><span className="error-text">{resetCreditsError}</span></div>
       )}
 
       {renderRegistryStatus}

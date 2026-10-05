@@ -10,7 +10,7 @@ import type {
   CostDailySeries,
   CostOverview,
 } from '../src/types/models';
-import type { CodexTrayAccountSnapshot } from '../src/services/provider_summary';
+import { getCodexTrayUsedPercent, type CodexTrayAccountSnapshot } from '../src/services/provider_summary';
 
 const hiddenSections = { timeline: false, cost: false, trend: false, tips: false };
 
@@ -85,6 +85,22 @@ async function renderPanel(options: {
       onUsageChange: options.onUsageChange,
       onTrayQuotaSnapshotsChange: options.onTrayQuotaSnapshotsChange,
       manualRefreshNonce: options.manualRefreshNonce,
+    }));
+    await flush();
+  });
+  return renderer;
+}
+
+async function mountPanel(options: {
+  onTrayQuotaSnapshotsChange?: (snapshots: CodexTrayAccountSnapshot[]) => void;
+} = {}): Promise<ReactTestRenderer> {
+  let renderer!: ReactTestRenderer;
+  await act(async () => {
+    renderer = create(createElement(CodexPanel, {
+      autoRefreshIntervalMs: 0,
+      showCostSummary: false,
+      sections: hiddenSections,
+      onTrayQuotaSnapshotsChange: options.onTrayQuotaSnapshotsChange,
     }));
     await flush();
   });
@@ -318,6 +334,195 @@ describe('Codex account tabs', () => {
     await act(async () => renderer.unmount());
   });
 
+  it('marks a prior Default quota stale while a healthy custom account remains fresh for the tray', async () => {
+    mockDefaultCalls();
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({ profiles: [profile('B', 80)], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('B', 80)], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    const renderer = await mountPanel({ onTrayQuotaSnapshotsChange });
+    vi.mocked(backend.getCodexRateLimits).mockRejectedValueOnce(new Error('transport failure'));
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0, manualRefreshNonce: 1, showCostSummary: false,
+        sections: hiddenSections, onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    const snapshots = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(snapshots).toEqual([
+      expect.objectContaining({ accountId: 'default', freshness: 'unavailable' }),
+      expect.objectContaining({ accountId: 'B', freshness: 'fresh' }),
+    ]);
+    expect(getCodexTrayUsedPercent(snapshots, 'weekly')).toBe(90);
+    expect(JSON.stringify(renderer.toJSON())).toContain('Stale data');
+    await act(async () => renderer.unmount());
+  });
+
+  it('publishes initial Default unavailable with a healthy custom account', async () => {
+    mockDefaultCalls();
+    vi.mocked(backend.getCodexRateLimits).mockRejectedValueOnce(new Error('transport failure'));
+    vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue({ profiles: [profile('B', 60)], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    const renderer = await mountPanel({ onTrayQuotaSnapshotsChange });
+    const snapshots = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(snapshots.map((snapshot) => [snapshot.accountId, snapshot.freshness])).toEqual([
+      ['default', 'unavailable'], ['B', 'fresh'],
+    ]);
+    expect(getCodexTrayUsedPercent(snapshots, 'weekly')).toBe(70);
+    expect(JSON.stringify(renderer.toJSON())).toContain('Quota unavailable');
+    await act(async () => renderer.unmount());
+  });
+
+  it('discards an older delayed Default success after a newer Default failure', async () => {
+    mockDefaultCalls();
+    const olderLimits = deferred<CodexRateLimits>();
+    vi.mocked(backend.getCodexRateLimits)
+      .mockReturnValueOnce(olderLimits.promise)
+      .mockRejectedValueOnce(new Error('newer failure'));
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({ profiles: [profile('Old')], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('B', 70)], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0, showCostSummary: false, sections: hiddenSections, onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0, manualRefreshNonce: 1, showCostSummary: false, sections: hiddenSections, onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => {
+      olderLimits.resolve({ connected: true, primary: { usedPercent: 99, windowMinutes: 300 } });
+      await flush();
+    });
+    const published = onTrayQuotaSnapshotsChange.mock.calls.map(([snapshots]) => snapshots as CodexTrayAccountSnapshot[]);
+    expect(published).toHaveLength(1);
+    expect(published[0]).toEqual([
+      expect.objectContaining({ accountId: 'default', freshness: 'unavailable' }),
+      expect.objectContaining({ accountId: 'B', freshness: 'fresh' }),
+    ]);
+    await act(async () => renderer.unmount());
+  });
+
+  it('discards an older delayed Default failure after a newer Default success', async () => {
+    mockDefaultCalls();
+    const olderLimits = deferred<CodexRateLimits>();
+    vi.mocked(backend.getCodexRateLimits)
+      .mockReturnValueOnce(olderLimits.promise)
+      .mockResolvedValueOnce({ connected: true, primary: { usedPercent: 40, windowMinutes: 300 }, secondary: { usedPercent: 50, windowMinutes: 10_080 } });
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({ profiles: [profile('Old')], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('B', 60)], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0, showCostSummary: false, sections: hiddenSections, onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0, manualRefreshNonce: 1, showCostSummary: false, sections: hiddenSections, onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    await act(async () => {
+      olderLimits.reject(new Error('older failure'));
+      await flush();
+    });
+    expect(onTrayQuotaSnapshotsChange).toHaveBeenCalledTimes(1);
+    expect(onTrayQuotaSnapshotsChange).toHaveBeenLastCalledWith([
+      expect.objectContaining({ accountId: 'default', freshness: 'fresh' }),
+      expect.objectContaining({ accountId: 'B', freshness: 'fresh' }),
+    ]);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps the selected healthy custom tab stable while an inactive profile is unavailable', async () => {
+    const unavailable = { ...profile('B', 99), status: 'error' as const, primary: undefined, secondary: undefined };
+    const renderer = await renderPanel({ profiles: { profiles: [profile('A', 31), unavailable], registryError: null } });
+    await act(async () => {
+      renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick();
+      await flush();
+    });
+    expect(renderer.root.findAllByProps({ role: 'tab' }).map((tab) => tab.props['aria-selected'])).toEqual([false, true, false]);
+    expect(JSON.stringify(renderer.toJSON())).toContain('31% used');
+    await act(async () => renderer.unmount());
+  });
+
+  it('returns an unknown tray value when every account is unavailable and atomically recovers on success', async () => {
+    mockDefaultCalls();
+    vi.mocked(backend.getCodexRateLimits)
+      .mockRejectedValueOnce(new Error('failure'))
+      .mockResolvedValueOnce({ connected: true, secondary: { usedPercent: 55, windowMinutes: 10_080 } });
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({ profiles: [{ ...profile('B'), status: 'offline', primary: undefined, secondary: undefined }], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('B', 65)], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    const renderer = await mountPanel({ onTrayQuotaSnapshotsChange });
+    const unavailable = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(getCodexTrayUsedPercent(unavailable, 'weekly')).toBeNull();
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0, manualRefreshNonce: 1, showCostSummary: false, sections: hiddenSections, onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    const recovered = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(recovered.every((snapshot) => snapshot.freshness === 'fresh')).toBe(true);
+    expect(getCodexTrayUsedPercent(recovered, 'weekly')).toBe(75);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps quota fresh when only account-info or reset-credits IPC rejects', async () => {
+    mockDefaultCalls();
+    vi.mocked(backend.getCodexInfo).mockRejectedValueOnce(new Error('raw info failure'));
+    vi.mocked(backend.getCodexResetCredits).mockRejectedValueOnce(new Error('raw credits failure'));
+    vi.spyOn(backend, 'getCodexProfiles').mockResolvedValue({ profiles: [profile('B', 70)], registryError: null });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    const renderer = await mountPanel({ onTrayQuotaSnapshotsChange });
+    const snapshots = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(snapshots.every((snapshot) => snapshot.freshness === 'fresh')).toBe(true);
+    expect(getCodexTrayUsedPercent(snapshots, 'weekly')).toBe(80);
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain('Account info unavailable');
+    expect(text).toContain('Reset credits unavailable');
+    expect(text).not.toContain('raw info failure');
+    expect(text).not.toContain('raw credits failure');
+    await act(async () => renderer.unmount());
+  });
+
+  it('retains custom tabs as stale when the registry transport rejects', async () => {
+    mockDefaultCalls();
+    vi.spyOn(backend, 'getCodexProfiles')
+      .mockResolvedValueOnce({ profiles: [profile('B', 70)], registryError: null })
+      .mockRejectedValueOnce(new Error('/private/raw registry failure'));
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    const renderer = await mountPanel({ onTrayQuotaSnapshotsChange });
+    await act(async () => {
+      renderer.update(createElement(CodexPanel, {
+        autoRefreshIntervalMs: 0, manualRefreshNonce: 1, showCostSummary: false, sections: hiddenSections, onTrayQuotaSnapshotsChange,
+      }));
+      await flush();
+    });
+    const snapshots = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(snapshots).toEqual([
+      expect.objectContaining({ accountId: 'default', freshness: 'fresh' }),
+      expect.objectContaining({ accountId: 'B', freshness: 'last-good-stale' }),
+    ]);
+    expect(getCodexTrayUsedPercent(snapshots, 'weekly')).toBe(20);
+    expect(renderer.root.findAllByProps({ role: 'tab' }).map((tab) => tab.children.join(''))).toEqual(['Default', 'B']);
+    expect(JSON.stringify(renderer.toJSON())).toContain('Custom profile registry unavailable.');
+    await act(async () => renderer.unmount());
+  });
+
   it('renders fixed safe diagnostic copy and falls back safely for unknown or missing codes', async () => {
     const messages = {
       invalid_row: 'This profile entry is invalid.',
@@ -364,7 +569,7 @@ describe('Codex account tabs', () => {
     await act(async () => renderer.unmount());
   });
 
-  it('discards a profile-only failed generation before publishing a later refresh', async () => {
+  it('publishes healthy custom quota when Default account info fails, then replaces it on a later refresh', async () => {
     mockDefaultCalls();
     vi.mocked(backend.getCodexInfo)
       .mockRejectedValueOnce(new Error('default refresh failed'))
@@ -397,10 +602,16 @@ describe('Codex account tabs', () => {
     const published = onTrayQuotaSnapshotsChange.mock.calls
       .map(([snapshots]) => snapshots as CodexTrayAccountSnapshot[])
       .filter((snapshots) => snapshots.length > 0);
-    expect(published).toEqual([[
-      expect.objectContaining({ accountId: 'default' }),
-      expect.objectContaining({ accountId: 'Later' }),
-    ]]);
+    expect(published).toEqual([
+      [
+        expect.objectContaining({ accountId: 'default', freshness: 'fresh' }),
+        expect.objectContaining({ accountId: 'Failed', freshness: 'fresh' }),
+      ],
+      [
+        expect.objectContaining({ accountId: 'default', freshness: 'fresh' }),
+        expect.objectContaining({ accountId: 'Later', freshness: 'fresh' }),
+      ],
+    ]);
     await act(async () => renderer.unmount());
   });
 
@@ -444,7 +655,7 @@ describe('Codex account tabs', () => {
     await act(async () => renderer.unmount());
   });
 
-  it('keeps superseded failed coordination bounded to the latest successful refresh', async () => {
+  it('keeps completed healthy custom generations while superseded work stays bounded', async () => {
     mockDefaultCalls();
     vi.mocked(backend.getCodexInfo)
       .mockRejectedValueOnce(new Error('failed 1'))
@@ -483,10 +694,11 @@ describe('Codex account tabs', () => {
     const published = onTrayQuotaSnapshotsChange.mock.calls
       .map(([snapshots]) => snapshots as CodexTrayAccountSnapshot[])
       .filter((snapshots) => snapshots.length > 0);
-    expect(published).toEqual([[
-      expect.objectContaining({ accountId: 'default' }),
-      expect.objectContaining({ accountId: 'Current' }),
-    ]]);
+    expect(published).toHaveLength(4);
+    expect(published.map((snapshots) => snapshots[1]?.accountId)).toEqual([
+      'Failed 1', 'Failed 2', 'Failed 3', 'Current',
+    ]);
+    expect(published.every((snapshots) => snapshots.every((snapshot) => snapshot.freshness === 'fresh'))).toBe(true);
     await act(async () => renderer.unmount());
   });
 

@@ -19,16 +19,16 @@ const owner_configs = [
     component_name: 'CodexPanel',
     function_name: 'fetchData',
     owner_name: 'request_generation',
-    backend_methods: ['getCodexInfo', 'getCodexRateLimits', 'getCodexResetCredits'],
+    backend_methods: ['getCodexInfo', 'getCodexRateLimits', 'getCodexResetCredits', 'getCodexProfiles'],
     loading: true,
     loading_setter: 'setLoading',
-    await_kind: 'promise_all',
-    promise_all_kind: 'array',
+    await_kind: 'per_member',
     target_scope: 'component',
     backend_arguments: {
       getCodexInfo: [],
       getCodexRateLimits: [],
       getCodexResetCredits: [],
+      getCodexProfiles: [],
     },
   },
   {
@@ -258,12 +258,77 @@ function direct_variable_declarations(block, name) {
   });
 }
 
+function is_member_promise_callback(callback, owner_name) {
+  return ts.isArrowFunction(callback)
+    && ts.isBlock(callback.body)
+    && callback.body.statements.length > 0
+    && is_fail_closed_guard(callback.body.statements[0], owner_name);
+}
+
+function validate_codex_per_member_wiring(body, config) {
+  const expected_promises = new Map([
+    ['getCodexProfiles', 'profilesPromise'],
+    ['getCodexInfo', 'infoPromise'],
+    ['getCodexRateLimits', 'limitsPromise'],
+    ['getCodexResetCredits', 'creditsPromise'],
+  ]);
+  for (const [method_name, promise_name] of expected_promises) {
+    const calls = collect_nodes(body, (node) => {
+      const parts = property_call_parts(node);
+      return parts !== null && parts.owner_name === 'backend' && parts.method_name === method_name;
+    });
+    ensure(calls.length === 1, `${config.path}:${config.function_name} ${method_name} call count is not one`);
+    validate_backend_call(calls[0], method_name, config);
+    const statement = body.statements.find((candidate) => collect_nodes(candidate, (node) => node === calls[0]).length === 1);
+    ensure(statement !== undefined && ts.isVariableStatement(statement), `${config.path}:${config.function_name} ${method_name} must initialize a member promise`);
+    const declarations = statement.declarationList.declarations;
+    ensure(declarations.length === 1 && identifier_name(declarations[0].name) === promise_name, `${config.path}:${config.function_name} ${method_name} member promise name is wrong`);
+    const initializer = declarations[0].initializer;
+    ensure(initializer !== undefined && ts.isCallExpression(initializer), `${config.path}:${config.function_name} ${method_name} must end in catch`);
+    ensure(ts.isPropertyAccessExpression(initializer.expression) && initializer.expression.name.text === 'catch', `${config.path}:${config.function_name} ${method_name} catch is missing`);
+    ensure(initializer.arguments.length === 1 && is_member_promise_callback(initializer.arguments[0], config.owner_name), `${config.path}:${config.function_name} ${method_name} catch guard is not fail closed`);
+    const then_call = initializer.expression.expression;
+    ensure(ts.isCallExpression(then_call) && ts.isPropertyAccessExpression(then_call.expression) && then_call.expression.name.text === 'then', `${config.path}:${config.function_name} ${method_name} then is missing`);
+    ensure(then_call.arguments.length === 1 && is_member_promise_callback(then_call.arguments[0], config.owner_name), `${config.path}:${config.function_name} ${method_name} then guard is not fail closed`);
+    ensure(then_call.expression.expression === calls[0], `${config.path}:${config.function_name} ${method_name} then must directly receive the backend call`);
+  }
+
+  const await_indexes = body.statements.flatMap((statement, index) => (
+    collect_nodes(statement, ts.isAwaitExpression).length > 0 ? [index] : []
+  ));
+  ensure(await_indexes.length === 1, `${config.path}:${config.function_name} member settle await count is not one`);
+  const await_index = await_indexes[0];
+  const await_expressions = collect_nodes(body.statements[await_index], ts.isAwaitExpression);
+  ensure(await_expressions.length === 1, `${config.path}:${config.function_name} member settle await expression count is not one`);
+  const promise_all = property_call_parts(await_expressions[0].expression);
+  ensure(promise_all !== null && promise_all.owner_name === 'Promise' && promise_all.method_name === 'all', `${config.path}:${config.function_name} must await member Promise.all`);
+  const promise_all_call = await_expressions[0].expression;
+  ensure(promise_all_call.arguments.length === 1 && ts.isArrayLiteralExpression(promise_all_call.arguments[0]), `${config.path}:${config.function_name} member Promise.all must receive an array`);
+  const promise_names = promise_all_call.arguments[0].elements.map(identifier_name).sort();
+  ensure(same_strings(promise_names, [...expected_promises.values()].sort()), `${config.path}:${config.function_name} member Promise.all dataflow is wrong`);
+  const loading_guard = body.statements[await_index + 1];
+  ensure(loading_guard !== undefined && is_loading_finish_guard(loading_guard, config.owner_name, config.loading_setter), `${config.path}:${config.function_name} member loading guard is wrong`);
+  const loading_finishes = collect_nodes(body, (node) => (
+    is_identifier_call(node, config.loading_setter)
+    && !(node.arguments.length === 1 && node.arguments[0].kind === ts.SyntaxKind.TrueKeyword)
+  ));
+  ensure(
+    loading_finishes.length === 1 && collect_nodes(loading_guard, (node) => node === loading_finishes[0]).length === 1,
+    `${config.path}:${config.function_name} loading completion must be unique and guarded`,
+  );
+}
+
 function validate_owner(target_body, config) {
   const declarations = direct_variable_declarations(target_body, config.function_name);
   ensure(declarations.length === 1, `${config.path}:${config.function_name} target count is not one`);
   const body = get_function_body(declarations[0], config);
   ensure(body.statements.length > 1, `${config.path}:${config.function_name} body is incomplete`);
   ensure(is_generation_start(body.statements[0], config.owner_name), `${config.path}:${config.function_name} must begin with its generation token`);
+
+  if (config.await_kind === 'per_member') {
+    validate_codex_per_member_wiring(body, config);
+    return;
+  }
 
   const try_statements = body.statements.filter(ts.isTryStatement);
   ensure(try_statements.length === 1, `${config.path}:${config.function_name} try count is not one`);
