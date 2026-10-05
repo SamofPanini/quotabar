@@ -39,6 +39,8 @@ export interface QuotaWindowSummary {
 export interface CodexTrayAccountSnapshot {
   accountId: string;
   connected: boolean;
+  /** Freshness is UI-local metadata: only a completed current quota read is fresh. */
+  freshness: 'fresh' | 'last-good-stale' | 'unavailable';
   primary?: CodexRateLimitWindow;
   secondary?: CodexRateLimitWindow;
   ordinaryUsageAllowed?: boolean | null;
@@ -54,7 +56,7 @@ export function getCodexTrayUsedPercent(
 ): number | null {
   let highest: number | null = null;
   for (const account of accounts) {
-    if (!account.connected) continue;
+    if (!account.connected || account.freshness !== 'fresh') continue;
     // `ordinaryUsageAllowed` is the provider's permission result, not a
     // freshness or validity marker for a returned usage window. In
     // particular, a saturated five-hour window can be reported alongside

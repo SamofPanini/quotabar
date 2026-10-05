@@ -105,7 +105,10 @@ interface CodexBundle {
   limits: Deferred<CodexRateLimits>;
 }
 
-function codex_requests(): PanelRequests & { reject_member(index: number, member: keyof CodexBundle, reason: unknown): void } {
+function codex_requests(): PanelRequests & {
+  reject_member(index: number, member: keyof CodexBundle, reason: unknown): void;
+  resolve_member(index: number, member: keyof CodexBundle, marker?: number): void;
+} {
   const bundles: CodexBundle[] = [];
   const get_bundle = (index: number) => {
     while (bundles.length <= index) {
@@ -125,8 +128,19 @@ function codex_requests(): PanelRequests & { reject_member(index: number, member
   vi.spyOn(backend, 'getCodexResetCredits').mockImplementation(() => get_bundle(credits_index++).credits.promise);
   vi.spyOn(backend, 'getCodexWeeklyQuota').mockResolvedValue({});
   return {
-    reject: (index, reason) => get_bundle(index).info.reject(reason),
+    reject: (index, reason) => {
+      const bundle = get_bundle(index);
+      bundle.info.resolve({ connected: true });
+      bundle.credits.resolve({ connected: true, availableCount: 0, credits: [] });
+      bundle.limits.reject(reason);
+    },
     reject_member: (index, member, reason) => get_bundle(index)[member].reject(reason),
+    resolve_member: (index, member, marker = 20) => {
+      const bundle = get_bundle(index);
+      if (member === 'info') bundle.info.resolve({ connected: true });
+      if (member === 'limits') bundle.limits.resolve({ connected: true, secondary: { usedPercent: marker } });
+      if (member === 'credits') bundle.credits.resolve({ connected: true, availableCount: 0, credits: [] });
+    },
     resolve: (index, marker) => {
       const bundle = get_bundle(index);
       bundle.info.resolve({ connected: true });
@@ -262,7 +276,12 @@ describe.each(panel_drivers)('$name latest request wins', (driver) => {
     await settle(() => race.requests.reject(1, new Error('new failure')));
     await settle(() => race.requests.resolve(0, 90));
     expect(driver.marker(race.callbacks)).toEqual([driver.expected_failure_marker]);
-    expect(rendered_text(race.renderer)).toContain('new failure');
+    if (driver.name === 'Codex') {
+      expect(rendered_text(race.renderer)).toContain('Quota unavailable');
+      expect(rendered_text(race.renderer)).not.toContain('new failure');
+    } else {
+      expect(rendered_text(race.renderer)).toContain('new failure');
+    }
     await unmount(race.renderer);
   });
 
@@ -289,7 +308,7 @@ describe.each(panel_drivers)('$name latest request wins', (driver) => {
   });
 });
 
-describe('Codex atomic bundle failures', () => {
+describe('Codex per-member failures', () => {
   for (const member of ['info', 'limits', 'credits'] as const) {
     it(`surfaces current ${member} rejection`, async () => {
       const requests = codex_requests();
@@ -299,10 +318,22 @@ describe('Codex atomic bundle failures', () => {
         renderer = create(panel_drivers[0].render(0, callbacks));
       });
       await settle(() => requests.reject_member(0, member, new Error(`current ${member} failure`)));
-      expect(callbacks.usage).toHaveBeenCalledWith(null);
-      expect(callbacks.connection).toHaveBeenCalledWith(false);
-      expect(callbacks.quota_windows).toHaveBeenCalledWith([]);
-      expect(rendered_text(renderer)).toContain(`current ${member} failure`);
+      for (const other of (['info', 'limits', 'credits'] as const).filter((candidate) => candidate !== member)) {
+        await settle(() => requests.resolve_member(0, other));
+      }
+      if (member === 'limits') {
+        expect(callbacks.usage).toHaveBeenCalledWith(null);
+        expect(callbacks.connection).toHaveBeenCalledWith(false);
+        expect(callbacks.quota_windows).toHaveBeenCalledWith([]);
+        expect(rendered_text(renderer)).toContain('Quota unavailable');
+        expect(rendered_text(renderer)).not.toContain('current limits failure');
+        expect(rendered_text(renderer)).not.toContain('Loading Codex info...');
+      } else {
+        expect(callbacks.usage.mock.calls.map(([value]) => value)).toEqual([20]);
+        expect(callbacks.usage).not.toHaveBeenCalledWith(null);
+        expect(rendered_text(renderer)).toContain(member === 'info' ? 'Account info unavailable' : 'Reset credits unavailable');
+        expect(rendered_text(renderer)).not.toContain(`current ${member} failure`);
+      }
       await unmount(renderer);
     });
 

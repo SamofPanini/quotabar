@@ -261,44 +261,87 @@ test('rejects a terminal guard with extra token arguments', () => {
   );
 });
 
-test('rejects a catch whose first statement is not the current-token guard', () => {
-  rejects_change(
-    paths.codex,
-    '    } catch (err) {\n      if (!request_generation.isCurrent(generation)) return;',
-    '    } catch (err) {\n      console.error(err);\n      if (!request_generation.isCurrent(generation)) return;',
-    /catch guard/,
-  );
-});
-
-test('rejects a missing current finally guard', () => {
-  rejects_change(
-    paths.codex,
-    '    } finally {\n      if (request_generation.isCurrent(generation)) {',
-    '    } finally {\n      setLoading(false);\n      if (request_generation.isCurrent(generation)) {',
-    /finally must contain one current guard/,
-  );
-});
-
-const malformed_finally_fixtures = [
-  ['guard with else', '      if (request_generation.isCurrent(generation)) { setLoading(false); } else { setLoading(false); }'],
-  ['wrong current owner', '      if (wrong_generation.isCurrent(generation)) { setLoading(false); }'],
-  ['non-block body', '      if (request_generation.isCurrent(generation)) setLoading(false);'],
-  ['multiple body statements', '      if (request_generation.isCurrent(generation)) { setLoading(false); setLoading(false); }'],
-  ['non-expression body', '      if (request_generation.isCurrent(generation)) { return; }'],
-  ['wrong setter', '      if (request_generation.isCurrent(generation)) { setOtherLoading(false); }'],
-  ['missing argument', '      if (request_generation.isCurrent(generation)) { setLoading(); }'],
-  ['wrong argument', '      if (request_generation.isCurrent(generation)) { setLoading(true); }'],
+const codex_member_guards = [
+  ['profiles', 'profilesPromise', 'profiles', 'lastGoodCustomProfiles.current = profiles.profiles;'],
+  ['info', 'infoPromise', 'info', 'setCodexData(info);'],
+  ['limits', 'limitsPromise', 'limits', 'const hasWindows = Boolean(limits.primary || limits.secondary);'],
+  ['credits', 'creditsPromise', 'credits', 'setResetCredits(credits);'],
 ];
-for (const [name, replacement] of malformed_finally_fixtures) {
-  test(`rejects malformed finally loading guard: ${name}`, () => {
+for (const [member, promise_name, callback_name, first_statement] of codex_member_guards) {
+  test(`rejects a missing Codex ${member} then guard`, () => {
     rejects_change(
       paths.codex,
-      '      if (request_generation.isCurrent(generation)) {\n        setLoading(false);\n      }',
-      replacement,
-      /finally loading guard/,
+      `    const ${promise_name} = backend.getCodex${member === 'profiles' ? 'Profiles' : member === 'info' ? 'Info' : member === 'limits' ? 'RateLimits' : 'ResetCredits'}()\n      .then((${callback_name}) => {\n        if (!request_generation.isCurrent(generation)) return;\n        ${first_statement}`,
+      `    const ${promise_name} = backend.getCodex${member === 'profiles' ? 'Profiles' : member === 'info' ? 'Info' : member === 'limits' ? 'RateLimits' : 'ResetCredits'}()\n      .then((${callback_name}) => {\n        ${first_statement}`,
+      /then guard/,
     );
   });
 }
+
+const codex_catch_guards = [
+  ['profiles', 'const staleProfiles = lastGoodCustomProfiles.current.map(staleProfile);'],
+  ['info', "setAccountInfoError('Account info unavailable');"],
+  ['limits', "setError('Quota unavailable');"],
+  ['credits', "setResetCreditsError('Reset credits unavailable');"],
+];
+for (const [member, first_statement] of codex_catch_guards) {
+  test(`rejects a missing Codex ${member} catch guard`, () => {
+    rejects_change(
+      paths.codex,
+      `      .catch(() => {\n        if (!request_generation.isCurrent(generation)) return;\n        ${first_statement}`,
+      `      .catch(() => {\n        ${first_statement}`,
+      /catch guard/,
+    );
+  });
+}
+
+test('rejects a missing Codex loading completion guard', () => {
+  rejects_change(
+    paths.codex,
+    '    if (request_generation.isCurrent(generation)) {\n      setLoading(false);\n    }',
+    '    setLoading(false);',
+    /loading guard/,
+  );
+});
+
+test('rejects an extra unguarded Codex loading completion', () => {
+  rejects_change(
+    paths.codex,
+    '    const generation = request_generation.begin();\n    pendingTrayCoordination.current = { generation };',
+    '    const generation = request_generation.begin();\n    setLoading(false);\n    pendingTrayCoordination.current = { generation };',
+    /loading completion must be unique and guarded/,
+  );
+});
+
+const malformed_codex_loading_fixtures = [
+  ['guard with else', '    if (request_generation.isCurrent(generation)) { setLoading(false); } else { setLoading(false); }'],
+  ['wrong current owner', '    if (wrong_generation.isCurrent(generation)) { setLoading(false); }'],
+  ['non-block body', '    if (request_generation.isCurrent(generation)) setLoading(false);'],
+  ['multiple body statements', '    if (request_generation.isCurrent(generation)) { setLoading(false); setLoading(false); }'],
+  ['non-expression body', '    if (request_generation.isCurrent(generation)) { return; }'],
+  ['wrong setter', '    if (request_generation.isCurrent(generation)) { setOtherLoading(false); }'],
+  ['missing argument', '    if (request_generation.isCurrent(generation)) { setLoading(); }'],
+  ['wrong argument', '    if (request_generation.isCurrent(generation)) { setLoading(true); }'],
+];
+for (const [name, replacement] of malformed_codex_loading_fixtures) {
+  test(`rejects malformed Codex loading completion guard: ${name}`, () => {
+    rejects_change(
+      paths.codex,
+      '    if (request_generation.isCurrent(generation)) {\n      setLoading(false);\n    }',
+      replacement,
+      /member loading guard is wrong/,
+    );
+  });
+}
+
+test('rejects a Codex backend result discarded before its member chain', () => {
+  rejects_change(
+    paths.codex,
+    '    const infoPromise = backend.getCodexInfo()\n',
+    '    const infoPromise = (backend.getCodexInfo(), Promise.resolve({ connected: true }))\n',
+    /then must directly receive the backend call/,
+  );
+});
 
 const malformed_start_fixtures = [
   ['not a declaration', '    request_generation.begin();'],
@@ -430,12 +473,12 @@ test('rejects an expected backend call discarded inside the await operand', () =
   );
 });
 
-test('rejects a Codex backend call discarded inside a Promise.all array element', () => {
+test('rejects a Codex member promise omitted from Promise.all settlement', () => {
   rejects_change(
     paths.codex,
-    '        backend.getCodexInfo(),',
-    '        (backend.getCodexInfo(), Promise.resolve({ connected: true })),',
-    /array elements must be direct backend calls/,
+    'await Promise.all([profilesPromise, infoPromise, limitsPromise, creditsPromise])',
+    'await Promise.all([profilesPromise, limitsPromise, creditsPromise])',
+    /member Promise.all dataflow/,
   );
 });
 
