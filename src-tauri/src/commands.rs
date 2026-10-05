@@ -8,13 +8,94 @@ use crate::{
     },
     services::{
         antigravity, claude, claude_snapshot, codex, codex_profiles, codex_weekly, cost, cursor,
-        grok, link, tray, tray_icon, window,
+        grok, link, tray, tray_icon, window, window_ping,
     },
 };
 
 #[tauri::command]
 pub async fn get_quota() -> Result<QuotaData, String> {
     Ok(claude::fetch_quota().await)
+}
+
+fn profile_for_ping(
+    alias: &str,
+    primary_dir: &std::path::Path,
+    legacy_dir: &std::path::Path,
+) -> Result<crate::domain::account::CodexProfile, window_ping::PingOutcome> {
+    codex_profiles::resolve_alias_with_locations(
+        alias,
+        primary_dir,
+        legacy_dir,
+        codex::get_codex_home().as_deref(),
+    )
+    .ok_or(window_ping::PingOutcome::ProfileUnavailable)
+}
+
+#[tauri::command]
+pub async fn ping_codex_window(
+    app: AppHandle,
+    alias: String,
+    force: bool,
+) -> Result<window_ping::PingOutcome, String> {
+    let legacy_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "Profile configuration is unavailable")?;
+    let primary_dir = crate::services::state_location::primary_state_dir()
+        .map_err(|_| "Profile configuration is unavailable")?;
+    let profile = match profile_for_ping(&alias, &primary_dir, &legacy_dir) {
+        Ok(profile) => profile,
+        Err(outcome) => return Ok(outcome),
+    };
+    Ok(window_ping::ping_codex(profile, force).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "quotabar-ping-command-{}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn ping_codex_window_profile_resolution_returns_profile_unavailable_for_unknown_and_invalid() {
+        let root = temp_root();
+        fs::write(
+            root.join(codex_profiles::CONFIG_FILE),
+            r#"{"version":1,"profiles":[{"alias":"broken"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            profile_for_ping("unknown", &root, &root),
+            Err(window_ping::PingOutcome::ProfileUnavailable)
+        ));
+        assert!(matches!(
+            profile_for_ping("broken", &root, &root),
+            Err(window_ping::PingOutcome::ProfileUnavailable)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[tauri::command]
+pub async fn ping_claude_window(force: bool) -> Result<window_ping::PingOutcome, String> {
+    Ok(window_ping::ping_claude(force).await)
 }
 
 /// Read-only Claude current-state projection. No frontend mutation command exists.

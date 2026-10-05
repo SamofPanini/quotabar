@@ -49,6 +49,8 @@ pub fn run() {
             commands::get_codex_reset_credits,
             commands::get_codex_profiles,
             commands::get_codex_weekly_quota,
+            commands::ping_codex_window,
+            commands::ping_claude_window,
             commands::get_cursor_info,
             commands::get_antigravity_info,
             commands::get_grok_info,

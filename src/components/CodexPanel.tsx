@@ -48,6 +48,14 @@ interface CodexPanelProps {
   onBonusExpiring?: (daysLeft: number) => void;
   onBonusReadyChange?: (ready: { exhausted: boolean; availableCount: number }) => void;
   onOpenDashboard?: () => void;
+  onPingContextChange?: (context: CodexPingContext) => void;
+}
+
+export interface CodexPingContext {
+  alias: string;
+  limits: CodexRateLimits | null;
+  available: boolean;
+  unavailableReason?: string;
 }
 
 interface PendingTrayCoordination {
@@ -248,6 +256,7 @@ export default function CodexPanel({
   sections = defaultPanelSections(),
   onBonusExpiring,
   onOpenDashboard,
+  onPingContextChange,
 }: CodexPanelProps) {
   const [codexData, setCodexData] = useState<CodexData | null>(null);
   const [rateLimits, setRateLimits] = useState<CodexRateLimits | null>(null);
@@ -442,6 +451,25 @@ export default function CodexPanel({
   const selectedCustomProfile = selectedAccountId === 'default'
     ? null
     : customProfiles.find((profile) => profile.alias === selectedAccountId) ?? null;
+  useEffect(() => {
+    const limits = selectedCustomProfile
+      ? {
+        connected: selectedCustomProfile.status === 'connected' || selectedCustomProfile.status === 'stale',
+        primary: selectedCustomProfile.primary,
+        secondary: selectedCustomProfile.secondary,
+        ordinaryUsageAllowed: selectedCustomProfile.ordinaryUsageAllowed,
+      }
+      : rateLimits;
+    const available = selectedCustomProfile
+      ? selectedCustomProfile.status === 'connected' || selectedCustomProfile.status === 'stale'
+      : Boolean(limits?.connected && !limits.error);
+    onPingContextChange?.({
+      alias: selectedAccountId,
+      limits,
+      available,
+      unavailableReason: selectedCustomProfile?.error ?? limits?.error,
+    });
+  }, [onPingContextChange, rateLimits, selectedAccountId, selectedCustomProfile]);
   const connected = rateLimits?.connected || codexData?.connected;
   const accountTabs = [
     { id: 'default', label: 'Default' },

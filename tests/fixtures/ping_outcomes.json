@@ -1,0 +1,40 @@
+[
+  {
+    "kind": "opened",
+    "resetsAt": 1800000000,
+    "tokens": 42,
+    "confirmedAfterSecs": 90
+  },
+  {
+    "kind": "sentUnconfirmed",
+    "tokens": null,
+    "expectedResetsAt": 1800018000
+  },
+  {
+    "kind": "alreadyOpen",
+    "resetsAt": null
+  },
+  {
+    "kind": "blocked"
+  },
+  {
+    "kind": "busy"
+  },
+  {
+    "kind": "cliNotFound",
+    "cli": "codex"
+  },
+  {
+    "kind": "cliFailed",
+    "code": "timeout"
+  },
+  {
+    "kind": "profileUnavailable"
+  },
+  {
+    "kind": "quotaUnreadable"
+  },
+  {
+    "kind": "confirmationRequired"
+  }
+]

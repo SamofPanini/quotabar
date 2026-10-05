@@ -13,6 +13,7 @@ import type {
   CursorData,
   GrokData,
   QuotaData,
+  PingOutcome,
 } from '../types/models';
 
 type TrayService = 'claude' | 'codex' | 'cursor' | 'grok' | 'antigravity';
@@ -66,6 +67,14 @@ export const backend = {
 
   getCodexWeeklyQuota() {
     return invokeBackend<CodexWeeklyQuotaData>('get_codex_weekly_quota');
+  },
+
+  pingCodexWindow(alias: string, force: boolean) {
+    return invokeBackend<PingOutcome>('ping_codex_window', { alias, force });
+  },
+
+  pingClaudeWindow(force: boolean) {
+    return invokeBackend<PingOutcome>('ping_claude_window', { force });
   },
 
   getCursorInfo() {

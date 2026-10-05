@@ -25,3 +25,4 @@ pub(crate) mod state_location;
 pub mod tray;
 pub mod tray_icon;
 pub mod window;
+pub(crate) mod window_ping;

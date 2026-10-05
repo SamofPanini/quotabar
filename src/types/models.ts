@@ -106,6 +106,33 @@ export interface CodexProfilesResponse {
   registryProvenance: 'none' | 'primary' | 'legacy';
 }
 
+export type PingOutcome =
+  | { kind: 'opened'; resetsAt: number; tokens: number | null; confirmedAfterSecs: number }
+  | { kind: 'sentUnconfirmed'; tokens: number | null; expectedResetsAt: number }
+  | { kind: 'alreadyOpen'; resetsAt: number | null }
+  | { kind: 'blocked' }
+  | { kind: 'busy' }
+  | { kind: 'cliNotFound'; cli: 'codex' | 'claude' }
+  | { kind: 'cliFailed'; code: 'nonzeroExit' | 'noCompletion' | 'timeout' | 'spawnFailed' }
+  | { kind: 'profileUnavailable' }
+  | { kind: 'quotaUnreadable' }
+  | { kind: 'confirmationRequired' };
+
+// The Record type makes adding or removing a PingOutcome kind a compile-time
+// update to this runtime contract list as well.
+export const PING_OUTCOME_KINDS: Readonly<Record<PingOutcome['kind'], true>> = {
+  opened: true,
+  sentUnconfirmed: true,
+  alreadyOpen: true,
+  blocked: true,
+  busy: true,
+  cliNotFound: true,
+  cliFailed: true,
+  profileUnavailable: true,
+  quotaUnreadable: true,
+  confirmationRequired: true,
+};
+
 export type CodexQuotaStatus = 'on_track' | 'watch' | 'likely_exhausted' | 'exhausted';
 
 export interface CodexWeeklyQuota {

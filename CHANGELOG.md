@@ -4,6 +4,7 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Add an opt-in Ping footer action for opening the selected Codex or Claude 5-hour window with one minimal CLI turn.
 - Add a Settings Launch at Login toggle backed by the OS login item.
 - Add All / single-service settings presets, and split monthly budgets from alerts.
 - Notify at 100% used and when a Codex bonus reset is unused at 100%.
