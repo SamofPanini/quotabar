@@ -339,9 +339,14 @@ fn first_executable_with_forbidden(
     candidates: impl IntoIterator<Item = PathBuf>,
     forbidden_root: &Path,
 ) -> Option<PathBuf> {
+    // Compare canonical paths on both sides: macOS temp and app paths may sit
+    // behind symlinks (for example /var -> /private/var).
+    let forbidden_root = forbidden_root
+        .canonicalize()
+        .unwrap_or_else(|_| forbidden_root.to_path_buf());
     candidates.into_iter().find_map(|candidate| {
         let canonical = candidate.canonicalize().ok()?;
-        (!canonical.starts_with(forbidden_root) && is_executable_file(&canonical))
+        (!canonical.starts_with(&forbidden_root) && is_executable_file(&canonical))
             .then_some(canonical)
     })
 }
