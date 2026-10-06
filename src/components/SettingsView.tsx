@@ -87,9 +87,9 @@ export default function SettingsView({
   onAutostartNotice,
 }: SettingsViewProps) {
   const [budgets, setBudgets] = useState<MonthlyBudgets>(getSavedMonthlyBudgets);
-  const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
   const [autostartError, setAutostartError] = useState<string | null>(null);
-  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(true);
   const enabledSwitcherCount = SERVICES.filter((service) => switcherVisibility[service]).length;
   const trayByService = new Map(trayEntries.map((entry) => [entry.service, entry]));
 
@@ -97,12 +97,13 @@ export default function SettingsView({
     let cancelled = false;
     void readAutostartEnabled().then((result) => {
       if (cancelled) return;
+      setAutostartBusy(false);
       if (result.status === 'ok') {
         setLaunchAtLogin(result.enabled);
         setAutostartError(null);
         return;
       }
-      setLaunchAtLogin(false);
+      setLaunchAtLogin(null);
       setAutostartError(result.status === 'failure' ? result.message : null);
     });
     return () => {
@@ -112,15 +113,28 @@ export default function SettingsView({
 
   const handleLaunchAtLoginToggle = async () => {
     if (autostartBusy) return;
-    const requested = !launchAtLogin;
     setAutostartBusy(true);
-    const result = await setAutostartEnabled(requested);
+    if (launchAtLogin === null) {
+      const result = await readAutostartEnabled();
+      setAutostartBusy(false);
+      if (result.status === 'ok') {
+        setLaunchAtLogin(result.enabled);
+        setAutostartError(null);
+        return;
+      }
+      setLaunchAtLogin(null);
+      setAutostartError(result.status === 'failure' ? result.message : null);
+      return;
+    }
+
+    const result = await setAutostartEnabled(!launchAtLogin);
     setAutostartBusy(false);
     if (result.status === 'ok') {
       setLaunchAtLogin(result.enabled);
       setAutostartError(null);
       return;
     }
+    setLaunchAtLogin(null);
     setAutostartError(result.message);
     onAutostartNotice?.(result.message);
   };
@@ -437,19 +451,33 @@ export default function SettingsView({
         <div className="settings-subsection-title settings-subsection-divider">Startup</div>
         <div className="settings-line">
           <span>Launch at Login</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={launchAtLogin}
-            aria-label="Launch at Login"
-            disabled={autostartBusy}
-            className={`target-switch ${launchAtLogin ? 'on' : ''}`}
-            onClick={() => {
-              void handleLaunchAtLoginToggle();
-            }}
-          >
-            <span />
-          </button>
+          {launchAtLogin === null ? (
+            <button
+              type="button"
+              className="settings-seg-btn"
+              aria-label="Check Launch at Login status"
+              disabled={autostartBusy}
+              onClick={() => {
+                void handleLaunchAtLoginToggle();
+              }}
+            >
+              Check again
+            </button>
+          ) : (
+            <button
+              type="button"
+              role="switch"
+              aria-checked={launchAtLogin}
+              aria-label="Launch at Login"
+              disabled={autostartBusy}
+              className={`target-switch ${launchAtLogin ? 'on' : ''}`}
+              onClick={() => {
+                void handleLaunchAtLoginToggle();
+              }}
+            >
+              <span />
+            </button>
+          )}
         </div>
         {autostartError ? (
           <div className="settings-hint" role="alert">{autostartError}</div>

@@ -61,6 +61,10 @@ function launchSwitch(renderer: ReactTestRenderer) {
   return renderer.root.findByProps({ 'aria-label': 'Launch at Login' });
 }
 
+function checkAgainButton(renderer: ReactTestRenderer) {
+  return renderer.root.findByProps({ 'aria-label': 'Check Launch at Login status' });
+}
+
 beforeEach(() => {
   (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
   autostart.readAutostartEnabled.mockReset().mockResolvedValue({ status: 'ok', enabled: false });
@@ -109,7 +113,7 @@ describe('Launch at Login settings row', () => {
     await act(async () => renderer.unmount());
   });
 
-  it('keeps the switch off and shows copy when status cannot be read', async () => {
+  it('shows Check again and status copy when the status cannot be read', async () => {
     autostart.readAutostartEnabled.mockResolvedValue({
       status: 'failure',
       message: AUTOSTART_STATUS_FAILURE_MESSAGE,
@@ -120,14 +124,15 @@ describe('Launch at Login settings row', () => {
       await Promise.resolve();
     });
 
-    expect(launchSwitch(renderer).props['aria-checked']).toBe(false);
+    expect(renderer.root.findAllByProps({ 'aria-label': 'Launch at Login' })).toHaveLength(0);
+    expect(checkAgainButton(renderer).props.children).toBe('Check again');
     expect(renderer.root.findByProps({ role: 'alert' }).props.children).toBe(
       AUTOSTART_STATUS_FAILURE_MESSAGE,
     );
     await act(async () => renderer.unmount());
   });
 
-  it('does not flip the switch when registration fails', async () => {
+  it('shows Check again when registration cannot be confirmed', async () => {
     const onAutostartNotice = vi.fn();
     autostart.setAutostartEnabled.mockResolvedValue({
       status: 'failure',
@@ -144,12 +149,84 @@ describe('Launch at Login settings row', () => {
       await Promise.resolve();
     });
 
-    expect(launchSwitch(renderer).props['aria-checked']).toBe(false);
+    expect(renderer.root.findAllByProps({ 'aria-label': 'Launch at Login' })).toHaveLength(0);
+    expect(checkAgainButton(renderer).props.children).toBe('Check again');
     expect(onAutostartNotice).toHaveBeenCalledExactlyOnceWith(AUTOSTART_UPDATE_FAILURE_MESSAGE);
     expect(renderer.root.findByProps({ role: 'alert' }).props.children).toBe(
       AUTOSTART_UPDATE_FAILURE_MESSAGE,
     );
     await act(async () => renderer.unmount());
+  });
+
+  it('keeps the launch setting non-interactive until its initial read settles', async () => {
+    autostart.readAutostartEnabled.mockReturnValue(new Promise(() => {}));
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(SettingsView, settingsProps()));
+    });
+
+    expect(renderer.root.findAllByProps({ 'aria-label': 'Launch at Login' })).toHaveLength(0);
+    expect(checkAgainButton(renderer).props.disabled).toBe(true);
+    await act(async () => {
+      checkAgainButton(renderer).props.onClick();
+    });
+    expect(autostart.readAutostartEnabled).toHaveBeenCalledExactlyOnceWith();
+    expect(autostart.setAutostartEnabled).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it('shows Check again without an error when preview status is unavailable', async () => {
+    autostart.readAutostartEnabled.mockResolvedValue({ status: 'unavailable' });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(SettingsView, settingsProps()));
+      await Promise.resolve();
+    });
+
+    expect(checkAgainButton(renderer).props.children).toBe('Check again');
+    expect(renderer.root.findAllByProps({ role: 'alert' })).toHaveLength(0);
+    await act(async () => renderer.unmount());
+  });
+
+  it('re-reads unknown status without writing and restores the switch on success', async () => {
+    autostart.readAutostartEnabled
+      .mockResolvedValueOnce({ status: 'unavailable' })
+      .mockResolvedValueOnce({ status: 'ok', enabled: true });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(SettingsView, settingsProps()));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      checkAgainButton(renderer).props.onClick();
+      await Promise.resolve();
+    });
+
+    expect(autostart.readAutostartEnabled).toHaveBeenCalledTimes(2);
+    expect(autostart.setAutostartEnabled).not.toHaveBeenCalled();
+    expect(launchSwitch(renderer).props['aria-checked']).toBe(true);
+    await act(async () => renderer.unmount());
+  });
+
+  it('ignores an initial read that resolves after unmount', async () => {
+    let resolveRead!: (result: { status: 'ok'; enabled: boolean }) => void;
+    autostart.readAutostartEnabled.mockReturnValue(new Promise((resolve) => {
+      resolveRead = resolve;
+    }));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(createElement(SettingsView, settingsProps()));
+    });
+    await act(async () => renderer.unmount());
+    const errorsBeforeLateRead = consoleError.mock.calls.length;
+    await act(async () => {
+      resolveRead({ status: 'ok', enabled: true });
+      await Promise.resolve();
+    });
+
+    expect(consoleError).toHaveBeenCalledTimes(errorsBeforeLateRead);
   });
 
   it('turns on after a confirmed login-item write', async () => {
