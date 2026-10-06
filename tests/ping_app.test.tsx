@@ -385,7 +385,7 @@ describe('App ping result and provider refresh isolation', () => {
     expect(text(renderer)).toContain('Ping sent · confirming…');
     expect(pingButton(renderer).props.disabled).toBe(true);
     expect(pingButton(renderer).props.title).toBe('Confirming window…');
-    expect(pingButton(renderer).findByProps({ className: 'btn-icon' }).children).toContain('P');
+    expect(pingButton(renderer).findByProps({ className: 'btn-text' }).children).toContain('Ping');
     await act(async () => {
       vi.advanceTimersByTime(8_000);
       await flush();

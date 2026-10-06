@@ -1021,7 +1021,9 @@
 
 .action-btn.refresh-btn {
   gap: 5px;
-  padding: 5px 11px;
+  min-width: 30px;
+  padding: 5px 8px;
+  font-size: 14px;
   color: var(--acc);
   background: rgba(10, 132, 255, 0.12);
   font-weight: 600;
@@ -1035,6 +1037,10 @@
 
 .action-btn.dashboard-btn {
   gap: 5px;
+}
+
+.action-btn.ping-btn {
+  min-width: 40px;
 }
 
 .action-status {

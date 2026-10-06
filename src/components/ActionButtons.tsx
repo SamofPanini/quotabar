@@ -69,19 +69,18 @@ export default function ActionButtons({
           aria-label="Refresh current provider"
         >
           <span className="btn-icon">{loading ? '...' : '↻'}</span>
-          <span className="btn-text">{loading ? 'Loading' : 'Refresh'}</span>
         </button>
 
         {showPing && (
           <button
             type="button"
-            className="action-btn icon-action ping-btn"
+            className="action-btn ping-btn"
             onClick={onPing}
             disabled={Boolean(pingDisabledTitle)}
             title={pingDisabledTitle ?? pingTitle}
             aria-label={pingTitle}
           >
-            <span className="btn-icon">{pingState === 'inFlight' ? '...' : 'P'}</span>
+            <span className="btn-text">{pingState === 'inFlight' ? '...' : 'Ping'}</span>
           </button>
         )}
 
