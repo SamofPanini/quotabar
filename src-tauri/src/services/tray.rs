@@ -231,6 +231,155 @@ fn emit_tray_service_activated(app: &AppHandle, service: TrayService) {
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+impl LRect {
+    fn contains(self, point: (f64, f64)) -> bool {
+        point.0 >= self.x
+            && point.0 < self.x + self.w
+            && point.1 >= self.y
+            && point.1 < self.y + self.h
+    }
+}
+
+fn popover_origin_from_physical(
+    cursor_physical: (f64, f64),
+    icon_physical: LRect,
+    monitors: &[(LRect, f64)],
+    window: (f64, f64),
+) -> (f64, f64) {
+    // tray-icon scales the clicked status-item frame by that screen's backing
+    // factor, so only the right candidate yields a menu-bar-sized logical height.
+    // With 1x/2x pairs this holds while real menu bars stay within 16-32 pt on
+    // 1x screens (22/24 pt) and above 16 pt on 2x screens (24, or 37 with a notch).
+    fn candidate_order(
+        left: &(LRect, f64, (f64, f64), LRect),
+        right: &(LRect, f64, (f64, f64), LRect),
+    ) -> std::cmp::Ordering {
+        let left_score = ((left.3.y - left.0.y).abs(), (left.3.h - 24.0).abs());
+        let right_score = ((right.3.y - right.0.y).abs(), (right.3.h - 24.0).abs());
+        left_score
+            .0
+            .total_cmp(&right_score.0)
+            .then_with(|| left_score.1.total_cmp(&right_score.1))
+    }
+
+    let fallback = monitors.first().copied().unwrap_or((
+        LRect {
+            x: 0.0,
+            y: 0.0,
+            w: window.0,
+            h: window.1,
+        },
+        1.0,
+    ));
+    let candidates: Vec<_> = monitors
+        .iter()
+        .copied()
+        .filter_map(|(screen, scale)| {
+            let cursor = (cursor_physical.0 / scale, cursor_physical.1 / scale);
+            screen.contains(cursor).then(|| {
+                let icon = LRect {
+                    x: icon_physical.x / scale,
+                    y: icon_physical.y / scale,
+                    w: icon_physical.w / scale,
+                    h: icon_physical.h / scale,
+                };
+                (screen, scale, cursor, icon)
+            })
+        })
+        .collect();
+    let (screen, _scale, cursor, icon) = candidates
+        .iter()
+        .copied()
+        .filter(|(screen, _, _, icon)| {
+            screen.contains((icon.x + icon.w / 2.0, icon.y + icon.h / 2.0))
+        })
+        .min_by(candidate_order)
+        .or_else(|| candidates.into_iter().min_by(candidate_order))
+        .unwrap_or_else(|| {
+            let (screen, scale) = fallback;
+            (
+                screen,
+                scale,
+                (cursor_physical.0 / scale, cursor_physical.1 / scale),
+                LRect {
+                    x: icon_physical.x / scale,
+                    y: icon_physical.y / scale,
+                    w: icon_physical.w / scale,
+                    h: icon_physical.h / scale,
+                },
+            )
+        });
+    let icon = screen
+        .contains((icon.x + icon.w / 2.0, icon.y + icon.h / 2.0))
+        .then_some(icon);
+    let anchor_x = icon.map_or(cursor.0, |icon| icon.x + icon.w / 2.0);
+    let max_x = (screen.x + screen.w - window.0).max(screen.x);
+    let max_y = (screen.y + screen.h - window.1).max(screen.y);
+    let mut y = icon.map_or(screen.y + 24.0 + 4.0, |icon| icon.y + icon.h + 4.0);
+    if let Some(icon) = icon.filter(|icon| icon.y - screen.y > screen.h / 2.0) {
+        y = icon.y - window.1 - 4.0;
+    }
+    (
+        (anchor_x - window.0 / 2.0).clamp(screen.x, max_x),
+        y.clamp(screen.y, max_y),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn position_window_near_tray(app: &AppHandle, cursor_physical: (f64, f64), icon_physical: LRect) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(window_size) = window.outer_size() else {
+        return;
+    };
+    let Ok(window_scale) = window.scale_factor() else {
+        return;
+    };
+    let Ok(monitors) = app.available_monitors() else {
+        return;
+    };
+    let monitors: Vec<_> = monitors
+        .into_iter()
+        .map(|monitor| {
+            let scale = monitor.scale_factor();
+            let position = monitor.position();
+            let size = monitor.size();
+            (
+                LRect {
+                    x: position.x as f64 / scale,
+                    y: position.y as f64 / scale,
+                    w: size.width as f64 / scale,
+                    h: size.height as f64 / scale,
+                },
+                scale,
+            )
+        })
+        .collect();
+    let origin = popover_origin_from_physical(
+        cursor_physical,
+        icon_physical,
+        &monitors,
+        (
+            window_size.width as f64 / window_scale,
+            window_size.height as f64 / window_scale,
+        ),
+    );
+    let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition {
+        x: origin.0,
+        y: origin.1,
+    }));
+}
+
+#[cfg(not(target_os = "macos"))]
 fn find_monitor_at_point(app: &AppHandle, x: i32, y: i32) -> Option<tauri::Monitor> {
     app.available_monitors().ok()?.into_iter().find(|monitor| {
         let pos = monitor.position();
@@ -239,6 +388,7 @@ fn find_monitor_at_point(app: &AppHandle, x: i32, y: i32) -> Option<tauri::Monit
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn position_window_near_tray(app: &AppHandle, tray: &tauri::tray::TrayIcon) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -249,7 +399,6 @@ fn position_window_near_tray(app: &AppHandle, tray: &tauri::tray::TrayIcon) {
     let Ok(window_size) = window.outer_size() else {
         return;
     };
-
     let pos = match rect.position {
         Position::Physical(p) => (p.x, p.y),
         Position::Logical(l) => (l.x as i32, l.y as i32),
@@ -258,12 +407,10 @@ fn position_window_near_tray(app: &AppHandle, tray: &tauri::tray::TrayIcon) {
         tauri::Size::Physical(s) => (s.width, s.height),
         tauri::Size::Logical(l) => (l.width as u32, l.height as u32),
     };
-
     let window_width = window_size.width as i32;
     let window_height = window_size.height as i32;
     let mut x = pos.0 + (tray_size.0 as i32 / 2) - (window_width / 2);
     let mut y = pos.1 + tray_size.1 as i32 + 8;
-
     if let Some(monitor) = find_monitor_at_point(app, pos.0, pos.1) {
         let screen_pos = monitor.position();
         let screen_size = monitor.size();
@@ -271,15 +418,12 @@ fn position_window_near_tray(app: &AppHandle, tray: &tauri::tray::TrayIcon) {
         let max_x = (screen_pos.x + screen_size.width as i32 - window_width).max(screen_pos.x);
         let min_y = screen_pos.y;
         let max_y = (screen_pos.y + screen_size.height as i32 - window_height).max(screen_pos.y);
-
         if pos.1 - screen_pos.y > screen_size.height as i32 / 2 {
             y = pos.1 - window_height - 8;
         }
-
         x = x.clamp(min_x, max_x);
         y = y.clamp(min_y, max_y);
     }
-
     let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
 }
 
@@ -404,6 +548,8 @@ fn build_service_tray(app: &AppHandle, service: TrayService) -> tauri::Result<()
             TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
+                position,
+                rect,
                 ..
             } => {
                 let app = tray.app_handle();
@@ -416,7 +562,28 @@ fn build_service_tray(app: &AppHandle, service: TrayService) -> tauri::Result<()
                             let _ = window.hide();
                         }
                         TrayClickAction::Show => {
-                            position_window_near_tray(app, tray);
+                            #[cfg(target_os = "macos")]
+                            if let (
+                                Position::Physical(icon_position),
+                                tauri::Size::Physical(icon_size),
+                            ) = (rect.position, rect.size)
+                            {
+                                position_window_near_tray(
+                                    app,
+                                    (position.x, position.y),
+                                    LRect {
+                                        x: icon_position.x as f64,
+                                        y: icon_position.y as f64,
+                                        w: icon_size.width as f64,
+                                        h: icon_size.height as f64,
+                                    },
+                                );
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                let _ = (position, rect);
+                                position_window_near_tray(app, tray);
+                            }
                             let shown = window.show();
                             let focused = window.set_focus();
                             eprintln!(
@@ -577,8 +744,8 @@ pub async fn update_tray_icon(
 #[cfg(test)]
 mod tests {
     use super::{
-        destroy_hidden_tray, format_tooltip, tray_click_action, TrayClickAction, TrayRuntimeState,
-        TrayService, TraySnapshot,
+        destroy_hidden_tray, format_tooltip, popover_origin_from_physical, tray_click_action,
+        LRect, TrayClickAction, TrayRuntimeState, TrayService, TraySnapshot,
     };
     use crate::services::tray_icon::TrayIconStyle;
 
@@ -635,6 +802,198 @@ mod tests {
     fn tray_click_hides_when_the_popover_was_already_visible() {
         assert_eq!(tray_click_action(true), TrayClickAction::Hide);
         assert_eq!(tray_click_action(false), TrayClickAction::Show);
+    }
+
+    const MAIN: LRect = LRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1680.0,
+        h: 1050.0,
+    };
+    const BELOW: LRect = LRect {
+        x: -394.0,
+        y: 1050.0,
+        w: 1920.0,
+        h: 1080.0,
+    };
+    const LEFT: LRect = LRect {
+        x: -1920.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+    };
+    const RIGHT: LRect = LRect {
+        x: 1680.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+    };
+    const WINDOW: (f64, f64) = (340.0, 600.0);
+
+    #[test]
+    fn physical_popover_selects_main_screen_and_preserves_retina_spacing() {
+        let origin = popover_origin_from_physical(
+            (3000.0, 24.0),
+            LRect {
+                x: 2980.0,
+                y: 0.0,
+                w: 44.0,
+                h: 48.0,
+            },
+            &[(MAIN, 2.0), (BELOW, 1.0)],
+            WINDOW,
+        );
+        assert_eq!(origin, (1331.0, 28.0));
+        assert!(origin.0 >= MAIN.x && origin.0 + WINDOW.0 <= MAIN.x + MAIN.w);
+    }
+
+    #[test]
+    fn physical_popover_selects_right_screen_with_main_first() {
+        let origin = popover_origin_from_physical(
+            (1800.0, 12.0),
+            LRect {
+                x: 1790.0,
+                y: 0.0,
+                w: 22.0,
+                h: 24.0,
+            },
+            &[(MAIN, 2.0), (RIGHT, 1.0)],
+            WINDOW,
+        );
+        assert_eq!(origin.1, 28.0);
+        assert!(origin.0 >= RIGHT.x && origin.0 + WINDOW.0 <= RIGHT.x + RIGHT.w);
+    }
+
+    #[test]
+    fn physical_popover_selects_main_screen_with_right_present() {
+        let origin = popover_origin_from_physical(
+            (3000.0, 24.0),
+            LRect {
+                x: 2980.0,
+                y: 0.0,
+                w: 44.0,
+                h: 48.0,
+            },
+            &[(MAIN, 2.0), (RIGHT, 1.0)],
+            WINDOW,
+        );
+        assert_eq!(origin, (1331.0, 28.0));
+    }
+
+    #[test]
+    fn physical_popover_selects_notched_main_screen_with_right_present() {
+        let origin = popover_origin_from_physical(
+            (3000.0, 30.0),
+            LRect {
+                x: 2980.0,
+                y: 0.0,
+                w: 44.0,
+                h: 74.0,
+            },
+            &[(RIGHT, 1.0), (MAIN, 2.0)],
+            WINDOW,
+        );
+        assert_eq!(origin, (1331.0, 41.0));
+    }
+
+    #[test]
+    fn physical_popover_selects_right_screen_with_22pt_menu_bar() {
+        let origin = popover_origin_from_physical(
+            (1800.0, 11.0),
+            LRect {
+                x: 1790.0,
+                y: 0.0,
+                w: 22.0,
+                h: 22.0,
+            },
+            &[(MAIN, 2.0), (RIGHT, 1.0)],
+            WINDOW,
+        );
+        assert_eq!(origin, (1680.0, 26.0));
+    }
+
+    #[test]
+    fn physical_popover_right_screen_does_not_depend_on_monitor_order() {
+        let origin = popover_origin_from_physical(
+            (1800.0, 12.0),
+            LRect {
+                x: 1790.0,
+                y: 0.0,
+                w: 22.0,
+                h: 24.0,
+            },
+            &[(RIGHT, 1.0), (MAIN, 2.0)],
+            WINDOW,
+        );
+        assert_eq!(origin, (1680.0, 28.0));
+    }
+
+    #[test]
+    fn physical_popover_prefers_below_screen_when_scales_overlap() {
+        let origin = popover_origin_from_physical(
+            (500.0, 1062.0),
+            LRect {
+                x: 490.0,
+                y: 1050.0,
+                w: 22.0,
+                h: 24.0,
+            },
+            &[(MAIN, 2.0), (BELOW, 1.0)],
+            WINDOW,
+        );
+        assert_eq!(origin.1, 1078.0);
+        assert!(origin.0 >= BELOW.x && origin.0 + WINDOW.0 <= BELOW.x + BELOW.w);
+        assert!(origin.1 >= BELOW.y && origin.1 + WINDOW.1 <= BELOW.y + BELOW.h);
+    }
+
+    #[test]
+    fn physical_popover_stays_on_left_external_screen() {
+        let origin = popover_origin_from_physical(
+            (-1000.0, 12.0),
+            LRect {
+                x: -1010.0,
+                y: 0.0,
+                w: 22.0,
+                h: 24.0,
+            },
+            &[(MAIN, 2.0), (LEFT, 1.0)],
+            WINDOW,
+        );
+        assert!(origin.0 >= -1920.0 && origin.0 <= -340.0);
+        assert_eq!(origin.1, 28.0);
+    }
+
+    #[test]
+    fn physical_popover_falls_back_to_first_screen_when_no_monitor_matches() {
+        let origin = popover_origin_from_physical(
+            (9999.0, 9999.0),
+            LRect {
+                x: 9990.0,
+                y: 9990.0,
+                w: 22.0,
+                h: 24.0,
+            },
+            &[(MAIN, 2.0), (BELOW, 1.0)],
+            WINDOW,
+        );
+        assert!(origin.0 >= MAIN.x && origin.0 + WINDOW.0 <= MAIN.x + MAIN.w);
+        assert!(origin.1 >= MAIN.y && origin.1 + WINDOW.1 <= MAIN.y + MAIN.h);
+    }
+
+    #[test]
+    fn physical_popover_clamps_at_right_edge() {
+        let origin = popover_origin_from_physical(
+            (3348.0, 24.0),
+            LRect {
+                x: 3336.0,
+                y: 0.0,
+                w: 44.0,
+                h: 48.0,
+            },
+            &[(MAIN, 2.0)],
+            WINDOW,
+        );
+        assert_eq!(origin, (1340.0, 28.0),);
     }
 
     #[test]
