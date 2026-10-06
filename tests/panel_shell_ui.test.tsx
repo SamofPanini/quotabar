@@ -190,7 +190,7 @@ describe('panel shell UI', () => {
     expect(html).toContain('>Sign in<');
     expect(html).toContain('>Preview<');
     expect(html).toContain('>Launch at Login<');
-    expect(html).toContain('aria-label="Launch at Login"');
+    expect(html).toContain('aria-label="Check Launch at Login status"');
   });
 
   it('keeps compact settings controls visually self-contained at panel width', () => {
