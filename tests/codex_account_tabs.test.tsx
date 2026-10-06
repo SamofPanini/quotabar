@@ -253,6 +253,32 @@ describe('Codex account tabs', () => {
     await act(async () => renderer.unmount());
   });
 
+  it('keeps the Default credit balance isolated from custom account tabs', async () => {
+    const renderer = await renderPanel({
+      defaultRateLimits: {
+        connected: true,
+        primary: { usedPercent: 8, windowMinutes: 300, resetsAt: 1_788_000_000 },
+        secondary: { usedPercent: 20, windowMinutes: 10_080, resetsAt: 1_788_600_000 },
+        credits: { hasCredits: true, unlimited: false, balance: '1234.5' },
+      },
+      profiles: { profiles: [profile('Work', 14)], registryError: null },
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain('1,234.5');
+
+    await act(async () => {
+      renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick();
+      await flush();
+    });
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('1,234.5');
+
+    await act(async () => {
+      renderer.root.findAllByProps({ role: 'tab' })[0].props.onClick();
+      await flush();
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain('1,234.5');
+    await act(async () => renderer.unmount());
+  });
+
   it('keeps conflicting ordinary-usage labels and neutral meters bound to their selected tab', async () => {
     const unknownProfile = profile('Unknown', 44);
     delete unknownProfile.ordinaryUsageAllowed;
@@ -337,7 +363,7 @@ describe('Codex account tabs', () => {
   it('marks a prior Default quota stale while a healthy custom account remains fresh for the tray', async () => {
     mockDefaultCalls();
     vi.spyOn(backend, 'getCodexProfiles')
-      .mockResolvedValueOnce({ profiles: [profile('B', 80)], registryError: null })
+      .mockResolvedValueOnce({ profiles: [profile('B', 20)], registryError: null })
       .mockResolvedValueOnce({ profiles: [profile('B', 80)], registryError: null });
     const onTrayQuotaSnapshotsChange = vi.fn();
     const renderer = await mountPanel({ onTrayQuotaSnapshotsChange });
@@ -355,6 +381,7 @@ describe('Codex account tabs', () => {
       expect.objectContaining({ accountId: 'B', freshness: 'fresh' }),
     ]);
     expect(getCodexTrayUsedPercent(snapshots, 'weekly')).toBe(90);
+    expect(getCodexTrayUsedPercent(snapshots, 'weekly')).not.toBe(20);
     expect(JSON.stringify(renderer.toJSON())).toContain('Stale data');
     await act(async () => renderer.unmount());
   });
@@ -442,18 +469,31 @@ describe('Codex account tabs', () => {
       expect.objectContaining({ accountId: 'default', freshness: 'fresh' }),
       expect.objectContaining({ accountId: 'B', freshness: 'fresh' }),
     ]);
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).not.toContain('Quota unavailable');
+    expect(text).not.toContain('Stale data');
     await act(async () => renderer.unmount());
   });
 
   it('keeps the selected healthy custom tab stable while an inactive profile is unavailable', async () => {
     const unavailable = { ...profile('B', 99), status: 'error' as const, primary: undefined, secondary: undefined };
-    const renderer = await renderPanel({ profiles: { profiles: [profile('A', 31), unavailable], registryError: null } });
+    const onTrayQuotaSnapshotsChange = vi.fn();
+    const renderer = await renderPanel({
+      profiles: { profiles: [profile('A', 31), unavailable], registryError: null },
+      onTrayQuotaSnapshotsChange,
+    });
     await act(async () => {
       renderer.root.findAllByProps({ role: 'tab' })[1].props.onClick();
       await flush();
     });
     expect(renderer.root.findAllByProps({ role: 'tab' }).map((tab) => tab.props['aria-selected'])).toEqual([false, true, false]);
     expect(JSON.stringify(renderer.toJSON())).toContain('31% used');
+    const snapshots = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(snapshots).toEqual(expect.arrayContaining([
+      expect.objectContaining({ accountId: 'A', freshness: 'fresh' }),
+      expect.objectContaining({ accountId: 'B', freshness: 'unavailable' }),
+    ]));
+    expect(getCodexTrayUsedPercent(snapshots, 'weekly')).toBe(41);
     await act(async () => renderer.unmount());
   });
 
@@ -469,6 +509,9 @@ describe('Codex account tabs', () => {
     const renderer = await mountPanel({ onTrayQuotaSnapshotsChange });
     const unavailable = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
     expect(getCodexTrayUsedPercent(unavailable, 'weekly')).toBeNull();
+    expect(unavailable).not.toHaveLength(0);
+    expect(unavailable.every((snapshot) => snapshot.freshness !== 'fresh')).toBe(true);
+    const callsBeforeRecovery = onTrayQuotaSnapshotsChange.mock.calls.length;
     await act(async () => {
       renderer.update(createElement(CodexPanel, {
         autoRefreshIntervalMs: 0, manualRefreshNonce: 1, showCostSummary: false, sections: hiddenSections, onTrayQuotaSnapshotsChange,
@@ -476,8 +519,24 @@ describe('Codex account tabs', () => {
       await flush();
     });
     const recovered = onTrayQuotaSnapshotsChange.mock.calls.at(-1)![0] as CodexTrayAccountSnapshot[];
+    expect(onTrayQuotaSnapshotsChange).toHaveBeenCalledTimes(callsBeforeRecovery + 1);
     expect(recovered.every((snapshot) => snapshot.freshness === 'fresh')).toBe(true);
     expect(getCodexTrayUsedPercent(recovered, 'weekly')).toBe(75);
+    await act(async () => renderer.unmount());
+  });
+
+  it('displays a fulfilled reset-credit error without replacing it with reject copy', async () => {
+    mockDefaultCalls();
+    vi.mocked(backend.getCodexResetCredits).mockResolvedValue({
+      connected: true,
+      availableCount: 0,
+      credits: [],
+      error: 'Reset credit lookup failed',
+    });
+    const renderer = await mountPanel();
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain('Reset credit lookup failed');
+    expect(text).not.toContain('Reset credits unavailable');
     await act(async () => renderer.unmount());
   });
 

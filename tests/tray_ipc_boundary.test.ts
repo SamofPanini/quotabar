@@ -33,6 +33,7 @@ describe('tray IPC percentage boundary', () => {
     [null, null],
     [-1, 0],
     [12.6, 13],
+    [120, 120],
     [999, 255],
   ] as const)('normalizes %s to %s', (input, expected) => {
     expect(normalizeTrayIpcPercentage(input)).toBe(expected);

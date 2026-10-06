@@ -325,4 +325,91 @@ describe('tray icon sync', () => {
     expect(claude_visible_calls().length).toBeGreaterThanOrEqual(callsAfterReject + 2);
     await unmount(renderer);
   });
+
+  test('keeps skip-cache tuples independent when Claude and Grok requests complete out of order', async () => {
+    (globalThis as Record<string, unknown>).localStorage = memoryStorage({
+      'claude-tray-enabled': 'true',
+      'codex-tray-enabled': 'false',
+      'cursor-tray-enabled': 'false',
+      'grok-tray-enabled': 'true',
+      'antigravity-tray-enabled': 'false',
+      'claude-quota-tray-cycle': 'false',
+    });
+    type PendingUpdate = { service: 'claude' | 'grok'; sequence: number; resolve(): void };
+    const pending: PendingUpdate[] = [];
+    let sequence = 0;
+    vi.spyOn(backend, 'updateTrayIcon').mockImplementation((service) => {
+      if (service !== 'claude' && service !== 'grok') return Promise.resolve();
+      return new Promise((resolve) => {
+        pending.push({ service, sequence: sequence++, resolve: () => resolve(undefined) });
+      });
+    });
+
+    const renderer = await render_app();
+    await act(flush);
+    const latest = (service: 'claude' | 'grok') => pending.filter((call) => call.service === service).at(-1)!;
+    const claude = latest('claude');
+    const grok = latest('grok');
+    const [later, earlier] = claude.sequence > grok.sequence ? [claude, grok] : [grok, claude];
+    await act(async () => {
+      later.resolve();
+      await flush();
+      earlier.resolve();
+      await flush();
+    });
+
+    const visibleCalls = (service: 'claude' | 'grok') => vi.mocked(backend.updateTrayIcon).mock.calls.filter(
+      (call) => call[0] === service && call[2] === true,
+    );
+    const beforeUnchanged = { claude: visibleCalls('claude').length, grok: visibleCalls('grok').length };
+    // Change only a third service (Codex, tray hidden) so a non-force sync must
+    // run while the Claude and Grok tuples stay identical.
+    const codexCalls = () => vi.mocked(backend.updateTrayIcon).mock.calls.filter((call) => call[0] === 'codex');
+    const codexBefore = codexCalls().length;
+    vi.mocked(backend.getCodexRateLimits).mockResolvedValue({
+      connected: true,
+      secondary: { usedPercent: 55, windowMinutes: 10_080 },
+    });
+    await act(async () => {
+      renderer.root.findByProps({ 'data-provider': 'codex' }).props.onClick();
+      await flush();
+    });
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Refresh current provider' }).props.onClick();
+      await flush();
+    });
+    expect(codexCalls().length).toBeGreaterThan(codexBefore);
+    expect(codexCalls().at(-1)?.[1]).toBe(55);
+    expect(visibleCalls('claude')).toHaveLength(beforeUnchanged.claude);
+    expect(visibleCalls('grok')).toHaveLength(beforeUnchanged.grok);
+
+    vi.mocked(backend.getGrokInfo).mockResolvedValue({ connected: true, percentage: 40, products: [] });
+    await act(async () => {
+      renderer.root.findByProps({ 'data-provider': 'grok' }).props.onClick();
+      await flush();
+    });
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Refresh current provider' }).props.onClick();
+      await flush();
+    });
+    expect(visibleCalls('claude')).toHaveLength(beforeUnchanged.claude);
+    expect(visibleCalls('grok')).toHaveLength(beforeUnchanged.grok + 1);
+    await unmount(renderer);
+  });
+
+  test('forces a tray update after a successful identical tuple has been cached', async () => {
+    const renderer = await render_app();
+    await act(flush);
+    vi.mocked(backend.updateTrayIcon).mockClear();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flush();
+    });
+
+    const grokCalls = vi.mocked(backend.updateTrayIcon).mock.calls.filter((call) => call[0] === 'grok');
+    expect(grokCalls).toHaveLength(1);
+    expect(grokCalls[0][3]).toBe(true);
+    await unmount(renderer);
+  });
 });

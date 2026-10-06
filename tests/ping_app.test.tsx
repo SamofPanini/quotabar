@@ -291,6 +291,54 @@ describe('App ping result and provider refresh isolation', () => {
     await act(async () => renderer.unmount());
   });
 
+  it('drops a delayed confirmation-required outcome after its target tab changes', async () => {
+    const outcome = deferred<PingOutcome>();
+    vi.mocked(backend.pingCodexWindow)
+      .mockReturnValueOnce(outcome.promise)
+      .mockResolvedValueOnce({ kind: 'cliFailed', code: 'spawnFailed' });
+    const renderer = await renderApp();
+    await clickProvider(renderer, 'codex');
+
+    await act(async () => {
+      pingButton(renderer).props.onClick();
+      await flush();
+    });
+    expect(backend.pingCodexWindow).toHaveBeenCalledWith('default', false);
+    // Complete the tab round trip before the outcome lands: the clearing effect
+    // has already run, so only the generation check can drop the late outcome.
+    await clickProvider(renderer, 'claude');
+    await clickProvider(renderer, 'codex');
+    await act(async () => {
+      outcome.resolve({ kind: 'confirmationRequired' });
+      await flush();
+    });
+
+    expect(text(renderer)).not.toContain("Couldn't confirm window state. Send a ping anyway?");
+    await act(async () => {
+      pingButton(renderer).props.onClick();
+      await flush();
+    });
+    expect(backend.pingCodexWindow).toHaveBeenCalledTimes(2);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps a confirmation-required outcome on its unchanged target tab', async () => {
+    const outcome = deferred<PingOutcome>();
+    vi.mocked(backend.pingCodexWindow).mockReturnValue(outcome.promise);
+    const renderer = await renderApp();
+    await clickProvider(renderer, 'codex');
+
+    await act(async () => {
+      pingButton(renderer).props.onClick();
+      await flush();
+      outcome.resolve({ kind: 'confirmationRequired' });
+      await flush();
+    });
+
+    expect(text(renderer)).toContain("Couldn't confirm window state. Send a ping anyway?");
+    await act(async () => renderer.unmount());
+  });
+
   it('does not let an old result timer clear a newer result for the same target', async () => {
     const renderer = await renderApp();
     await act(async () => {
