@@ -1,12 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Capability for the main window; webview has no opener capability and Rust link.rs opens dashboard links",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default",
     "notification:default",
-    "autostart:default"
+    "autostart:default",
+    "opener:deny-open-url",
+    "opener:deny-open-path",
+    "opener:deny-reveal-item-in-dir"
   ]
 }
