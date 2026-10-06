@@ -1,5 +1,6 @@
 use crate::domain::models::{QuotaData, UsageInfo};
 use crate::services::http::{is_transient_os_error, shared_http_client};
+use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
 use std::path::Path;
@@ -12,9 +13,12 @@ use std::time::{Duration, Instant};
 const TOKEN_CACHE_TTL: Duration = Duration::from_secs(300);
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(120);
 const MAX_STALE_QUOTA_AGE: Duration = Duration::from_secs(15 * 60);
+const EXPIRY_SAFETY_WINDOW_MS: u64 = 60_000;
+const DEFAULT_RETRY_AFTER_SECS: u64 = 300;
+const CLAUDE_LOGIN_REFRESH_THROTTLE_MS: u64 = 60_000;
+const CLAUDE_LOGIN_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 const CLAUDE_TOKEN_ENV_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
-const CLAUDE_AUTH_RELOGIN_MESSAGE: &str =
-    "Claude OAuth token expired or invalid. Please re-login to Claude Code, then click Refresh.";
+const CLAUDE_AUTH_RELOGIN_MESSAGE: &str = "Claude Code login expired. Click Refresh to renew it.";
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 const CREDENTIAL_NAMES: [&str; 4] = [
@@ -145,6 +149,107 @@ fn quota_cache() -> &'static Mutex<Option<CachedQuota>> {
     QUOTA_CACHE.get_or_init(|| Mutex::new(None))
 }
 
+/// A remembered "401 after a forced re-read". Only the credential's expiry is
+/// kept; `expires_at_ms: None` means the failing credential had no expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AuthFailure {
+    expires_at_ms: Option<u64>,
+}
+
+#[derive(Default)]
+struct RequestGateState {
+    auth_failure: Option<AuthFailure>,
+    rate_limited_until: Option<u64>,
+}
+
+static REQUEST_GATE_STATE: OnceLock<Mutex<RequestGateState>> = OnceLock::new();
+static LAST_CLAUDE_LOGIN_REFRESH_AT: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+
+fn request_gate_state() -> &'static Mutex<RequestGateState> {
+    REQUEST_GATE_STATE.get_or_init(|| Mutex::new(RequestGateState::default()))
+}
+
+fn last_claude_login_refresh_at() -> &'static Mutex<Option<u64>> {
+    LAST_CLAUDE_LOGIN_REFRESH_AT.get_or_init(|| Mutex::new(None))
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QuotaRequestGate {
+    Allow,
+    AuthBlocked,
+    RateLimited,
+}
+
+/// Decides whether a quota HTTP request may be made without inspecting a
+/// credential or making any network call. The production path supplies the
+/// injectable wall clock value from `now_epoch_ms`.
+fn quota_request_gate(
+    now_ms: u64,
+    expires_at_ms: Option<u64>,
+    auth_failure: Option<AuthFailure>,
+    rate_limited_until: Option<u64>,
+) -> QuotaRequestGate {
+    if auth_failure.is_some_and(|failure| failure.expires_at_ms == expires_at_ms)
+        || expires_at_ms
+            .is_some_and(|expires| expires <= now_ms.saturating_add(EXPIRY_SAFETY_WINDOW_MS))
+    {
+        return QuotaRequestGate::AuthBlocked;
+    }
+    if rate_limited_until.is_some_and(|until| now_ms < until) {
+        return QuotaRequestGate::RateLimited;
+    }
+    QuotaRequestGate::Allow
+}
+
+fn retry_after_secs(value: Option<&reqwest::header::HeaderValue>) -> u64 {
+    value
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RETRY_AFTER_SECS)
+}
+
+fn rate_limited_until(now_ms: u64, retry_after_secs: u64) -> u64 {
+    now_ms.saturating_add(retry_after_secs.saturating_mul(1_000))
+}
+
+fn refresh_throttled(now_ms: u64, last_refresh_at_ms: Option<u64>) -> bool {
+    last_refresh_at_ms
+        .is_some_and(|last| now_ms.saturating_sub(last) < CLAUDE_LOGIN_REFRESH_THROTTLE_MS)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaudeLoginRefreshResult {
+    Refreshed,
+    Unchanged,
+    CliNotFound,
+    Failed,
+    Throttled,
+}
+
+fn login_refresh_result(
+    before_expires_at_ms: Option<u64>,
+    after_expires_at_ms: Option<u64>,
+    now_ms: u64,
+) -> ClaudeLoginRefreshResult {
+    if after_expires_at_ms
+        .is_some_and(|after| after > before_expires_at_ms.unwrap_or(0) && after > now_ms)
+    {
+        ClaudeLoginRefreshResult::Refreshed
+    } else {
+        ClaudeLoginRefreshResult::Unchanged
+    }
+}
+
 fn read_oauth_token_from_env() -> Option<String> {
     std::env::var(CLAUDE_TOKEN_ENV_KEY)
         .ok()
@@ -261,7 +366,7 @@ fn request_quota_diagnostic(access_token: &str, count: u64, gap: Option<f64>) ->
     )
 }
 
-fn get_oauth_token(force_refresh: bool) -> Result<String, String> {
+fn get_oauth_credentials(force_refresh: bool) -> Result<CachedCredentials, String> {
     log_msg(&format!(
         "[OAuth] get_oauth_token called, force_refresh={force_refresh}"
     ));
@@ -276,7 +381,7 @@ fn get_oauth_token(force_refresh: bool) -> Result<String, String> {
                         elapsed,
                         creds.expires_at_ms,
                     ));
-                    return Ok(creds.access_token.clone());
+                    return Ok(creds.clone());
                 } else {
                     log_msg(&format!(
                         "[OAuth] cache expired, age={:.0}s > ttl={:.0}s, re-reading credentials",
@@ -299,7 +404,11 @@ fn get_oauth_token(force_refresh: bool) -> Result<String, String> {
                 expires_at_ms: None,
             });
         }
-        return Ok(token);
+        return Ok(CachedCredentials {
+            access_token: token,
+            cached_at: Instant::now(),
+            expires_at_ms: None,
+        });
     }
 
     log_msg("[OAuth] reading from keychain...");
@@ -317,7 +426,11 @@ fn get_oauth_token(force_refresh: bool) -> Result<String, String> {
             expires_at_ms: keychain.expires_at_ms,
         });
     }
-    Ok(keychain.access_token)
+    Ok(CachedCredentials {
+        access_token: keychain.access_token,
+        cached_at: Instant::now(),
+        expires_at_ms: keychain.expires_at_ms,
+    })
 }
 
 async fn request_quota(access_token: &str) -> Result<reqwest::Response, String> {
@@ -485,18 +598,156 @@ fn fallback_or_disconnected(error: String) -> QuotaData {
     QuotaData::disconnected(error)
 }
 
+fn gate_error(gate: QuotaRequestGate) -> QuotaData {
+    match gate {
+        QuotaRequestGate::AuthBlocked => {
+            stale_or_disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE.to_string())
+        }
+        QuotaRequestGate::RateLimited => {
+            stale_or_disconnected("API error: 429 Too Many Requests".to_string())
+        }
+        QuotaRequestGate::Allow => unreachable!("allow does not have a gate error"),
+    }
+}
+
+fn gate_snapshot() -> (Option<AuthFailure>, Option<u64>) {
+    request_gate_state()
+        .lock()
+        .map(|state| (state.auth_failure, state.rate_limited_until))
+        .unwrap_or((None, None))
+}
+
+fn clear_auth_gate() {
+    if let Ok(mut state) = request_gate_state().lock() {
+        state.auth_failure = None;
+    }
+}
+
+fn clear_auth_gate_if_refreshed(expires_at_ms: Option<u64>, failure: Option<AuthFailure>) {
+    if failure.is_some_and(|failure| failure.expires_at_ms != expires_at_ms) {
+        clear_auth_gate();
+    }
+}
+
+fn remember_auth_failure(expires_at_ms: Option<u64>) {
+    if let Ok(mut state) = request_gate_state().lock() {
+        state.auth_failure = Some(AuthFailure { expires_at_ms });
+    }
+}
+
+/// Whether `fetch_quota` must read credentials and consult the gate before
+/// anything else (including the response cache). Reading credentials is local;
+/// it lets an expired login outrank an active 429 window.
+fn request_gate_active(
+    now_ms: u64,
+    auth_failure: Option<AuthFailure>,
+    rate_limited_until: Option<u64>,
+) -> bool {
+    auth_failure.is_some() || rate_limited_until.is_some_and(|until| now_ms < until)
+}
+
+fn remember_rate_limit(retry_after: u64) {
+    if let Ok(mut state) = request_gate_state().lock() {
+        state.rate_limited_until = Some(rate_limited_until(now_epoch_ms(), retry_after));
+    }
+}
+
+fn read_credentials(force_refresh: bool) -> Result<CachedCredentials, String> {
+    get_oauth_credentials(force_refresh)
+}
+
+pub async fn refresh_claude_login() -> ClaudeLoginRefreshResult {
+    let now_ms = now_epoch_ms();
+    {
+        let Ok(mut last_refresh_at) = last_claude_login_refresh_at().lock() else {
+            return ClaudeLoginRefreshResult::Failed;
+        };
+        if refresh_throttled(now_ms, *last_refresh_at) {
+            return ClaudeLoginRefreshResult::Throttled;
+        }
+        *last_refresh_at = Some(now_ms);
+    }
+
+    let Some(_flight) = crate::services::window_ping::ClaudeFlight::acquire() else {
+        return ClaudeLoginRefreshResult::Throttled;
+    };
+
+    let command = match crate::services::window_ping::build_claude_auth_status_command() {
+        Ok(command) => command,
+        Err(crate::services::window_ping::ClaudeAuthCommandError::CliNotFound) => {
+            return ClaudeLoginRefreshResult::CliNotFound;
+        }
+        Err(crate::services::window_ping::ClaudeAuthCommandError::Setup) => {
+            return ClaudeLoginRefreshResult::Failed;
+        }
+    };
+    let before = match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
+        Ok(Ok(credentials)) => credentials.expires_at_ms,
+        _ => return ClaudeLoginRefreshResult::Failed,
+    };
+    match crate::services::window_ping::run_child_discarding_output_without_blocking(
+        command,
+        CLAUDE_LOGIN_REFRESH_TIMEOUT,
+    )
+    .await
+    {
+        crate::services::window_ping::ChildResult::Success(_) => {}
+        crate::services::window_ping::ChildResult::Nonzero
+        | crate::services::window_ping::ChildResult::Timeout
+        | crate::services::window_ping::ChildResult::SpawnFailed => {
+            return ClaudeLoginRefreshResult::Failed;
+        }
+    }
+    let after = match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
+        Ok(Ok(credentials)) => credentials.expires_at_ms,
+        _ => return ClaudeLoginRefreshResult::Failed,
+    };
+    let result = login_refresh_result(before, after, now_epoch_ms());
+    // Without an expiry the refresh cannot be observed; allow one more attempt.
+    if result == ClaudeLoginRefreshResult::Refreshed || after.is_none() {
+        clear_auth_gate();
+    }
+    result
+}
+
 pub async fn fetch_quota() -> QuotaData {
     log_msg("[Quota] ---- fetch_quota start ----");
 
-    // Return cached response if still fresh
+    let (auth_failure, rate_limited_until) = gate_snapshot();
+    if request_gate_active(now_epoch_ms(), auth_failure, rate_limited_until) {
+        // Local credential read first, so an expired login outranks the 429 window.
+        let force_refresh = auth_failure.is_some();
+        let credentials =
+            match tauri::async_runtime::spawn_blocking(move || read_credentials(force_refresh))
+                .await
+            {
+                Ok(Ok(credentials)) => credentials,
+                Ok(Err(error)) => return fallback_or_disconnected(error),
+                Err(error) => {
+                    return fallback_or_disconnected(format!("OAuth token task failed: {error}"))
+                }
+            };
+        clear_auth_gate_if_refreshed(credentials.expires_at_ms, auth_failure);
+        let gate = quota_request_gate(
+            now_epoch_ms(),
+            credentials.expires_at_ms,
+            auth_failure,
+            rate_limited_until,
+        );
+        if gate != QuotaRequestGate::Allow {
+            return gate_error(gate);
+        }
+    }
+
+    // Return cached response only after active request gates have been checked.
     if let Some(cached) = get_cached_quota() {
         return cached;
     }
 
-    let access_token = match tauri::async_runtime::spawn_blocking(|| get_oauth_token(false)).await {
-        Ok(Ok(token)) => token,
+    let credentials = match tauri::async_runtime::spawn_blocking(|| read_credentials(false)).await {
+        Ok(Ok(credentials)) => credentials,
         Ok(Err(error)) => {
-            log_msg(&format!("[Quota] get_oauth_token failed: {error}"));
+            log_msg(&format!("[Quota] credential read failed: {error}"));
             return fallback_or_disconnected(error);
         }
         Err(error) => {
@@ -505,7 +756,18 @@ pub async fn fetch_quota() -> QuotaData {
         }
     };
 
-    let mut response = match request_quota(&access_token).await {
+    let (auth_failure, rate_limited_until) = gate_snapshot();
+    let gate = quota_request_gate(
+        now_epoch_ms(),
+        credentials.expires_at_ms,
+        auth_failure,
+        rate_limited_until,
+    );
+    if gate != QuotaRequestGate::Allow {
+        return gate_error(gate);
+    }
+
+    let mut response = match request_quota(&credentials.access_token).await {
         Ok(resp) => resp,
         Err(error) => {
             log_msg(&format!("[Quota] initial request failed: {error}"));
@@ -519,6 +781,7 @@ pub async fn fetch_quota() -> QuotaData {
     // 429: return stale cache data if available, but always include error
     // so the frontend can trigger adaptive backoff
     if is_rate_limited(status) {
+        remember_rate_limit(retry_after_secs(response.headers().get("retry-after")));
         log_msg("[Quota] 429 rate limited, returning stale cache if available");
         if let Some(stale) = get_stale_cached_quota() {
             return mark_quota_fetch_error(stale, "API error: 429 Too Many Requests".to_string());
@@ -530,9 +793,9 @@ pub async fn fetch_quota() -> QuotaData {
         log_msg(&format!(
             "[Quota] auth error ({status}), step 1: force re-read from keychain"
         ));
-        let fresh_access_token =
-            match tauri::async_runtime::spawn_blocking(|| get_oauth_token(true)).await {
-                Ok(Ok(token)) => token,
+        let fresh_credentials =
+            match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
+                Ok(Ok(credentials)) => credentials,
                 Ok(Err(error)) => {
                     log_msg(&format!("[Quota] keychain re-read failed: {error}"));
                     return fallback_or_disconnected(error);
@@ -543,7 +806,20 @@ pub async fn fetch_quota() -> QuotaData {
                 }
             };
 
-        response = match request_quota(&fresh_access_token).await {
+        // The re-read credential passes the same gate before the second request.
+        let (auth_failure, rate_limited_until) = gate_snapshot();
+        let gate = quota_request_gate(
+            now_epoch_ms(),
+            fresh_credentials.expires_at_ms,
+            auth_failure,
+            rate_limited_until,
+        );
+        if gate != QuotaRequestGate::Allow {
+            log_msg("[Quota] re-read credential blocked by request gate; skipping retry");
+            return gate_error(gate);
+        }
+
+        response = match request_quota(&fresh_credentials.access_token).await {
             Ok(resp) => resp,
             Err(error) => {
                 log_msg(&format!(
@@ -559,6 +835,7 @@ pub async fn fetch_quota() -> QuotaData {
         ));
 
         if is_rate_limited(status2) {
+            remember_rate_limit(retry_after_secs(response.headers().get("retry-after")));
             log_msg("[Quota] 429 after keychain retry, returning stale cache");
             if let Some(stale) = get_stale_cached_quota() {
                 return mark_quota_fetch_error(
@@ -573,7 +850,8 @@ pub async fn fetch_quota() -> QuotaData {
             log_msg(&format!(
                 "[Quota] auth error ({status2}) after keychain re-read; stopping until Claude Code login is refreshed"
             ));
-            return QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE);
+            remember_auth_failure(fresh_credentials.expires_at_ms);
+            return stale_or_disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE.to_string());
         }
     }
 
@@ -642,10 +920,13 @@ pub async fn fetch_quota() -> QuotaData {
 #[cfg(test)]
 mod tests {
     use super::{
-        mark_quota_fetch_error, oauth_cache_hit_diagnostic, oauth_env_source_diagnostic,
-        oauth_keychain_source_diagnostic, parse_first_quota_window, parse_quota_window,
-        parse_weekly_scoped_model_quota, request_quota_diagnostic, stale_quota_usable,
-        FABLE5_QUOTA_KEYS, MAX_STALE_QUOTA_AGE,
+        login_refresh_result, mark_quota_fetch_error, oauth_cache_hit_diagnostic,
+        oauth_env_source_diagnostic, oauth_keychain_source_diagnostic, parse_first_quota_window,
+        parse_quota_window, parse_weekly_scoped_model_quota, quota_request_gate,
+        rate_limited_until, refresh_throttled, request_gate_active, request_quota_diagnostic,
+        retry_after_secs, stale_quota_usable, AuthFailure, ClaudeLoginRefreshResult,
+        QuotaRequestGate, DEFAULT_RETRY_AFTER_SECS, EXPIRY_SAFETY_WINDOW_MS, FABLE5_QUOTA_KEYS,
+        MAX_STALE_QUOTA_AGE,
     };
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -803,6 +1084,124 @@ mod tests {
             stale.error.as_deref(),
             Some("Network error: connection reset")
         );
+    }
+
+    #[test]
+    fn quota_gate_blocks_expired_or_near_expiry_credentials_without_a_request() {
+        let now = 1_000_000;
+        assert_eq!(
+            quota_request_gate(now, Some(now), None, None),
+            QuotaRequestGate::AuthBlocked
+        );
+        assert_eq!(
+            quota_request_gate(now, Some(now + EXPIRY_SAFETY_WINDOW_MS), None, None),
+            QuotaRequestGate::AuthBlocked
+        );
+        assert_eq!(
+            quota_request_gate(now, Some(now + 3_600_000), None, None),
+            QuotaRequestGate::Allow
+        );
+        assert_eq!(
+            quota_request_gate(now, None, None, None),
+            QuotaRequestGate::Allow
+        );
+    }
+
+    #[test]
+    fn quota_gate_requires_a_changed_expiry_after_an_auth_failure() {
+        let now = 1_000_000;
+        assert_eq!(
+            quota_request_gate(
+                now,
+                Some(now + 3_600_000),
+                failure(Some(now + 3_600_000)),
+                None
+            ),
+            QuotaRequestGate::AuthBlocked
+        );
+        assert_eq!(
+            quota_request_gate(
+                now,
+                Some(now + 7_200_000),
+                failure(Some(now + 3_600_000)),
+                None
+            ),
+            QuotaRequestGate::Allow
+        );
+        // A failing credential without an expiry stays blocked while it is unchanged.
+        assert_eq!(
+            quota_request_gate(now, None, failure(None), None),
+            QuotaRequestGate::AuthBlocked
+        );
+        assert_eq!(
+            quota_request_gate(now, Some(now + 3_600_000), failure(None), None),
+            QuotaRequestGate::Allow
+        );
+    }
+
+    fn failure(expires_at_ms: Option<u64>) -> Option<AuthFailure> {
+        Some(AuthFailure { expires_at_ms })
+    }
+
+    #[test]
+    fn request_gate_reads_credentials_first_whenever_a_gate_is_active() {
+        let now = 1_000_000;
+        assert!(!request_gate_active(now, None, None));
+        assert!(!request_gate_active(now, None, Some(now)));
+        assert!(request_gate_active(now, None, Some(now + 1)));
+        assert!(request_gate_active(now, failure(None), None));
+        // Expired credential during an active 429 window reports the auth error.
+        assert_eq!(
+            quota_request_gate(now, Some(now - 1), None, Some(now + 120_000)),
+            QuotaRequestGate::AuthBlocked
+        );
+    }
+
+    #[test]
+    fn quota_gate_observes_retry_after_and_auth_has_priority() {
+        let now = 1_000_000;
+        let until = rate_limited_until(now, 120);
+        assert_eq!(
+            quota_request_gate(now, None, None, Some(until)),
+            QuotaRequestGate::RateLimited
+        );
+        assert_eq!(
+            quota_request_gate(until, None, None, Some(until)),
+            QuotaRequestGate::Allow
+        );
+        assert_eq!(
+            quota_request_gate(
+                now,
+                Some(now + 3_600_000),
+                failure(Some(now + 3_600_000)),
+                Some(until)
+            ),
+            QuotaRequestGate::AuthBlocked
+        );
+        let seconds = reqwest::header::HeaderValue::from_static("120");
+        assert_eq!(retry_after_secs(Some(&seconds)), 120);
+        assert_eq!(retry_after_secs(None), DEFAULT_RETRY_AFTER_SECS);
+        let invalid = reqwest::header::HeaderValue::from_static("not-seconds");
+        assert_eq!(retry_after_secs(Some(&invalid)), DEFAULT_RETRY_AFTER_SECS);
+    }
+
+    #[test]
+    fn refresh_login_decision_requires_a_future_increased_expiry_and_throttles() {
+        let now = 1_000_000;
+        assert_eq!(
+            login_refresh_result(Some(now + 1), Some(now + 2), now),
+            ClaudeLoginRefreshResult::Refreshed
+        );
+        assert_eq!(
+            login_refresh_result(Some(now + 1), Some(now + 1), now),
+            ClaudeLoginRefreshResult::Unchanged
+        );
+        assert_eq!(
+            login_refresh_result(Some(now + 1), Some(now), now),
+            ClaudeLoginRefreshResult::Unchanged
+        );
+        assert!(refresh_throttled(now + 59_999, Some(now)));
+        assert!(!refresh_throttled(now + 60_000, Some(now)));
     }
 
     #[test]

@@ -4,6 +4,7 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Prevent repeated Claude quota requests after expired OAuth credentials or 429 responses, and let manual Refresh ask Claude Code to renew its own login.
 - Show each Claude quota card's valid future reset time alongside its relative reset countdown.
 - Remove webview opener permissions and route dashboard links exclusively through Rust.
 - Drop a late Ping "send anyway?" confirmation when its tab or account changed while the request was in flight, so a cleared confirmation no longer reappears.
