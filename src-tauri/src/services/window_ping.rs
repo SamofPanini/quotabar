@@ -569,6 +569,17 @@ async fn run_child_without_blocking(command: Command, timeout: Duration) -> Chil
         .unwrap_or(ChildResult::SpawnFailed)
 }
 
+pub(crate) async fn run_child_discarding_output_without_blocking(
+    command: Command,
+    timeout: Duration,
+) -> ChildResult {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_child_with_output(command, timeout, || {}, false)
+    })
+    .await
+    .unwrap_or(ChildResult::SpawnFailed)
+}
+
 fn codex_tokens(stdout: &[u8]) -> Option<u64> {
     for line in stdout.split(|byte| *byte == b'\n') {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -638,6 +649,30 @@ fn build_claude_command() -> Result<Command, PingOutcome> {
     // PING1: multi-account = CLAUDE_CONFIG_DIR per profile; gated on Claude multi-account acquisition
     command.args(claude_args());
     Ok(command)
+}
+
+/// Builds the silent maintenance command used to let Claude Code renew its
+/// own login. Its output may include local paths, so it is deliberately
+/// discarded rather than captured or logged.
+pub(crate) fn build_claude_doctor_command() -> Result<Command, PingOutcome> {
+    let Some(binary) = claude_cli() else {
+        return Err(PingOutcome::CliNotFound { cli: "claude" });
+    };
+    let Ok(cwd) = ping_cwd() else {
+        return Err(PingOutcome::CliFailed {
+            code: "spawnFailed",
+        });
+    };
+    Ok(build_claude_doctor_command_for(&binary, &cwd))
+}
+
+fn build_claude_doctor_command_for(binary: &Path, cwd: &Path) -> Command {
+    let mut command = clean_command(binary, cwd, None);
+    command
+        .arg("doctor")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 async fn ping_codex_core(
@@ -2155,6 +2190,27 @@ mod tests {
         assert!(matches!(
             run_child(command, Duration::from_secs(1)),
             ChildResult::Success(_)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_doctor_command_uses_silent_ping_environment() {
+        let root = temp_root("doctor-command");
+        let cwd = root.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let cli = fake_cli(&root, "claude", "printf stdout; printf stderr >&2");
+        let command = build_claude_doctor_command_for(&cli, &cwd);
+
+        assert_eq!(command.get_program(), cli.as_os_str());
+        assert_eq!(command.get_args().collect::<Vec<_>>(), vec!["doctor"]);
+        assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
+        assert!(matches!(
+            tauri::async_runtime::block_on(run_child_discarding_output_without_blocking(
+                command,
+                Duration::from_secs(1)
+            )),
+            ChildResult::Success(output) if output.is_empty()
         ));
         let _ = fs::remove_dir_all(root);
     }
