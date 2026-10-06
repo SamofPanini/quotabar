@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   AntigravityData,
+  ClaudeLoginRefreshResult,
   ClaudeCurrentSnapshots,
   CodexData,
   CodexProfilesResponse,
@@ -43,6 +44,10 @@ export function normalizeTrayIpcPercentage(percentage: number | null): number | 
 export const backend = {
   getQuota() {
     return invokeBackend<QuotaData>('get_quota');
+  },
+
+  refreshClaudeLogin() {
+    return invokeBackend<ClaudeLoginRefreshResult>('refresh_claude_login');
   },
 
   getClaudeCurrentSnapshots() {

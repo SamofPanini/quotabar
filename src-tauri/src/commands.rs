@@ -17,6 +17,11 @@ pub async fn get_quota() -> Result<QuotaData, String> {
     Ok(claude::fetch_quota().await)
 }
 
+#[tauri::command]
+pub async fn refresh_claude_login() -> Result<claude::ClaudeLoginRefreshResult, String> {
+    Ok(claude::refresh_claude_login().await)
+}
+
 fn profile_for_ping(
     alias: &str,
     primary_dir: &std::path::Path,

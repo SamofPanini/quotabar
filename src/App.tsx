@@ -59,7 +59,7 @@ import {
   saveMenuBarQuotaWindow,
   type MenuBarQuotaWindow,
 } from './services/codex_tray_window';
-import type { PingOutcome, QuotaData } from './types/models';
+import type { ClaudeLoginRefreshResult, PingOutcome, QuotaData } from './types/models';
 import {
   claudePingWindowState,
   codexPingWindowState,
@@ -86,6 +86,7 @@ import {
   getClaudeRefreshIntervalMs,
   getClaudeTrayUsedPercent,
   getClaudeTrayUsedPercentForWindow,
+  isClaudeAuthError,
   keepClaudeQuotaOnError,
   getInitialTrayEnabledState,
   getSavedDockHidden,
@@ -157,6 +158,16 @@ export function subscribeStorageReadFailureToast(
   });
 }
 
+export function claudeLoginRefreshMessageFor(result: ClaudeLoginRefreshResult): string | null {
+  switch (result) {
+    case 'refreshed': return null;
+    case 'unchanged': return 'Claude Code login is still expired. Open Claude Code and send a message, then click Refresh.';
+    case 'cliNotFound': return 'Claude Code CLI not found. Sign in to Claude Code, then click Refresh.';
+    case 'failed':
+    case 'throttled': return "Couldn't renew the Claude Code login. Try again in a minute.";
+  }
+}
+
 export default function App() {
   const isMacOS = isMacOSPlatform();
 
@@ -164,6 +175,7 @@ export default function App() {
   const [quota, setQuota] = useState<QuotaData | null>(null);
   const [claudeLoading, setClaudeLoading] = useState(false);
   const [claudeError, setClaudeError] = useState<string | null>(null);
+  const [claudeLoginRefreshMessage, setClaudeLoginRefreshMessage] = useState<string | null>(null);
   const [claudeCostRefreshNonce, setClaudeCostRefreshNonce] = useState(0);
   const [codexPingContext, setCodexPingContext] = useState<CodexPingContext | null>(null);
   const [pingInFlight, setPingInFlight] = useState<Record<string, true>>({});
@@ -360,6 +372,7 @@ export default function App() {
       } else {
         setQuota(data);
         setClaudeError(null);
+        setClaudeLoginRefreshMessage(null);
         claudeIntervalRef.current = AUTO_REFRESH_INTERVAL_MS;
       }
       setServiceConnected('claude', data.connected);
@@ -650,9 +663,23 @@ export default function App() {
   const activeProvider = isProviderTab(activeView) ? activeView : lastProviderTab;
   const activeTab: TabName = activeView === 'all' ? 'all' : activeProvider;
 
+  const refreshClaudeQuota = useCallback(async () => {
+    if (claudeError && isClaudeAuthError(claudeError)) {
+      try {
+        const result = await backend.refreshClaudeLogin();
+        setClaudeLoginRefreshMessage(claudeLoginRefreshMessageFor(result));
+      } catch {
+        setClaudeLoginRefreshMessage(claudeLoginRefreshMessageFor('failed'));
+      }
+    } else {
+      setClaudeLoginRefreshMessage(null);
+    }
+    await fetchClaudeQuota();
+  }, [claudeError, fetchClaudeQuota]);
+
   const handleRefresh = useCallback(() => {
     if (activeView === 'all') {
-      fetchClaudeQuota();
+      void refreshClaudeQuota();
       setClaudeCostRefreshNonce((value) => value + 1);
       setRefreshNonces((prev) => {
         const next = { ...prev };
@@ -664,12 +691,12 @@ export default function App() {
       return;
     }
     if (activeProvider === 'claude') {
-      fetchClaudeQuota();
+      void refreshClaudeQuota();
       setClaudeCostRefreshNonce((value) => value + 1);
       return;
     }
     setRefreshNonces((prev) => ({ ...prev, [activeProvider]: prev[activeProvider] + 1 }));
-  }, [activeProvider, activeView, fetchClaudeQuota]);
+  }, [activeProvider, activeView, refreshClaudeQuota]);
 
   const showPingResult = useCallback((target: PingTarget, message: string) => {
     const key = pingTargetKey(target);
@@ -941,7 +968,9 @@ export default function App() {
                 <ClaudePanel
                   quota={quota}
                   loading={claudeLoading}
-                  error={claudeError}
+                  error={claudeError && isClaudeAuthError(claudeError)
+                    ? claudeLoginRefreshMessage ?? claudeError
+                    : claudeError}
                   windowVisible={windowVisible}
                   costRefreshKey={claudeCostRefreshNonce}
                   onRetry={handleRefresh}

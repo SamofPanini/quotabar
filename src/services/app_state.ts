@@ -168,12 +168,13 @@ export function getClaudeTrayUsedPercentForWindow(
     : null;
 }
 
-function isClaudeAuthError(error: string): boolean {
+export function isClaudeAuthError(error: string): boolean {
   const normalized = error.toLowerCase();
   return (
     normalized.includes('oauth token') ||
     normalized.includes('re-login') ||
     normalized.includes('login to claude code') ||
+    normalized.includes('claude code login expired') ||
     normalized.includes('token expired') ||
     normalized.includes('expired or invalid') ||
     normalized.includes('401') ||

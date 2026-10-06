@@ -266,9 +266,9 @@ impl Drop for CodexFlight {
     }
 }
 
-struct ClaudeFlight;
+pub(crate) struct ClaudeFlight;
 impl ClaudeFlight {
-    fn acquire() -> Option<Self> {
+    pub(crate) fn acquire() -> Option<Self> {
         let mut busy = CLAUDE_IN_FLIGHT.lock().ok()?;
         if *busy {
             return None;
@@ -374,7 +374,7 @@ fn codex_cli() -> Option<PathBuf> {
     first_executable(cli_candidates(&home, &CODEX_CLI_CANDIDATES))
 }
 
-fn claude_cli() -> Option<PathBuf> {
+pub(crate) fn claude_cli() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     first_executable(cli_candidates(&home, &CLAUDE_CLI_CANDIDATES))
 }
@@ -398,6 +398,24 @@ fn clean_command(binary: &Path, cwd: &Path, codex_home: Option<&Path>) -> Comman
         command.env("CODEX_HOME", home);
     }
     command
+}
+
+/// Builds the credential-refresh status check with the same CLI discovery and
+/// sanitized environment as Claude Ping. Its output is deliberately discarded.
+pub(crate) enum ClaudeAuthCommandError {
+    CliNotFound,
+    Setup,
+}
+
+pub(crate) fn build_claude_auth_status_command() -> Result<Command, ClaudeAuthCommandError> {
+    let binary = claude_cli().ok_or(ClaudeAuthCommandError::CliNotFound)?;
+    let cwd = ping_cwd().map_err(|_| ClaudeAuthCommandError::Setup)?;
+    let mut command = clean_command(&binary, &cwd, None);
+    command
+        .args(["auth", "status", "--json"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
 }
 
 fn codex_args(cwd: &Path) -> Vec<String> {
@@ -457,7 +475,7 @@ fn claude_args() -> Vec<String> {
     ]
 }
 
-enum ChildResult {
+pub(crate) enum ChildResult {
     Success(Vec<u8>),
     Nonzero,
     Timeout,
@@ -475,23 +493,37 @@ fn run_child(command: Command, timeout: Duration) -> ChildResult {
     run_child_after_arm(command, timeout, || {})
 }
 
-fn run_child_after_arm(mut command: Command, timeout: Duration, arm: impl FnOnce()) -> ChildResult {
+fn run_child_after_arm(command: Command, timeout: Duration, arm: impl FnOnce()) -> ChildResult {
+    run_child_with_output(command, timeout, arm, true)
+}
+
+fn run_child_with_output(
+    mut command: Command,
+    timeout: Duration,
+    arm: impl FnOnce(),
+    capture_stdout: bool,
+) -> ChildResult {
     #[cfg(unix)]
     command.process_group(0);
     let Ok(mut child) = command.spawn() else {
         return ChildResult::SpawnFailed;
     };
     let pid = child.id();
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_process_group(pid);
-        let _ = child.wait();
-        return ChildResult::SpawnFailed;
+    let stdout_receiver = if capture_stdout {
+        let Some(mut stdout) = child.stdout.take() else {
+            terminate_process_group(pid);
+            let _ = child.wait();
+            return ChildResult::SpawnFailed;
+        };
+        let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = stdout_sender.send(stdout.read_to_end(&mut output).map(|_| output));
+        });
+        Some(stdout_receiver)
+    } else {
+        None
     };
-    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        let _ = stdout_sender.send(stdout.read_to_end(&mut output).map(|_| output));
-    });
     arm();
     let started = Instant::now();
     loop {
@@ -500,9 +532,14 @@ fn run_child_after_arm(mut command: Command, timeout: Duration, arm: impl FnOnce
                 if !status.success() {
                     terminate_process_group(pid);
                     let _ = child.wait();
-                    let _ = stdout_receiver.recv_timeout(Duration::from_secs(2));
+                    if let Some(receiver) = &stdout_receiver {
+                        let _ = receiver.recv_timeout(Duration::from_secs(2));
+                    }
                     return ChildResult::Nonzero;
                 }
+                let Some(stdout_receiver) = stdout_receiver else {
+                    return ChildResult::Success(Vec::new());
+                };
                 let remaining = timeout.saturating_sub(started.elapsed());
                 return match stdout_receiver.recv_timeout(remaining) {
                     Ok(Ok(output)) => ChildResult::Success(output),
@@ -518,14 +555,18 @@ fn run_child_after_arm(mut command: Command, timeout: Duration, arm: impl FnOnce
             Ok(None) if started.elapsed() >= timeout => {
                 terminate_process_group(pid);
                 let _ = child.wait();
-                let _ = stdout_receiver.recv_timeout(Duration::from_secs(2));
+                if let Some(receiver) = &stdout_receiver {
+                    let _ = receiver.recv_timeout(Duration::from_secs(2));
+                }
                 return ChildResult::Timeout;
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(_) => {
                 terminate_process_group(pid);
                 let _ = child.wait();
-                let _ = stdout_receiver.recv_timeout(Duration::from_secs(2));
+                if let Some(receiver) = &stdout_receiver {
+                    let _ = receiver.recv_timeout(Duration::from_secs(2));
+                }
                 return ChildResult::SpawnFailed;
             }
         }
@@ -540,6 +581,20 @@ async fn run_child_without_blocking(command: Command, timeout: Duration) -> Chil
     tauri::async_runtime::spawn_blocking(move || run_child(command, timeout))
         .await
         .unwrap_or(ChildResult::SpawnFailed)
+}
+
+/// Uses Ping's process-group timeout mechanism while deliberately discarding
+/// both output streams. `auth status` is used only for Claude Code's own
+/// credential refresh side effect; QuotaBar never consumes its output.
+pub(crate) async fn run_child_discarding_output_without_blocking(
+    command: Command,
+    timeout: Duration,
+) -> ChildResult {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_child_with_output(command, timeout, || {}, false)
+    })
+    .await
+    .unwrap_or(ChildResult::SpawnFailed)
 }
 
 fn codex_tokens(stdout: &[u8]) -> Option<u64> {

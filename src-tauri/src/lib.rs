@@ -47,6 +47,7 @@ pub fn run() {
         .manage(TrayState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_quota,
+            commands::refresh_claude_login,
             commands::get_claude_current_snapshots,
             commands::get_codex_info,
             commands::get_codex_rate_limits,
