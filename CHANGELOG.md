@@ -4,10 +4,11 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Let Claude Ping renew an expired Claude Code login, while Refresh only re-reads local credentials.
 - Position the tray popover on the display whose menu-bar icon was clicked, including mixed-scale macOS setups.
 - Make macOS app install, stop, and relaunch scripts transactional and restrict stopping to the selected app bundle.
 - Compact the footer status and return Ping after its first confirmation read while reporting final window confirmation in the background.
-- Prevent repeated Claude quota requests after expired OAuth credentials or 429 responses, and let manual Refresh ask Claude Code to renew its own login.
+- Prevent repeated Claude quota requests after expired OAuth credentials or 429 responses.
 - Show each Claude quota card's valid future reset time alongside its relative reset countdown.
 - Remove webview opener permissions and route dashboard links exclusively through Rust.
 - Drop a late Ping "send anyway?" confirmation when its tab or account changed while the request was in flight, so a cleared confirmation no longer reappears.

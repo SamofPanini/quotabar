@@ -16,7 +16,7 @@ export interface QuotaData {
   error?: string;
 }
 
-export type ClaudeLoginRefreshResult = 'refreshed' | 'unchanged' | 'cliNotFound' | 'failed' | 'throttled';
+export type ClaudeLoginRefreshResult = 'refreshed' | 'unchanged' | 'failed';
 
 /** Read-only C3-A projection. It intentionally omits binding, sequence, source, and path data. */
 export type ClaudeBindingState = 'unbound' | 'bound' | 'unverified' | 'error';
@@ -116,7 +116,7 @@ export type PingOutcome =
   | { kind: 'blocked' }
   | { kind: 'busy' }
   | { kind: 'cliNotFound'; cli: 'codex' | 'claude' }
-  | { kind: 'cliFailed'; code: 'nonzeroExit' | 'noCompletion' | 'timeout' | 'spawnFailed' | 'confirmationAborted' }
+  | { kind: 'cliFailed'; code: 'nonzeroExit' | 'noCompletion' | 'timeout' | 'spawnFailed' | 'confirmationAborted' | 'renewFailed' }
   | { kind: 'profileUnavailable' }
   | { kind: 'quotaUnreadable' }
   | { kind: 'confirmationRequired' };

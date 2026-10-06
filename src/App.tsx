@@ -161,10 +161,8 @@ export function subscribeStorageReadFailureToast(
 export function claudeLoginRefreshMessageFor(result: ClaudeLoginRefreshResult): string | null {
   switch (result) {
     case 'refreshed': return null;
-    case 'unchanged': return 'Claude Code login is still expired. Open Claude Code and send a message, then click Refresh.';
-    case 'cliNotFound': return 'Claude Code CLI not found. Sign in to Claude Code, then click Refresh.';
-    case 'failed':
-    case 'throttled': return "Couldn't renew the Claude Code login. Try again in a minute.";
+    case 'unchanged': return 'Claude Code login is still expired. Press Ping to renew it.';
+    case 'failed': return "Couldn't read the Claude Code login. Try again.";
   }
 }
 
@@ -745,7 +743,9 @@ export default function App() {
       case 'busy': return 'Ping failed · busy';
       case 'quotaUnreadable': return 'Ping failed · quota unavailable';
       case 'profileUnavailable': return 'Ping failed · profile unavailable';
-      case 'cliFailed': return `Ping failed · ${outcome.code}`;
+      case 'cliFailed': return outcome.code === 'renewFailed'
+        ? 'Renew failed · sign in to Claude Code in Terminal'
+        : `Ping failed · ${outcome.code}`;
       case 'confirmationRequired': return "Couldn't confirm window state. Send a ping anyway?";
     }
   }, []);
@@ -764,6 +764,7 @@ export default function App() {
       ? 'Ordinary usage blocked — ping would not open a window'
       : !codexPingContext?.available ? (codexPingContext?.unavailableReason ?? 'Quota unavailable') : undefined
     : pingProvider === 'claude' && (!quota?.connected || Boolean(claudeError))
+      && !(claudeError && isClaudeAuthError(claudeError))
       ? (claudeError ?? 'Claude quota unavailable') : undefined;
   const pingCurrentInFlight = currentPingKey != null && Boolean(pingInFlight[currentPingKey]);
   const pingCurrentConfirming = currentPingKey != null && Boolean(pingConfirming[currentPingKey]);
@@ -845,6 +846,17 @@ export default function App() {
 
   const handlePing = useCallback(() => {
     if (pingDisabledReason || pingTarget == null) return;
+    if (pingTarget.provider === 'claude' && claudeError && isClaudeAuthError(claudeError)) {
+      const key = pingTargetKey(pingTarget);
+      setPingConfirmations((previous) => ({
+        ...previous,
+        [key]: {
+          ...pingTarget,
+          message: 'Claude Code login expired. Send a ping to renew it? This starts a 5-hour window.',
+        },
+      }));
+      return;
+    }
     if (pingWindowState === 'closed') {
       void runPing(pingTarget, false);
       return;
@@ -857,7 +869,7 @@ export default function App() {
       : "Couldn't confirm window state. Send a ping anyway?";
     const key = pingTargetKey(pingTarget);
     setPingConfirmations((previous) => ({ ...previous, [key]: { ...pingTarget, message } }));
-  }, [codexPingContext?.limits?.primary?.resetsAt, pingDisabledReason, pingTarget, pingWindowState, quota?.session?.resetTime, runPing]);
+  }, [claudeError, codexPingContext?.limits?.primary?.resetsAt, pingDisabledReason, pingTarget, pingWindowState, quota?.session?.resetTime, runPing]);
 
   const handleOpenDashboard = useCallback(async () => {
     try {
@@ -1100,7 +1112,9 @@ export default function App() {
               onPing={handlePing}
               pingState={pingCurrentConfirming ? 'confirming' : pingCurrentInFlight ? 'inFlight' : 'idle'}
               pingDisabledReason={pingDisabledReason}
-              pingTitle={`Ping ${pingAlias} — start 5-hour window`}
+              pingTitle={pingProvider === 'claude' && claudeError && isClaudeAuthError(claudeError)
+                ? 'Renew Claude Code login — sends a ping (starts a 5-hour window)'
+                : `Ping ${pingAlias} — start 5-hour window`}
               pingConfirmText={visiblePingConfirmation?.message}
               onPingConfirm={() => {
                 if (visiblePingConfirmation) void runPing(visiblePingConfirmation, true);
