@@ -3,7 +3,9 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App';
 import { backend } from '../src/services/backend';
-import type { CodexProfilesResponse, PingOutcome } from '../src/types/models';
+import type { CodexProfilesResponse, PingConfirmationEvent, PingOutcome } from '../src/types/models';
+
+let pingConfirmationHandler: ((event: PingConfirmationEvent) => void) | undefined;
 
 vi.mock('../src/hooks/use_popover_window', () => ({
   usePopoverWindow: () => false,
@@ -96,6 +98,10 @@ function installBackend(): void {
   vi.spyOn(backend, 'getAntigravityInfo').mockResolvedValue({ connected: false, status: 'pending' });
   vi.spyOn(backend, 'pingClaudeWindow').mockResolvedValue({ kind: 'cliFailed', code: 'spawnFailed' });
   vi.spyOn(backend, 'pingCodexWindow').mockResolvedValue({ kind: 'cliFailed', code: 'spawnFailed' });
+  vi.spyOn(backend, 'onPingConfirmation').mockImplementation(async (handler) => {
+    pingConfirmationHandler = handler;
+    return () => { pingConfirmationHandler = undefined; };
+  });
   vi.spyOn(backend, 'setDockVisibility').mockResolvedValue(undefined);
   vi.spyOn(backend, 'updateTrayIcon').mockResolvedValue(undefined);
 }
@@ -115,6 +121,7 @@ beforeEach(() => {
     'antigravity-tray-enabled': 'false',
   });
   installBackend();
+  pingConfirmationHandler = undefined;
 });
 
 afterEach(() => {
@@ -361,6 +368,89 @@ describe('App ping result and provider refresh isolation', () => {
       await flush();
     });
     expect(text(renderer)).not.toContain('Ping failed · spawnFailed');
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps confirming visible, then applies only the matching completion event', async () => {
+    vi.mocked(backend.pingClaudeWindow).mockResolvedValue({
+      kind: 'confirming', tokens: 3, expectedResetsAt: 1_800_018_000,
+    });
+    const renderer = await renderApp();
+    vi.mocked(backend.getQuota).mockClear();
+
+    await act(async () => {
+      pingButton(renderer).props.onClick();
+      await flush();
+    });
+    expect(text(renderer)).toContain('Ping sent · confirming…');
+    expect(pingButton(renderer).props.disabled).toBe(true);
+    expect(pingButton(renderer).props.title).toBe('Confirming window…');
+    expect(pingButton(renderer).findByProps({ className: 'btn-icon' }).children).toContain('P');
+    await act(async () => {
+      vi.advanceTimersByTime(8_000);
+      await flush();
+    });
+    expect(text(renderer)).toContain('Ping sent · confirming…');
+    expect(backend.getQuota).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pingConfirmationHandler?.({
+        provider: 'codex', alias: 'default',
+        outcome: { kind: 'opened', resetsAt: 1_800_000_000, tokens: null, confirmedAfterSecs: 30 },
+      });
+      await flush();
+    });
+    expect(text(renderer)).toContain('Ping sent · confirming…');
+    expect(pingButton(renderer).props.disabled).toBe(true);
+
+    vi.mocked(backend.getQuota).mockClear();
+    await act(async () => {
+      pingConfirmationHandler?.({
+        provider: 'claude', alias: 'default',
+        outcome: { kind: 'opened', resetsAt: 1_800_000_000, tokens: null, confirmedAfterSecs: 30 },
+      });
+      await flush();
+    });
+    expect(text(renderer)).toContain('Window started · resets');
+    expect(pingButton(renderer).props.disabled).toBe(false);
+    expect(backend.getQuota).toHaveBeenCalledTimes(1);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps the current Codex work target confirming when default completes', async () => {
+    const resetsAt = Math.floor(Date.now() / 1000) + 5 * 60 * 60;
+    vi.mocked(backend.getCodexProfiles).mockResolvedValue({
+      profiles: [{
+        alias: 'work', status: 'connected', primary: { usedPercent: 0, windowMinutes: 300, resetsAt },
+        availableResetCredits: 0, ordinaryUsageAllowed: true,
+      }], registryError: null, registryProvenance: 'primary',
+    });
+    vi.mocked(backend.pingCodexWindow).mockResolvedValue({
+      kind: 'confirming', tokens: 3, expectedResetsAt: 1_800_018_000,
+    });
+    const renderer = await renderApp();
+    await clickProvider(renderer, 'codex');
+    await act(async () => {
+      accountTab(renderer, 'work').props.onClick();
+      await flush();
+    });
+    await act(async () => {
+      pingButton(renderer).props.onClick();
+      await flush();
+    });
+    expect(text(renderer)).toContain('Ping sent · confirming…');
+    expect(pingButton(renderer).props.title).toBe('Confirming window…');
+
+    await act(async () => {
+      pingConfirmationHandler?.({
+        provider: 'codex', alias: 'default',
+        outcome: { kind: 'opened', resetsAt: 1_800_000_000, tokens: null, confirmedAfterSecs: 30 },
+      });
+      await flush();
+    });
+    expect(text(renderer)).toContain('Ping sent · confirming…');
+    expect(pingButton(renderer).props.disabled).toBe(true);
+    expect(pingButton(renderer).props.title).toBe('Confirming window…');
     await act(async () => renderer.unmount());
   });
 });

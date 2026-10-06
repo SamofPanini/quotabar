@@ -11,6 +11,11 @@
     "expectedResetsAt": 1800018000
   },
   {
+    "kind": "confirming",
+    "tokens": 42,
+    "expectedResetsAt": 1800018000
+  },
+  {
     "kind": "alreadyOpen",
     "resetsAt": null
   },

@@ -22,6 +22,12 @@ describe('PING1 PingOutcome cross-language fixture', () => {
       expect(typeof unconfirmed.expectedResetsAt).toBe('number');
     }
 
+    const confirming = outcomes.find((outcome) => outcome.kind === 'confirming');
+    expect(confirming).toBeDefined();
+    if (confirming?.kind === 'confirming') {
+      expect(typeof confirming.expectedResetsAt).toBe('number');
+    }
+
     const alreadyOpen = outcomes.find((outcome) => outcome.kind === 'alreadyOpen');
     expect(alreadyOpen).toBeDefined();
     if (alreadyOpen?.kind === 'alreadyOpen') {

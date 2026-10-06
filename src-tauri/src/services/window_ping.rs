@@ -61,6 +61,10 @@ pub enum PingOutcome {
         tokens: Option<u64>,
         expected_resets_at: i64,
     },
+    Confirming {
+        tokens: Option<u64>,
+        expected_resets_at: i64,
+    },
     AlreadyOpen {
         resets_at: Option<i64>,
     },
@@ -676,6 +680,7 @@ async fn ping_codex_core(
     runner: &mut (dyn FnMut(Command) -> CoreFuture<ChildResult> + Send),
     command_builder: &mut (dyn FnMut(&CodexProfile) -> Result<Command, PingOutcome> + Send),
     sleeper: &mut (dyn FnMut(Duration) -> CoreFuture<()> + Send),
+    on_confirming: &mut (dyn FnMut(PingOutcome) + Send),
 ) -> PingOutcome {
     let Some(profile) = profile else {
         return PingOutcome::ProfileUnavailable;
@@ -725,14 +730,14 @@ async fn ping_codex_core(
     let completed_at = clock();
     let plan = confirmation_plan(completed_at, &CONFIRM_DELAYS_SECS)
         .expect("constant confirmation staircase and completed timestamp fit i64");
-    for step in &plan.steps {
+    for (index, step) in plan.steps.iter().enumerate() {
         if step.delay_secs > 0 {
             sleeper(Duration::from_secs(step.delay_secs)).await;
         }
         let limits = quota_reader().await;
-        if limits.error.is_none()
-            && codex_window_state(limits.primary.as_ref(), clock()) == WindowState::Open
-        {
+        let is_open = limits.error.is_none()
+            && codex_window_state(limits.primary.as_ref(), clock()) == WindowState::Open;
+        if is_open {
             if let Some(resets_at) = limits.primary.and_then(|primary| primary.resets_at) {
                 return PingOutcome::Opened {
                     resets_at,
@@ -740,6 +745,12 @@ async fn ping_codex_core(
                     confirmed_after_secs: step.confirmed_after_secs,
                 };
             }
+        }
+        if index == 0 {
+            on_confirming(PingOutcome::Confirming {
+                tokens,
+                expected_resets_at: plan.expected_resets_at,
+            });
         }
     }
     PingOutcome::SentUnconfirmed {
@@ -755,6 +766,7 @@ async fn ping_claude_core(
     runner: &mut (dyn FnMut(Command) -> CoreFuture<ChildResult> + Send),
     command_builder: &mut (dyn FnMut() -> Result<Command, PingOutcome> + Send),
     sleeper: &mut (dyn FnMut(Duration) -> CoreFuture<()> + Send),
+    on_confirming: &mut (dyn FnMut(PingOutcome) + Send),
 ) -> PingOutcome {
     let quota = quota_reader().await;
     if quota.error.is_some() || !quota.connected || quota.session.is_none() {
@@ -796,14 +808,14 @@ async fn ping_claude_core(
     let completed_at = clock();
     let plan = confirmation_plan(completed_at, &CONFIRM_DELAYS_SECS)
         .expect("constant confirmation staircase and completed timestamp fit i64");
-    for step in &plan.steps {
+    for (index, step) in plan.steps.iter().enumerate() {
         if step.delay_secs > 0 {
             sleeper(Duration::from_secs(step.delay_secs)).await;
         }
         let quota = quota_reader().await;
-        if quota.error.is_none()
-            && claude_window_state(quota.session.as_ref(), clock()) == WindowState::Open
-        {
+        let is_open = quota.error.is_none()
+            && claude_window_state(quota.session.as_ref(), clock()) == WindowState::Open;
+        if is_open {
             if let Some(resets_at) = quota.session.as_ref().and_then(session_reset_epoch) {
                 return PingOutcome::Opened {
                     resets_at,
@@ -812,6 +824,12 @@ async fn ping_claude_core(
                 };
             }
         }
+        if index == 0 {
+            on_confirming(PingOutcome::Confirming {
+                tokens,
+                expected_resets_at: plan.expected_resets_at,
+            });
+        }
     }
     PingOutcome::SentUnconfirmed {
         tokens,
@@ -819,7 +837,11 @@ async fn ping_claude_core(
     }
 }
 
-pub async fn ping_codex(profile: CodexProfile, force: bool) -> PingOutcome {
+pub async fn ping_codex(
+    profile: CodexProfile,
+    force: bool,
+    on_confirming: &mut (dyn FnMut(PingOutcome) + Send),
+) -> PingOutcome {
     let Some(_flight) = CodexFlight::acquire(&profile) else {
         return PingOutcome::Busy;
     };
@@ -841,11 +863,15 @@ pub async fn ping_codex(profile: CodexProfile, force: bool) -> PingOutcome {
         &mut runner,
         &mut command_builder,
         &mut sleeper,
+        on_confirming,
     )
     .await
 }
 
-pub async fn ping_claude(force: bool) -> PingOutcome {
+pub async fn ping_claude(
+    force: bool,
+    on_confirming: &mut (dyn FnMut(PingOutcome) + Send),
+) -> PingOutcome {
     let Some(_flight) = ClaudeFlight::acquire() else {
         return PingOutcome::Busy;
     };
@@ -862,6 +888,7 @@ pub async fn ping_claude(force: bool) -> PingOutcome {
         &mut runner,
         &mut command_builder,
         &mut sleeper,
+        on_confirming,
     )
     .await
 }
@@ -878,7 +905,7 @@ mod tests {
     use crate::domain::models::{CodexRateLimits, UsageInfo};
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -908,6 +935,19 @@ mod tests {
             ordinary_usage_allowed: Some(true),
             error: None,
         }
+    }
+
+    fn claude_quota(session: UsageInfo) -> crate::domain::models::QuotaData {
+        crate::domain::models::QuotaData::connected(Some(session), None, None, None, None, None)
+    }
+
+    fn successful_claude_runner(_: Command) -> CoreFuture<ChildResult> {
+        Box::pin(async {
+            ChildResult::Success(
+                br#"{"type":"result","is_error":false,"subtype":"success","usage":{"input_tokens":1,"output_tokens":2}}"#
+                    .to_vec(),
+            )
+        })
     }
 
     fn test_profile() -> CodexProfile {
@@ -1205,6 +1245,7 @@ mod tests {
         };
         let mut builder = |_: &CodexProfile| Ok(Command::new("unused"));
         let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let mut no_confirming = |_| {};
         assert_eq!(
             tauri::async_runtime::block_on(ping_codex_core(
                 None,
@@ -1214,6 +1255,7 @@ mod tests {
                 &mut unavailable_runner,
                 &mut builder,
                 &mut no_wait,
+                &mut no_confirming,
             )),
             PingOutcome::ProfileUnavailable,
         );
@@ -1238,6 +1280,7 @@ mod tests {
                 &mut unknown_runner,
                 &mut builder,
                 &mut no_wait,
+                &mut no_confirming,
             )),
             PingOutcome::ConfirmationRequired,
         );
@@ -1266,6 +1309,7 @@ mod tests {
         let clock = move || clock_value_for_read.load(Ordering::Relaxed);
         let mut builder = |_: &CodexProfile| Ok(Command::new("unused"));
         let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let mut no_confirming = |_| {};
         assert_eq!(
             tauri::async_runtime::block_on(ping_codex_core(
                 Some(test_profile()),
@@ -1275,6 +1319,7 @@ mod tests {
                 &mut runner,
                 &mut builder,
                 &mut no_wait,
+                &mut no_confirming,
             )),
             PingOutcome::SentUnconfirmed {
                 tokens: Some(3),
@@ -1312,6 +1357,7 @@ mod tests {
         let clock = move || clock_value_for_read.load(Ordering::Relaxed);
         let mut builder = || Ok(Command::new("unused"));
         let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let mut no_confirming = |_| {};
         assert_eq!(
             tauri::async_runtime::block_on(ping_claude_core(
                 false,
@@ -1320,11 +1366,307 @@ mod tests {
                 &mut runner,
                 &mut builder,
                 &mut no_wait,
+                &mut no_confirming,
             )),
             PingOutcome::SentUnconfirmed {
                 tokens: Some(3),
                 expected_resets_at: 20_000,
             },
+        );
+    }
+
+    #[test]
+    fn codex_core_reports_confirming_once_after_first_unconfirmed_read() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let reads_for_reader = Arc::clone(&reads);
+        let mut quota_reader = move || {
+            let is_open = reads_for_reader.fetch_add(1, Ordering::Relaxed) >= 2;
+            Box::pin(async move {
+                codex_limits(primary(
+                    if is_open { 1.0 } else { 0.0 },
+                    Some(20_000),
+                    Some(300),
+                ))
+            }) as CoreFuture<_>
+        };
+        let clock = || 1_000;
+        let mut runner = |_: Command| {
+            Box::pin(async {
+                ChildResult::Success(
+                    br#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}"#
+                        .to_vec(),
+                )
+            }) as CoreFuture<_>
+        };
+        let mut builder = |_: &CodexProfile| Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let confirmations_for_callback = Arc::clone(&confirmations);
+        let mut on_confirming = move |outcome| {
+            confirmations_for_callback.lock().unwrap().push(outcome);
+        };
+
+        assert_eq!(
+            tauri::async_runtime::block_on(ping_codex_core(
+                Some(test_profile()),
+                false,
+                &mut quota_reader,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::Opened {
+                resets_at: 20_000,
+                tokens: Some(3),
+                confirmed_after_secs: 30,
+            },
+        );
+        assert_eq!(
+            *confirmations.lock().unwrap(),
+            vec![PingOutcome::Confirming {
+                tokens: Some(3),
+                expected_resets_at: 19_000,
+            }],
+        );
+    }
+
+    #[test]
+    fn codex_core_skips_confirming_when_first_read_confirms_or_cli_fails() {
+        let clock = || 1_000;
+        let first_read = Arc::new(AtomicU64::new(0));
+        let first_read_for_reader = Arc::clone(&first_read);
+        let mut immediate_open_reader = move || {
+            let is_confirmation_read = first_read_for_reader.fetch_add(1, Ordering::Relaxed) > 0;
+            Box::pin(async move {
+                codex_limits(primary(
+                    if is_confirmation_read { 1.0 } else { 0.0 },
+                    Some(20_000),
+                    Some(300),
+                ))
+            }) as CoreFuture<_>
+        };
+        let mut success_runner = |_: Command| {
+            Box::pin(async {
+                ChildResult::Success(
+                    br#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}"#
+                        .to_vec(),
+                )
+            }) as CoreFuture<_>
+        };
+        let mut builder = |_: &CodexProfile| Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let immediate_confirmations = Arc::clone(&confirmations);
+        let mut on_confirming =
+            move |outcome| immediate_confirmations.lock().unwrap().push(outcome);
+        assert!(matches!(
+            tauri::async_runtime::block_on(ping_codex_core(
+                Some(test_profile()),
+                false,
+                &mut immediate_open_reader,
+                &clock,
+                &mut success_runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::Opened {
+                confirmed_after_secs: 0,
+                ..
+            }
+        ));
+        assert!(confirmations.lock().unwrap().is_empty());
+
+        let mut failed_reader = || {
+            Box::pin(async { codex_limits(primary(0.0, Some(20_000), Some(300))) }) as CoreFuture<_>
+        };
+        let mut failed_runner =
+            |_: Command| Box::pin(async { ChildResult::Nonzero }) as CoreFuture<_>;
+        assert_eq!(
+            tauri::async_runtime::block_on(ping_codex_core(
+                Some(test_profile()),
+                false,
+                &mut failed_reader,
+                &clock,
+                &mut failed_runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::CliFailed {
+                code: "nonzeroExit",
+            },
+        );
+        assert!(confirmations.lock().unwrap().is_empty());
+
+        let mut unreadable_reader =
+            || Box::pin(async { CodexRateLimits::disconnected("not read") }) as CoreFuture<_>;
+        assert_eq!(
+            tauri::async_runtime::block_on(ping_codex_core(
+                Some(test_profile()),
+                false,
+                &mut unreadable_reader,
+                &clock,
+                &mut failed_runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::QuotaUnreadable,
+        );
+        assert!(confirmations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_core_reports_confirming_once_after_first_unconfirmed_read() {
+        let mut quota_reader =
+            || Box::pin(async { claude_quota(session(0.0, None)) }) as CoreFuture<_>;
+        let clock = || 1_000;
+        let mut runner = successful_claude_runner;
+        let mut builder = || Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let callback_confirmations = Arc::clone(&confirmations);
+        let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+
+        assert_eq!(
+            tauri::async_runtime::block_on(ping_claude_core(
+                false,
+                &mut quota_reader,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::SentUnconfirmed {
+                tokens: Some(3),
+                expected_resets_at: 19_000,
+            },
+        );
+        assert_eq!(
+            *confirmations.lock().unwrap(),
+            vec![PingOutcome::Confirming {
+                tokens: Some(3),
+                expected_resets_at: 19_000,
+            }],
+        );
+    }
+
+    #[test]
+    fn claude_core_skips_confirming_when_first_read_opens() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let reads_for_reader = Arc::clone(&reads);
+        let mut quota_reader = move || {
+            let is_confirmation_read = reads_for_reader.fetch_add(1, Ordering::Relaxed) > 0;
+            Box::pin(async move {
+                claude_quota(if is_confirmation_read {
+                    session(1.0, Some("2026-10-06T12:00:00Z"))
+                } else {
+                    session(0.0, None)
+                })
+            }) as CoreFuture<_>
+        };
+        let clock = || 1_000;
+        let mut runner = successful_claude_runner;
+        let mut builder = || Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let callback_confirmations = Arc::clone(&confirmations);
+        let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+
+        assert!(matches!(
+            tauri::async_runtime::block_on(ping_claude_core(
+                false,
+                &mut quota_reader,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::Opened {
+                confirmed_after_secs: 0,
+                ..
+            }
+        ));
+        assert!(confirmations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_core_skips_confirming_when_cli_fails() {
+        let mut quota_reader =
+            || Box::pin(async { claude_quota(session(0.0, None)) }) as CoreFuture<_>;
+        let clock = || 1_000;
+        let mut runner = |_: Command| Box::pin(async { ChildResult::Nonzero }) as CoreFuture<_>;
+        let mut builder = || Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let callback_confirmations = Arc::clone(&confirmations);
+        let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+
+        assert_eq!(
+            tauri::async_runtime::block_on(ping_claude_core(
+                false,
+                &mut quota_reader,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::CliFailed {
+                code: "nonzeroExit",
+            },
+        );
+        assert!(confirmations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_core_reports_confirming_when_first_open_read_lacks_reset() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let reads_for_reader = Arc::clone(&reads);
+        let mut quota_reader = move || {
+            let is_confirmation_read = reads_for_reader.fetch_add(1, Ordering::Relaxed) > 0;
+            Box::pin(async move {
+                claude_quota(if is_confirmation_read {
+                    session(1.0, None)
+                } else {
+                    session(0.0, None)
+                })
+            }) as CoreFuture<_>
+        };
+        let clock = || 1_000;
+        let mut runner = successful_claude_runner;
+        let mut builder = || Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let callback_confirmations = Arc::clone(&confirmations);
+        let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+
+        assert_eq!(
+            tauri::async_runtime::block_on(ping_claude_core(
+                false,
+                &mut quota_reader,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut on_confirming,
+            )),
+            PingOutcome::SentUnconfirmed {
+                tokens: Some(3),
+                expected_resets_at: 19_000,
+            },
+        );
+        assert_eq!(
+            *confirmations.lock().unwrap(),
+            vec![PingOutcome::Confirming {
+                tokens: Some(3),
+                expected_resets_at: 19_000,
+            }],
         );
     }
 
@@ -1673,6 +2015,10 @@ mod tests {
                     confirmed_after_secs: expected["confirmedAfterSecs"].as_u64().unwrap(),
                 },
                 "sentUnconfirmed" => PingOutcome::SentUnconfirmed {
+                    tokens: expected["tokens"].as_u64(),
+                    expected_resets_at: expected["expectedResetsAt"].as_i64().unwrap(),
+                },
+                "confirming" => PingOutcome::Confirming {
                     tokens: expected["tokens"].as_u64(),
                     expected_resets_at: expected["expectedResetsAt"].as_i64().unwrap(),
                 },
