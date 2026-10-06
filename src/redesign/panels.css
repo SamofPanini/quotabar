@@ -290,6 +290,12 @@
   line-height: 1.2;
 }
 
+.reset-at-text {
+  flex: 0 0 auto;
+  margin-left: auto;
+  text-align: right;
+}
+
 .quota-pace {
   display: block;
   margin-top: 5px;

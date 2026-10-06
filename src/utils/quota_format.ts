@@ -1,4 +1,5 @@
 import type { CSSProperties } from 'react';
+import { parseRfc3339EpochSeconds } from '../services/ping_window';
 
 export function formatPlanType(planType?: string, fallback = 'Unknown'): string {
   if (!planType) return fallback;
@@ -44,6 +45,31 @@ export function formatResetTime(
   } catch {
     return emptyLabel;
   }
+}
+
+export function formatResetAt(value?: string | number): string {
+  if (typeof value === 'string') {
+    const epochSeconds = parseRfc3339EpochSeconds(value);
+    if (epochSeconds === undefined) return '';
+    return formatResetAt(epochSeconds);
+  }
+
+  if (!value) return '';
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return '';
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  const time = date.toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+  if (sameDay) return `Today, ${time}`;
+  const day = date.toLocaleDateString('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  });
+  return `${day}, ${time}`;
 }
 
 function formatShortDuration(ms: number): string {
