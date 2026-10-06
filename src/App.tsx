@@ -179,6 +179,7 @@ export default function App() {
   const [claudeCostRefreshNonce, setClaudeCostRefreshNonce] = useState(0);
   const [codexPingContext, setCodexPingContext] = useState<CodexPingContext | null>(null);
   const [pingInFlight, setPingInFlight] = useState<Record<string, true>>({});
+  const [pingConfirming, setPingConfirming] = useState<Record<string, true>>({});
   const [pingResults, setPingResults] = useState<Record<string, PingResult>>({});
   const [pingConfirmations, setPingConfirmations] = useState<Record<string, PingConfirmation>>({});
   const pingConfirmationGeneration = useRef(0);
@@ -718,6 +719,16 @@ export default function App() {
     pingResultTimers.current.set(key, { timer, generation });
   }, []);
 
+  const showPingConfirming = useCallback((target: PingTarget, message: string) => {
+    const key = pingTargetKey(target);
+    const generation = (pingResultGenerations.current.get(key) ?? 0) + 1;
+    pingResultGenerations.current.set(key, generation);
+    const prior = pingResultTimers.current.get(key);
+    if (prior) clearTimeout(prior.timer);
+    pingResultTimers.current.delete(key);
+    setPingResults((previous) => ({ ...previous, [key]: { message, generation } }));
+  }, []);
+
   useEffect(() => () => {
     for (const { timer } of pingResultTimers.current.values()) clearTimeout(timer);
     pingResultTimers.current.clear();
@@ -727,6 +738,7 @@ export default function App() {
     switch (outcome.kind) {
       case 'opened': return `Window started · resets ${formatPingReset(outcome.resetsAt)}`;
       case 'sentUnconfirmed': return 'Ping sent · window not confirmed yet';
+      case 'confirming': return 'Ping sent · confirming…';
       case 'alreadyOpen': return `Window already active · resets ${formatPingReset(outcome.resetsAt)}`;
       case 'blocked': return 'Ordinary usage blocked';
       case 'cliNotFound': return outcome.cli === 'codex' ? 'Codex CLI not found' : 'Claude Code CLI not found';
@@ -754,11 +766,21 @@ export default function App() {
     : pingProvider === 'claude' && (!quota?.connected || Boolean(claudeError))
       ? (claudeError ?? 'Claude quota unavailable') : undefined;
   const pingCurrentInFlight = currentPingKey != null && Boolean(pingInFlight[currentPingKey]);
+  const pingCurrentConfirming = currentPingKey != null && Boolean(pingConfirming[currentPingKey]);
 
   useEffect(() => {
     pingConfirmationGeneration.current += 1;
     setPingConfirmations({});
   }, [currentPingKey]);
+
+  const refreshAfterPing = useCallback((target: PingTarget) => {
+    if (target.provider === 'codex') {
+      setRefreshNonces((prev) => ({ ...prev, codex: prev.codex + 1 }));
+    } else {
+      fetchClaudeQuota();
+      setClaudeCostRefreshNonce((value) => value + 1);
+    }
+  }, [fetchClaudeQuota]);
 
   const runPing = useCallback(async (target: PingTarget, force: boolean) => {
     const key = pingTargetKey(target);
@@ -781,13 +803,14 @@ export default function App() {
         }));
         return;
       }
-      showPingResult(target, formatPingOutcome(outcome));
-      if (target.provider === 'codex') {
-        setRefreshNonces((prev) => ({ ...prev, codex: prev.codex + 1 }));
-      } else {
-        fetchClaudeQuota();
-        setClaudeCostRefreshNonce((value) => value + 1);
+      if (outcome.kind === 'confirming') {
+        setPingConfirming((previous) => ({ ...previous, [key]: true }));
+        showPingConfirming(target, formatPingOutcome(outcome));
+        refreshAfterPing(target);
+        return;
       }
+      showPingResult(target, formatPingOutcome(outcome));
+      refreshAfterPing(target);
     } catch {
       showPingResult(target, 'Ping failed · unavailable');
     } finally {
@@ -796,7 +819,29 @@ export default function App() {
         return remaining;
       });
     }
-  }, [fetchClaudeQuota, formatPingOutcome, pingInFlight, showPingResult]);
+  }, [formatPingOutcome, pingInFlight, refreshAfterPing, showPingConfirming, showPingResult]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let mounted = true;
+    backend.onPingConfirmation(({ provider, alias, outcome }) => {
+      const target: PingTarget = { provider, alias };
+      const key = pingTargetKey(target);
+      setPingConfirming((previous) => {
+        const { [key]: _confirming, ...remaining } = previous;
+        return remaining;
+      });
+      showPingResult(target, formatPingOutcome(outcome));
+      refreshAfterPing(target);
+    }).then((stopListening) => {
+      if (mounted) unlisten = stopListening;
+      else stopListening();
+    }).catch(() => {});
+    return () => {
+      mounted = false;
+      unlisten?.();
+    };
+  }, [formatPingOutcome, refreshAfterPing, showPingResult]);
 
   const handlePing = useCallback(() => {
     if (pingDisabledReason || pingTarget == null) return;
@@ -1049,10 +1094,11 @@ export default function App() {
               loading={activeLoading}
               statusText={footerPingStatus}
               statusTitle={visiblePingResult ?? pingDisabledReason ?? footerStatusTitle}
+              statusIsUpdatedAt={footerPingStatus === footerStatus && !activeLoading && lastUpdatedAt != null}
               showDashboard={providerViewActive}
               showPing={pingProvider !== null}
               onPing={handlePing}
-              pingState={pingCurrentInFlight ? 'inFlight' : 'idle'}
+              pingState={pingCurrentConfirming ? 'confirming' : pingCurrentInFlight ? 'inFlight' : 'idle'}
               pingDisabledReason={pingDisabledReason}
               pingTitle={`Ping ${pingAlias} — start 5-hour window`}
               pingConfirmText={visiblePingConfirmation?.message}

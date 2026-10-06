@@ -1038,8 +1038,12 @@
 }
 
 .action-status {
-  flex: 1 1 76px;
-  min-width: 76px;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
   padding-right: 4px;
   overflow: hidden;
   color: var(--sub);
@@ -1048,6 +1052,23 @@
   white-space: nowrap;
   font-size: 11px;
   line-height: 14px;
+}
+
+.action-status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.action-status svg {
+  flex: 0 0 auto;
+}
+
+.app-version {
+  flex: 0 0 auto;
+  color: var(--sub);
+  font-size: 10px;
 }
 
 .action-announcement {

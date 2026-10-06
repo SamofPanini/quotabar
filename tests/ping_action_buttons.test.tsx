@@ -19,7 +19,7 @@ describe('Ping footer action', () => {
     expect(render()).not.toContain('Ping');
     const html = render({ showPing: true });
     expect(html.indexOf('Refresh')).toBeLessThan(html.indexOf('>P<'));
-    expect(html.indexOf('>P<')).toBeLessThan(html.indexOf('Dashboard'));
+    expect(html.indexOf('>P<')).toBeLessThan(html.indexOf('Web'));
     expect(html).not.toContain('>Ping<');
     expect(html).toContain('aria-label="Ping selected account — start 5-hour window"');
   });
@@ -35,6 +35,10 @@ describe('Ping footer action', () => {
     expect(inFlight).toContain('title="Ping is in progress"');
     const refreshLoading = render({ showPing: true, loading: true });
     expect(refreshLoading).toContain('title="Refresh is in progress"');
+    const confirming = render({ showPing: true, pingState: 'confirming', pingDisabledReason: 'Ordinary usage blocked — ping would not open a window' });
+    expect(confirming).toContain('>P<');
+    expect(confirming).toContain('disabled=""');
+    expect(confirming).toContain('title="Confirming window…"');
   });
 
   it('puts the confirmation in its own one-line strip above the footer action row', () => {

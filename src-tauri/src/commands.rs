@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     domain::account::CodexProfilesResponse,
@@ -54,6 +54,55 @@ where
     ping(profile, force).await
 }
 
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PingConfirmationEvent {
+    provider: &'static str,
+    alias: String,
+    outcome: window_ping::PingOutcome,
+}
+
+type ConfirmingCallback = Box<dyn FnMut(window_ping::PingOutcome) + Send>;
+
+async fn route_ping_outcome<Run, Fut, Emit>(run: Run, emit: Emit) -> window_ping::PingOutcome
+where
+    Run: FnOnce(ConfirmingCallback) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = window_ping::PingOutcome> + Send + 'static,
+    Emit: FnOnce(window_ping::PingOutcome) + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+    let sender_for_run = std::sync::Arc::clone(&sender);
+    let run_task = tauri::async_runtime::spawn(async move {
+        let sender_for_callback = std::sync::Arc::clone(&sender_for_run);
+        let on_confirming: ConfirmingCallback = Box::new(move |outcome| {
+            if let Some(sender) = sender_for_callback.lock().unwrap().take() {
+                let _ = sender.send(outcome);
+            }
+        });
+        run(on_confirming).await
+    });
+    tauri::async_runtime::spawn(async move {
+        let outcome = match run_task.await {
+            Ok(outcome) => outcome,
+            Err(_) => window_ping::PingOutcome::CliFailed {
+                code: "confirmationAborted",
+            },
+        };
+        if let Some(sender) = sender.lock().unwrap().take() {
+            let _ = sender.send(outcome);
+        } else {
+            emit(outcome);
+        }
+    });
+    match tauri::async_runtime::spawn_blocking(move || receiver.recv()).await {
+        Ok(Ok(outcome)) => outcome,
+        _ => window_ping::PingOutcome::CliFailed {
+            code: "spawnFailed",
+        },
+    }
+}
+
 #[tauri::command]
 pub async fn ping_codex_window(
     app: AppHandle,
@@ -66,12 +115,31 @@ pub async fn ping_codex_window(
         .map_err(|_| "Profile configuration is unavailable")?;
     let primary_dir = crate::services::state_location::primary_state_dir()
         .map_err(|_| "Profile configuration is unavailable")?;
-    Ok(resolve_and_ping_codex(
-        &alias,
-        &primary_dir,
-        &legacy_dir,
-        force,
-        |profile, force| window_ping::ping_codex(profile, force),
+    let event_app = app.clone();
+    let event_alias = alias.clone();
+    Ok(route_ping_outcome(
+        move |mut on_confirming| async move {
+            resolve_and_ping_codex(
+                &alias,
+                &primary_dir,
+                &legacy_dir,
+                force,
+                move |profile, force| async move {
+                    window_ping::ping_codex(profile, force, &mut *on_confirming).await
+                },
+            )
+            .await
+        },
+        move |outcome| {
+            let _ = event_app.emit(
+                "ping-confirmation",
+                PingConfirmationEvent {
+                    provider: "codex",
+                    alias: event_alias,
+                    outcome,
+                },
+            );
+        },
     )
     .await)
 }
@@ -177,11 +245,129 @@ mod tests {
         assert_eq!(seen_alias.lock().unwrap().as_deref(), Some("codex/work"));
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn route_ping_outcome_returns_confirming_then_emits_final_outcome() {
+        let (event_sender, event_receiver) = std::sync::mpsc::sync_channel(1);
+        let command_outcome = tauri::async_runtime::block_on(route_ping_outcome(
+            |mut on_confirming| async move {
+                on_confirming(window_ping::PingOutcome::Confirming {
+                    tokens: Some(3),
+                    expected_resets_at: 20_000,
+                });
+                window_ping::PingOutcome::Opened {
+                    resets_at: 20_000,
+                    tokens: Some(3),
+                    confirmed_after_secs: 30,
+                }
+            },
+            move |outcome| event_sender.send(outcome).unwrap(),
+        ));
+
+        assert_eq!(
+            command_outcome,
+            window_ping::PingOutcome::Confirming {
+                tokens: Some(3),
+                expected_resets_at: 20_000,
+            },
+        );
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            window_ping::PingOutcome::Opened {
+                resets_at: 20_000,
+                tokens: Some(3),
+                confirmed_after_secs: 30,
+            },
+        );
+    }
+
+    #[test]
+    fn route_ping_outcome_returns_final_outcome_without_event_when_not_confirming() {
+        let event_count = Arc::new(AtomicUsize::new(0));
+        let emitted = Arc::clone(&event_count);
+        let command_outcome = tauri::async_runtime::block_on(route_ping_outcome(
+            |_| async { window_ping::PingOutcome::Busy },
+            move |_| {
+                emitted.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+
+        assert_eq!(command_outcome, window_ping::PingOutcome::Busy);
+        assert_eq!(event_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn route_ping_outcome_emits_aborted_failure_after_confirming_run_panics() {
+        let (event_sender, event_receiver) = std::sync::mpsc::sync_channel(1);
+        let command_outcome = tauri::async_runtime::block_on(route_ping_outcome(
+            |mut on_confirming| async move {
+                on_confirming(window_ping::PingOutcome::Confirming {
+                    tokens: Some(3),
+                    expected_resets_at: 20_000,
+                });
+                panic!("test confirming run panic");
+            },
+            move |outcome| event_sender.send(outcome).unwrap(),
+        ));
+
+        assert_eq!(
+            command_outcome,
+            window_ping::PingOutcome::Confirming {
+                tokens: Some(3),
+                expected_resets_at: 20_000,
+            },
+        );
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            window_ping::PingOutcome::CliFailed {
+                code: "confirmationAborted",
+            },
+        );
+    }
+
+    #[test]
+    fn ping_confirmation_event_serializes_only_the_public_fields() {
+        let event = PingConfirmationEvent {
+            provider: "codex",
+            alias: "work".to_string(),
+            outcome: window_ping::PingOutcome::Confirming {
+                tokens: Some(3),
+                expected_resets_at: 20_000,
+            },
+        };
+        let value = serde_json::to_value(event).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 3);
+        assert!(object.contains_key("provider"));
+        assert!(object.contains_key("alias"));
+        assert!(object.contains_key("outcome"));
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["alias"], "work");
+        assert_eq!(value["outcome"]["kind"], "confirming");
+    }
 }
 
 #[tauri::command]
-pub async fn ping_claude_window(force: bool) -> Result<window_ping::PingOutcome, String> {
-    Ok(window_ping::ping_claude(force).await)
+pub async fn ping_claude_window(
+    app: AppHandle,
+    force: bool,
+) -> Result<window_ping::PingOutcome, String> {
+    Ok(route_ping_outcome(
+        move |mut on_confirming| async move {
+            window_ping::ping_claude(force, &mut *on_confirming).await
+        },
+        move |outcome| {
+            let _ = app.emit(
+                "ping-confirmation",
+                PingConfirmationEvent {
+                    provider: "claude",
+                    alias: "default".to_string(),
+                    outcome,
+                },
+            );
+        },
+    )
+    .await)
 }
 
 /// Read-only Claude current-state projection. No frontend mutation command exists.

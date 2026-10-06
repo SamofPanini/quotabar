@@ -68,7 +68,7 @@ describe('panel shell UI', () => {
         onSettings={() => {}}
         onQuit={() => {}}
         loading={false}
-        statusText="Updated now"
+        statusText="now"
         showDashboard={false}
       />,
     );
@@ -76,7 +76,7 @@ describe('panel shell UI', () => {
     expect(html).not.toContain('Dashboard');
     expect(html).not.toContain('role="status"');
     expect(html).toContain('aria-live="off"');
-    expect(html).toContain('Updated now');
+    expect(html).toContain('>now<');
   });
 
   it('announces refresh loading without guessing its outcome', async () => {
@@ -100,12 +100,42 @@ describe('panel shell UI', () => {
         onSettings: vi.fn(),
         onQuit: vi.fn(),
         loading: false,
-        statusText: 'Updated now',
+        statusText: 'now',
       }));
     });
     expect(renderer.root.findAllByProps({ role: 'status' })).toHaveLength(0);
     expect(renderer.root.findByProps({ className: 'action-status' }).props['aria-live']).toBe('off');
     await act(async () => renderer.unmount());
+  });
+
+  it('uses the build version and only shows the clock for an update timestamp', () => {
+    const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+    const tauriVersion = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8')).version;
+    const updated = renderToStaticMarkup(<ActionButtons
+      onRefresh={() => {}}
+      onDashboard={() => {}}
+      onSettings={() => {}}
+      onQuit={() => {}}
+      loading={false}
+      statusText="now"
+      statusIsUpdatedAt
+    />);
+    const nonUpdated = renderToStaticMarkup(<ActionButtons
+      onRefresh={() => {}}
+      onDashboard={() => {}}
+      onSettings={() => {}}
+      onQuit={() => {}}
+      loading={false}
+      statusText="Ping sent · confirming…"
+    />);
+
+    expect(updated).toContain('>Web<');
+    expect(updated).not.toContain('Dashboard');
+    expect(updated).toContain('aria-label="Open provider dashboard"');
+    expect(updated).toContain(`>v${version}<`);
+    expect(tauriVersion).toBe(version);
+    expect(updated).toContain('width="12"');
+    expect(nonUpdated).not.toContain('width="12"');
   });
 
   it('groups settings by task and combines panel and menu visibility', () => {

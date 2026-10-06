@@ -111,11 +111,12 @@ export interface CodexProfilesResponse {
 export type PingOutcome =
   | { kind: 'opened'; resetsAt: number; tokens: number | null; confirmedAfterSecs: number }
   | { kind: 'sentUnconfirmed'; tokens: number | null; expectedResetsAt: number }
+  | { kind: 'confirming'; tokens: number | null; expectedResetsAt: number }
   | { kind: 'alreadyOpen'; resetsAt: number | null }
   | { kind: 'blocked' }
   | { kind: 'busy' }
   | { kind: 'cliNotFound'; cli: 'codex' | 'claude' }
-  | { kind: 'cliFailed'; code: 'nonzeroExit' | 'noCompletion' | 'timeout' | 'spawnFailed' }
+  | { kind: 'cliFailed'; code: 'nonzeroExit' | 'noCompletion' | 'timeout' | 'spawnFailed' | 'confirmationAborted' }
   | { kind: 'profileUnavailable' }
   | { kind: 'quotaUnreadable' }
   | { kind: 'confirmationRequired' };
@@ -125,6 +126,7 @@ export type PingOutcome =
 export const PING_OUTCOME_KINDS: Readonly<Record<PingOutcome['kind'], true>> = {
   opened: true,
   sentUnconfirmed: true,
+  confirming: true,
   alreadyOpen: true,
   blocked: true,
   busy: true,
@@ -134,6 +136,12 @@ export const PING_OUTCOME_KINDS: Readonly<Record<PingOutcome['kind'], true>> = {
   quotaUnreadable: true,
   confirmationRequired: true,
 };
+
+export interface PingConfirmationEvent {
+  provider: 'codex' | 'claude';
+  alias: string;
+  outcome: PingOutcome;
+}
 
 export type CodexQuotaStatus = 'on_track' | 'watch' | 'likely_exhausted' | 'exhausted';
 

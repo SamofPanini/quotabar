@@ -7,10 +7,11 @@ interface ActionButtonsProps {
   settingsActive?: boolean;
   statusText?: string;
   statusTitle?: string;
+  statusIsUpdatedAt?: boolean;
   showDashboard?: boolean;
   showPing?: boolean;
   onPing?: () => void;
-  pingState?: 'idle' | 'inFlight';
+  pingState?: 'idle' | 'inFlight' | 'confirming';
   pingDisabledReason?: string;
   pingTitle?: string;
   pingConfirmText?: string;
@@ -27,6 +28,7 @@ export default function ActionButtons({
   settingsActive = false,
   statusText,
   statusTitle,
+  statusIsUpdatedAt = false,
   showDashboard = true,
   showPing = false,
   onPing,
@@ -37,8 +39,10 @@ export default function ActionButtons({
   onPingConfirm,
   onPingCancel,
 }: ActionButtonsProps) {
-  const pingDisabledTitle = pingDisabledReason
-    ?? (loading ? 'Refresh is in progress' : pingState === 'inFlight' ? 'Ping is in progress' : undefined);
+  const pingDisabledTitle = pingState === 'confirming'
+    ? 'Confirming window…'
+    : pingDisabledReason
+      ?? (loading ? 'Refresh is in progress' : pingState === 'inFlight' ? 'Ping is in progress' : undefined);
 
   return (
     <>
@@ -86,10 +90,10 @@ export default function ActionButtons({
             type="button"
             className="action-btn dashboard-btn"
             onClick={onDashboard}
-            title="Open dashboard"
+            title="Open provider website"
             aria-label="Open provider dashboard"
           >
-            <span className="btn-text">Dashboard</span>
+            <span className="btn-text">Web</span>
             <span className="btn-icon dashboard-arrow">↗</span>
           </button>
         )}
@@ -100,9 +104,17 @@ export default function ActionButtons({
             aria-live="off"
             title={statusTitle ?? statusText}
           >
-            {statusText}
+            {statusIsUpdatedAt && (
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" />
+              </svg>
+            )}
+            <span className="action-status-text">{statusText}</span>
           </span>
         )}
+
+        <span className="app-version" title={`QuotaBar v${__APP_VERSION__}`}>v{__APP_VERSION__}</span>
 
         <button
           type="button"

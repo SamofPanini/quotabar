@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AntigravityData,
   ClaudeLoginRefreshResult,
@@ -15,6 +16,7 @@ import type {
   GrokData,
   QuotaData,
   PingOutcome,
+  PingConfirmationEvent,
 } from '../types/models';
 
 type TrayService = 'claude' | 'codex' | 'cursor' | 'grok' | 'antigravity';
@@ -41,7 +43,16 @@ export function normalizeTrayIpcPercentage(percentage: number | null): number | 
   return Math.min(255, Math.max(0, Math.round(percentage)));
 }
 
+export function onPingConfirmation(
+  handler: (event: PingConfirmationEvent) => void,
+): Promise<UnlistenFn> {
+  if (!hasTauriBackend()) return Promise.resolve(() => {});
+  return listen<PingConfirmationEvent>('ping-confirmation', (event) => handler(event.payload));
+}
+
 export const backend = {
+  onPingConfirmation,
+
   getQuota() {
     return invokeBackend<QuotaData>('get_quota');
   },
