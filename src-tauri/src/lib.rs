@@ -75,8 +75,10 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 use tauri::ActivationPolicy;
-                // Default to visible Dock; user can toggle to Accessory from UI.
-                app.set_activation_policy(ActivationPolicy::Regular);
+                // Default to a menu-bar (Accessory) app, matching LSUIElement in
+                // Info.plist; the saved "Hide Dock icon" preference is applied by
+                // the frontend after launch.
+                app.set_activation_policy(ActivationPolicy::Accessory);
             }
 
             services::tray::setup_tray(app.handle())?;

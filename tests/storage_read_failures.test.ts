@@ -100,11 +100,11 @@ const userVisibleReadCases: UserVisibleReadCase[] = [
   {
     name: 'dock visibility',
     key: 'claude-quota-dock-hidden',
-    validRaw: 'true',
+    validRaw: 'false',
     malformedRaw: 'yes',
     read: getSavedDockHidden,
-    expectedValue: true,
-    expectedDefault: false,
+    expectedValue: false,
+    expectedDefault: true,
   },
   {
     name: 'settings expansion',
