@@ -70,7 +70,9 @@ export function getSavedTheme(): ThemeName {
 
 export function getSavedDockHidden(): boolean {
   const result = readStorageValue(DOCK_HIDDEN_KEY, decodeBoolean, { notifyUser: true });
-  return result.status === 'value' ? result.value : false;
+  // Menu-bar app by default: an Accessory app's popover can appear over other
+  // apps' full-screen Spaces, a Regular (Dock icon) app's cannot.
+  return result.status === 'value' ? result.value : true;
 }
 
 export function getSavedSettingsExpanded(): boolean {
