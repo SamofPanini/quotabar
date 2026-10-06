@@ -280,10 +280,11 @@ For normal use, download the current installer from [GitHub Releases](https://gi
 macOS:
 
 ```bash
-./scripts/stop_app.sh
 ./scripts/install_app.sh
 ./scripts/run_app.sh
 ```
+
+The scripts target `/Applications/QuotaBar.app` by default. Set `QUOTABAR_APP_DST` (an absolute path ending in `QuotaBar.app`, not a symlink) to install, stop or launch a copy elsewhere, e.g. `QUOTABAR_APP_DST="$HOME/Downloads/QuotaBar.app" ./scripts/install_app.sh`.
 
 Or one-shot restart after rebuild:
 
