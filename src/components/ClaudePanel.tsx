@@ -86,6 +86,7 @@ export default function ClaudePanel({
                   label="5-hour window"
                   percentage={Math.round(quota.session.percentage)}
                   resetsIn={formatClaudeResetTime(quota.session.resetTime)}
+                  resetAt={quota.session.resetTime}
                   pace={formatPaceText(quota.session.percentage, quota.session.resetTime, SESSION_WINDOW_MINUTES)}
                 />
               ) : (
@@ -102,6 +103,7 @@ export default function ClaudePanel({
                   label="All models"
                   percentage={Math.round(quota.weeklyTotal.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklyTotal.resetTime)}
+                  resetAt={quota.weeklyTotal.resetTime}
                   featured
                 />
               )}
@@ -111,6 +113,7 @@ export default function ClaudePanel({
                   label="Opus"
                   percentage={Math.round(quota.weeklyOpus.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklyOpus.resetTime)}
+                  resetAt={quota.weeklyOpus.resetTime}
                 />
               )}
 
@@ -119,6 +122,7 @@ export default function ClaudePanel({
                   label="Sonnet"
                   percentage={Math.round(quota.weeklySonnet.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklySonnet.resetTime)}
+                  resetAt={quota.weeklySonnet.resetTime}
                 />
               )}
 
@@ -127,6 +131,7 @@ export default function ClaudePanel({
                   label="Claude Design"
                   percentage={Math.round(quota.weeklyDesign.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklyDesign.resetTime)}
+                  resetAt={quota.weeklyDesign.resetTime}
                 />
               )}
 
@@ -135,6 +140,7 @@ export default function ClaudePanel({
                   label="Fable 5"
                   percentage={Math.round(quota.weeklyFable5.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklyFable5.resetTime)}
+                  resetAt={quota.weeklyFable5.resetTime}
                 />
               )}
 

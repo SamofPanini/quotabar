@@ -31,7 +31,7 @@ import {
   isWeeklyExhausted,
 } from '../services/codex_weekly_display';
 import { getAvailableResetCredits, getHighUsageTip } from '../services/detail_helpers';
-import { clampProgressValue, formatPaceText, formatPlanType, formatResetTime, getProgressStyle } from '../utils/quota_format';
+import { clampProgressValue, formatPaceText, formatPlanType, formatResetAt, formatResetTime, getProgressStyle } from '../utils/quota_format';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
 import { useLatestRequestGeneration } from '../hooks/use_latest_request_generation';
 
@@ -94,25 +94,6 @@ function formatWindowLabel(minutes?: number, kind: 'primary' | 'secondary' = 'pr
     return `${hours}-hour window`;
   }
   return `${minutes}m`;
-}
-
-function formatResetAt(value?: number): string {
-  if (!value) return '';
-  const date = new Date(value * 1000);
-  if (Number.isNaN(date.getTime())) return '';
-  const now = new Date();
-  const sameDay = date.toDateString() === now.toDateString();
-  const time = date.toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-  });
-  if (sameDay) return `Today, ${time}`;
-  const day = date.toLocaleDateString('en-US', {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-  });
-  return `${day}, ${time}`;
 }
 
 function formatGrantDate(value?: string): string {

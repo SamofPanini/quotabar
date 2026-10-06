@@ -4,6 +4,7 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Show each Claude quota card's valid future reset time alongside its relative reset countdown.
 - Remove webview opener permissions and route dashboard links exclusively through Rust.
 - Drop a late Ping "send anyway?" confirmation when its tab or account changed while the request was in flight, so a cleared confirmation no longer reappears.
 - Keep healthy Codex accounts in the menu bar when another account, account info, reset credits, or the profile registry fails; the menu bar only counts fresh reads, and stale accounts stay visible and labeled in the panel.

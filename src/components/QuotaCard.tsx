@@ -1,4 +1,5 @@
-import { clampProgressValue, getProgressStyle } from '../utils/quota_format';
+import { clampProgressValue, formatResetAt, getProgressStyle } from '../utils/quota_format';
+import { parseRfc3339EpochSeconds } from '../services/ping_window';
 
 interface QuotaCardProps {
   label: string;
@@ -6,6 +7,7 @@ interface QuotaCardProps {
   resetsIn: string;
   pace?: string | null;
   featured?: boolean;
+  resetAt?: string | number;
 }
 
 function getStatusColor(percentage: number): string {
@@ -14,8 +16,16 @@ function getStatusColor(percentage: number): string {
   return 'good';
 }
 
-export default function QuotaCard({ label, percentage, resetsIn, pace, featured = false }: QuotaCardProps) {
+export default function QuotaCard({ label, percentage, resetsIn, pace, featured = false, resetAt }: QuotaCardProps) {
   const status = getStatusColor(percentage);
+  const resetAtEpochSeconds = typeof resetAt === 'string'
+    ? parseRfc3339EpochSeconds(resetAt)
+    : resetAt;
+  const resetAtDate = resetAtEpochSeconds == null ? undefined : new Date(resetAtEpochSeconds * 1000);
+  const resetAtIso = resetAtDate && Number.isFinite(resetAtDate.getTime()) && resetAtDate.getTime() > Date.now()
+    ? resetAtDate.toISOString()
+    : undefined;
+  const resetAtText = resetAtIso ? formatResetAt(resetAt) : '';
 
   return (
     <div className={`quota-card${featured ? ' featured' : ''}`}>
@@ -41,7 +51,9 @@ export default function QuotaCard({ label, percentage, resetsIn, pace, featured 
 
       <div className="quota-footer">
         <span className="reset-text">Resets in {resetsIn}</span>
-        <span className="reset-at-text" />
+        <span className="reset-at-text">
+          {resetAtIso && resetAtText && <time dateTime={resetAtIso}>{resetAtText}</time>}
+        </span>
       </div>
 
       {pace && (
