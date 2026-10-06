@@ -4,6 +4,7 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Position the tray popover on the display whose menu-bar icon was clicked, including mixed-scale macOS setups.
 - Make macOS app install, stop, and relaunch scripts transactional and restrict stopping to the selected app bundle.
 - Compact the footer status and return Ping after its first confirmation read while reporting final window confirmation in the background.
 - Prevent repeated Claude quota requests after expired OAuth credentials or 429 responses, and let manual Refresh ask Claude Code to renew its own login.
