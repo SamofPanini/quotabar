@@ -404,24 +404,6 @@ fn clean_command(binary: &Path, cwd: &Path, codex_home: Option<&Path>) -> Comman
     command
 }
 
-/// Builds the credential-refresh status check with the same CLI discovery and
-/// sanitized environment as Claude Ping. Its output is deliberately discarded.
-pub(crate) enum ClaudeAuthCommandError {
-    CliNotFound,
-    Setup,
-}
-
-pub(crate) fn build_claude_auth_status_command() -> Result<Command, ClaudeAuthCommandError> {
-    let binary = claude_cli().ok_or(ClaudeAuthCommandError::CliNotFound)?;
-    let cwd = ping_cwd().map_err(|_| ClaudeAuthCommandError::Setup)?;
-    let mut command = clean_command(&binary, &cwd, None);
-    command
-        .args(["auth", "status", "--json"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    Ok(command)
-}
-
 fn codex_args(cwd: &Path) -> Vec<String> {
     vec![
         "-C".into(),
@@ -587,20 +569,6 @@ async fn run_child_without_blocking(command: Command, timeout: Duration) -> Chil
         .unwrap_or(ChildResult::SpawnFailed)
 }
 
-/// Uses Ping's process-group timeout mechanism while deliberately discarding
-/// both output streams. `auth status` is used only for Claude Code's own
-/// credential refresh side effect; QuotaBar never consumes its output.
-pub(crate) async fn run_child_discarding_output_without_blocking(
-    command: Command,
-    timeout: Duration,
-) -> ChildResult {
-    tauri::async_runtime::spawn_blocking(move || {
-        run_child_with_output(command, timeout, || {}, false)
-    })
-    .await
-    .unwrap_or(ChildResult::SpawnFailed)
-}
-
 fn codex_tokens(stdout: &[u8]) -> Option<u64> {
     for line in stdout.split(|byte| *byte == b'\n') {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -762,6 +730,8 @@ async fn ping_codex_core(
 async fn ping_claude_core(
     force: bool,
     quota_reader: &mut (dyn FnMut() -> CoreFuture<crate::domain::models::QuotaData> + Send),
+    renewal_needed: &mut (dyn FnMut() -> CoreFuture<bool> + Send),
+    after_renew: &mut (dyn FnMut() + Send),
     clock: &(dyn Fn() -> i64 + Sync),
     runner: &mut (dyn FnMut(Command) -> CoreFuture<ChildResult> + Send),
     command_builder: &mut (dyn FnMut() -> Result<Command, PingOutcome> + Send),
@@ -769,16 +739,19 @@ async fn ping_claude_core(
     on_confirming: &mut (dyn FnMut(PingOutcome) + Send),
 ) -> PingOutcome {
     let quota = quota_reader().await;
-    if quota.error.is_some() || !quota.connected || quota.session.is_none() {
+    let renewing = quota.error.is_some() || !quota.connected || quota.session.is_none();
+    if renewing && !(force && renewal_needed().await) {
         return PingOutcome::QuotaUnreadable;
     }
-    if let Err(outcome) = ping_send_decision(
-        claude_window_state(quota.session.as_ref(), clock()),
-        force,
-        quota.session.as_ref().and_then(session_reset_epoch),
-        false,
-    ) {
-        return outcome;
+    if !renewing {
+        if let Err(outcome) = ping_send_decision(
+            claude_window_state(quota.session.as_ref(), clock()),
+            force,
+            quota.session.as_ref().and_then(session_reset_epoch),
+            false,
+        ) {
+            return outcome;
+        }
     }
     let command = match command_builder() {
         Ok(command) => command,
@@ -787,24 +760,47 @@ async fn ping_claude_core(
     let tokens = match runner(command).await {
         ChildResult::Success(stdout) => match claude_tokens(&stdout) {
             Some(tokens) => tokens,
+            None if renewing => {
+                return PingOutcome::CliFailed {
+                    code: "renewFailed",
+                }
+            }
             None => {
                 return PingOutcome::CliFailed {
                     code: "noCompletion",
                 }
             }
         },
+        ChildResult::Nonzero if renewing => {
+            return PingOutcome::CliFailed {
+                code: "renewFailed",
+            }
+        }
         ChildResult::Nonzero => {
             return PingOutcome::CliFailed {
                 code: "nonzeroExit",
             }
         }
+        ChildResult::Timeout if renewing => {
+            return PingOutcome::CliFailed {
+                code: "renewFailed",
+            }
+        }
         ChildResult::Timeout => return PingOutcome::CliFailed { code: "timeout" },
+        ChildResult::SpawnFailed if renewing => {
+            return PingOutcome::CliFailed {
+                code: "renewFailed",
+            }
+        }
         ChildResult::SpawnFailed => {
             return PingOutcome::CliFailed {
                 code: "spawnFailed",
             }
         }
     };
+    if renewing {
+        after_renew();
+    }
     let completed_at = clock();
     let plan = confirmation_plan(completed_at, &CONFIRM_DELAYS_SECS)
         .expect("constant confirmation staircase and completed timestamp fit i64");
@@ -876,6 +872,8 @@ pub async fn ping_claude(
         return PingOutcome::Busy;
     };
     let mut quota_reader = || Box::pin(claude::fetch_quota()) as CoreFuture<_>;
+    let mut renewal_needed = || Box::pin(claude::login_renewal_needed()) as CoreFuture<_>;
+    let mut after_renew = claude::invalidate_login_state;
     let clock = now_secs;
     let mut runner =
         |command| Box::pin(run_child_without_blocking(command, CLI_TIMEOUT)) as CoreFuture<_>;
@@ -884,6 +882,8 @@ pub async fn ping_claude(
     ping_claude_core(
         force,
         &mut quota_reader,
+        &mut renewal_needed,
+        &mut after_renew,
         &clock,
         &mut runner,
         &mut command_builder,
@@ -1358,10 +1358,14 @@ mod tests {
         let mut builder = || Ok(Command::new("unused"));
         let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
         let mut no_confirming = |_| {};
+        let mut no_renewal = || Box::pin(async { false }) as CoreFuture<_>;
+        let mut no_after_renew = || {};
         assert_eq!(
             tauri::async_runtime::block_on(ping_claude_core(
                 false,
                 &mut quota_reader,
+                &mut no_renewal,
+                &mut no_after_renew,
                 &clock,
                 &mut runner,
                 &mut builder,
@@ -1530,11 +1534,15 @@ mod tests {
         let confirmations = Arc::new(Mutex::new(Vec::new()));
         let callback_confirmations = Arc::clone(&confirmations);
         let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+        let mut no_renewal = || Box::pin(async { false }) as CoreFuture<_>;
+        let mut no_after_renew = || {};
 
         assert_eq!(
             tauri::async_runtime::block_on(ping_claude_core(
                 false,
                 &mut quota_reader,
+                &mut no_renewal,
+                &mut no_after_renew,
                 &clock,
                 &mut runner,
                 &mut builder,
@@ -1576,11 +1584,15 @@ mod tests {
         let confirmations = Arc::new(Mutex::new(Vec::new()));
         let callback_confirmations = Arc::clone(&confirmations);
         let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+        let mut no_renewal = || Box::pin(async { false }) as CoreFuture<_>;
+        let mut no_after_renew = || {};
 
         assert!(matches!(
             tauri::async_runtime::block_on(ping_claude_core(
                 false,
                 &mut quota_reader,
+                &mut no_renewal,
+                &mut no_after_renew,
                 &clock,
                 &mut runner,
                 &mut builder,
@@ -1606,11 +1618,15 @@ mod tests {
         let confirmations = Arc::new(Mutex::new(Vec::new()));
         let callback_confirmations = Arc::clone(&confirmations);
         let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+        let mut no_renewal = || Box::pin(async { false }) as CoreFuture<_>;
+        let mut no_after_renew = || {};
 
         assert_eq!(
             tauri::async_runtime::block_on(ping_claude_core(
                 false,
                 &mut quota_reader,
+                &mut no_renewal,
+                &mut no_after_renew,
                 &clock,
                 &mut runner,
                 &mut builder,
@@ -1645,11 +1661,15 @@ mod tests {
         let confirmations = Arc::new(Mutex::new(Vec::new()));
         let callback_confirmations = Arc::clone(&confirmations);
         let mut on_confirming = move |outcome| callback_confirmations.lock().unwrap().push(outcome);
+        let mut no_renewal = || Box::pin(async { false }) as CoreFuture<_>;
+        let mut no_after_renew = || {};
 
         assert_eq!(
             tauri::async_runtime::block_on(ping_claude_core(
                 false,
                 &mut quota_reader,
+                &mut no_renewal,
+                &mut no_after_renew,
                 &clock,
                 &mut runner,
                 &mut builder,
@@ -1668,6 +1688,187 @@ mod tests {
                 expected_resets_at: 19_000,
             }],
         );
+    }
+
+    #[test]
+    fn claude_core_renews_an_unreadable_forced_login_before_confirming() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(AtomicU64::new(0));
+        let reader_events = Arc::clone(&events);
+        let reader_reads = Arc::clone(&reads);
+        let mut quota_reader = move || {
+            let is_initial = reader_reads.fetch_add(1, Ordering::Relaxed) == 0;
+            let events = Arc::clone(&reader_events);
+            Box::pin(async move {
+                events
+                    .lock()
+                    .unwrap()
+                    .push(if is_initial { "initial" } else { "confirm" });
+                if is_initial {
+                    crate::domain::models::QuotaData::disconnected("expired")
+                } else {
+                    claude_quota(session(0.0, None))
+                }
+            }) as CoreFuture<_>
+        };
+        let renewal_events = Arc::clone(&events);
+        let mut renewal_needed = move || {
+            renewal_events.lock().unwrap().push("renewal_needed");
+            Box::pin(async { true }) as CoreFuture<_>
+        };
+        let after_events = Arc::clone(&events);
+        let mut after_renew = move || after_events.lock().unwrap().push("after_renew");
+        let runner_events = Arc::clone(&events);
+        let mut runner = move |_: Command| {
+            runner_events.lock().unwrap().push("runner");
+            successful_claude_runner(Command::new("unused"))
+        };
+        let clock = || 1_000;
+        let mut builder = || Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let mut no_confirming = |_| {};
+
+        assert!(matches!(
+            tauri::async_runtime::block_on(ping_claude_core(
+                true,
+                &mut quota_reader,
+                &mut renewal_needed,
+                &mut after_renew,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut no_confirming,
+            )),
+            PingOutcome::SentUnconfirmed { .. }
+        ));
+        let events = events.lock().unwrap();
+        let runner = events.iter().position(|event| *event == "runner").unwrap();
+        let after_renew = events
+            .iter()
+            .position(|event| *event == "after_renew")
+            .unwrap();
+        let confirmation = events.iter().position(|event| *event == "confirm").unwrap();
+        assert!(runner < after_renew && after_renew < confirmation);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == "after_renew")
+                .count(),
+            1
+        );
+        assert_eq!(events.iter().filter(|event| **event == "runner").count(), 1);
+    }
+
+    #[test]
+    fn claude_core_does_not_renew_without_force_or_when_not_needed() {
+        for (force, needed) in [(false, true), (true, false)] {
+            let mut quota_reader = || {
+                Box::pin(async { crate::domain::models::QuotaData::disconnected("expired") })
+                    as CoreFuture<_>
+            };
+            let runner_calls = Arc::new(AtomicU64::new(0));
+            let runner_calls_for_runner = Arc::clone(&runner_calls);
+            let mut runner = move |_: Command| {
+                runner_calls_for_runner.fetch_add(1, Ordering::Relaxed);
+                successful_claude_runner(Command::new("unused"))
+            };
+            let after_calls = Arc::new(AtomicU64::new(0));
+            let after_calls_for_renew = Arc::clone(&after_calls);
+            let mut after_renew = move || {
+                after_calls_for_renew.fetch_add(1, Ordering::Relaxed);
+            };
+            let mut renewal_needed = move || Box::pin(async move { needed }) as CoreFuture<_>;
+            let clock = || 1_000;
+            let mut builder = || Ok(Command::new("unused"));
+            let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+            let mut no_confirming = |_| {};
+            assert_eq!(
+                tauri::async_runtime::block_on(ping_claude_core(
+                    force,
+                    &mut quota_reader,
+                    &mut renewal_needed,
+                    &mut after_renew,
+                    &clock,
+                    &mut runner,
+                    &mut builder,
+                    &mut no_wait,
+                    &mut no_confirming,
+                )),
+                PingOutcome::QuotaUnreadable,
+            );
+            assert_eq!(runner_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(after_calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn claude_core_reports_renew_failed_without_invalidating_state() {
+        let mut quota_reader = || {
+            Box::pin(async { crate::domain::models::QuotaData::disconnected("expired") })
+                as CoreFuture<_>
+        };
+        let mut renewal_needed = || Box::pin(async { true }) as CoreFuture<_>;
+        let after_calls = Arc::new(AtomicU64::new(0));
+        let after_calls_for_renew = Arc::clone(&after_calls);
+        let mut after_renew = move || {
+            after_calls_for_renew.fetch_add(1, Ordering::Relaxed);
+        };
+        let clock = || 1_000;
+        let mut runner = |_: Command| Box::pin(async { ChildResult::Nonzero }) as CoreFuture<_>;
+        let mut builder = || Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let mut no_confirming = |_| {};
+        assert_eq!(
+            tauri::async_runtime::block_on(ping_claude_core(
+                true,
+                &mut quota_reader,
+                &mut renewal_needed,
+                &mut after_renew,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut no_confirming,
+            )),
+            PingOutcome::CliFailed {
+                code: "renewFailed"
+            },
+        );
+        assert_eq!(after_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn claude_core_skips_renewal_check_when_quota_is_readable() {
+        let mut quota_reader =
+            || Box::pin(async { claude_quota(session(0.0, None)) }) as CoreFuture<_>;
+        let renewal_calls = Arc::new(AtomicU64::new(0));
+        let renewal_calls_for_check = Arc::clone(&renewal_calls);
+        let mut renewal_needed = move || {
+            renewal_calls_for_check.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { true }) as CoreFuture<_>
+        };
+        let mut no_after_renew = || {};
+        let clock = || 1_000;
+        let mut runner = successful_claude_runner;
+        let mut builder = || Ok(Command::new("unused"));
+        let mut no_wait = |_: Duration| Box::pin(async {}) as CoreFuture<_>;
+        let mut no_confirming = |_| {};
+        assert!(matches!(
+            tauri::async_runtime::block_on(ping_claude_core(
+                false,
+                &mut quota_reader,
+                &mut renewal_needed,
+                &mut no_after_renew,
+                &clock,
+                &mut runner,
+                &mut builder,
+                &mut no_wait,
+                &mut no_confirming,
+            )),
+            PingOutcome::SentUnconfirmed { .. }
+        ));
+        assert_eq!(renewal_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

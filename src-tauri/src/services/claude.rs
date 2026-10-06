@@ -15,10 +15,8 @@ const QUOTA_CACHE_TTL: Duration = Duration::from_secs(120);
 const MAX_STALE_QUOTA_AGE: Duration = Duration::from_secs(15 * 60);
 const EXPIRY_SAFETY_WINDOW_MS: u64 = 60_000;
 const DEFAULT_RETRY_AFTER_SECS: u64 = 300;
-const CLAUDE_LOGIN_REFRESH_THROTTLE_MS: u64 = 60_000;
-const CLAUDE_LOGIN_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 const CLAUDE_TOKEN_ENV_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
-const CLAUDE_AUTH_RELOGIN_MESSAGE: &str = "Claude Code login expired. Click Refresh to renew it.";
+const CLAUDE_AUTH_RELOGIN_MESSAGE: &str = "Claude Code login expired. Press Ping to renew it.";
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 const CREDENTIAL_NAMES: [&str; 4] = [
@@ -163,14 +161,9 @@ struct RequestGateState {
 }
 
 static REQUEST_GATE_STATE: OnceLock<Mutex<RequestGateState>> = OnceLock::new();
-static LAST_CLAUDE_LOGIN_REFRESH_AT: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
 
 fn request_gate_state() -> &'static Mutex<RequestGateState> {
     REQUEST_GATE_STATE.get_or_init(|| Mutex::new(RequestGateState::default()))
-}
-
-fn last_claude_login_refresh_at() -> &'static Mutex<Option<u64>> {
-    LAST_CLAUDE_LOGIN_REFRESH_AT.get_or_init(|| Mutex::new(None))
 }
 
 fn now_epoch_ms() -> u64 {
@@ -221,19 +214,12 @@ fn rate_limited_until(now_ms: u64, retry_after_secs: u64) -> u64 {
     now_ms.saturating_add(retry_after_secs.saturating_mul(1_000))
 }
 
-fn refresh_throttled(now_ms: u64, last_refresh_at_ms: Option<u64>) -> bool {
-    last_refresh_at_ms
-        .is_some_and(|last| now_ms.saturating_sub(last) < CLAUDE_LOGIN_REFRESH_THROTTLE_MS)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ClaudeLoginRefreshResult {
     Refreshed,
     Unchanged,
-    CliNotFound,
     Failed,
-    Throttled,
 }
 
 fn login_refresh_result(
@@ -656,55 +642,56 @@ fn read_credentials(force_refresh: bool) -> Result<CachedCredentials, String> {
     get_oauth_credentials(force_refresh)
 }
 
-pub async fn refresh_claude_login() -> ClaudeLoginRefreshResult {
-    let now_ms = now_epoch_ms();
-    {
-        let Ok(mut last_refresh_at) = last_claude_login_refresh_at().lock() else {
-            return ClaudeLoginRefreshResult::Failed;
-        };
-        if refresh_throttled(now_ms, *last_refresh_at) {
-            return ClaudeLoginRefreshResult::Throttled;
-        }
-        *last_refresh_at = Some(now_ms);
+fn clear_credentials_cache() {
+    if let Ok(mut guard) = credentials_cache().lock() {
+        *guard = None;
     }
+}
 
-    let Some(_flight) = crate::services::window_ping::ClaudeFlight::acquire() else {
-        return ClaudeLoginRefreshResult::Throttled;
-    };
+/// Returns whether a forced Claude Ping may renew a locally-expired login.
+/// This only consults the local credential source and the auth gate; it never
+/// sends a quota request.
+pub(crate) async fn login_renewal_needed() -> bool {
+    // An explicit CLAUDE_CODE_OAUTH_TOKEN outranks the keychain, so renewing the
+    // Claude Code login could not change what QuotaBar reads.
+    if read_oauth_token_from_env().is_some() {
+        return false;
+    }
+    let (auth_failure, _) = gate_snapshot();
+    if auth_failure.is_some() {
+        return true;
+    }
+    match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
+        Ok(Ok(credentials)) => {
+            quota_request_gate(now_epoch_ms(), credentials.expires_at_ms, None, None)
+                == QuotaRequestGate::AuthBlocked
+        }
+        _ => false,
+    }
+}
 
-    let command = match crate::services::window_ping::build_claude_auth_status_command() {
-        Ok(command) => command,
-        Err(crate::services::window_ping::ClaudeAuthCommandError::CliNotFound) => {
-            return ClaudeLoginRefreshResult::CliNotFound;
-        }
-        Err(crate::services::window_ping::ClaudeAuthCommandError::Setup) => {
-            return ClaudeLoginRefreshResult::Failed;
-        }
-    };
-    let before = match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
+/// Makes the next quota read use the credentials written by Claude Code after
+/// a successful renewal Ping.
+pub(crate) fn invalidate_login_state() {
+    clear_credentials_cache();
+    clear_auth_gate();
+    if let Ok(mut guard) = quota_cache().lock() {
+        *guard = None;
+    }
+}
+
+pub async fn refresh_claude_login() -> ClaudeLoginRefreshResult {
+    let before = match tauri::async_runtime::spawn_blocking(|| read_credentials(false)).await {
         Ok(Ok(credentials)) => credentials.expires_at_ms,
         _ => return ClaudeLoginRefreshResult::Failed,
     };
-    match crate::services::window_ping::run_child_discarding_output_without_blocking(
-        command,
-        CLAUDE_LOGIN_REFRESH_TIMEOUT,
-    )
-    .await
-    {
-        crate::services::window_ping::ChildResult::Success(_) => {}
-        crate::services::window_ping::ChildResult::Nonzero
-        | crate::services::window_ping::ChildResult::Timeout
-        | crate::services::window_ping::ChildResult::SpawnFailed => {
-            return ClaudeLoginRefreshResult::Failed;
-        }
-    }
+    clear_credentials_cache();
     let after = match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
         Ok(Ok(credentials)) => credentials.expires_at_ms,
         _ => return ClaudeLoginRefreshResult::Failed,
     };
     let result = login_refresh_result(before, after, now_epoch_ms());
-    // Without an expiry the refresh cannot be observed; allow one more attempt.
-    if result == ClaudeLoginRefreshResult::Refreshed || after.is_none() {
+    if result == ClaudeLoginRefreshResult::Refreshed {
         clear_auth_gate();
     }
     result
@@ -923,10 +910,9 @@ mod tests {
         login_refresh_result, mark_quota_fetch_error, oauth_cache_hit_diagnostic,
         oauth_env_source_diagnostic, oauth_keychain_source_diagnostic, parse_first_quota_window,
         parse_quota_window, parse_weekly_scoped_model_quota, quota_request_gate,
-        rate_limited_until, refresh_throttled, request_gate_active, request_quota_diagnostic,
-        retry_after_secs, stale_quota_usable, AuthFailure, ClaudeLoginRefreshResult,
-        QuotaRequestGate, DEFAULT_RETRY_AFTER_SECS, EXPIRY_SAFETY_WINDOW_MS, FABLE5_QUOTA_KEYS,
-        MAX_STALE_QUOTA_AGE,
+        rate_limited_until, request_gate_active, request_quota_diagnostic, retry_after_secs,
+        stale_quota_usable, AuthFailure, ClaudeLoginRefreshResult, QuotaRequestGate,
+        DEFAULT_RETRY_AFTER_SECS, EXPIRY_SAFETY_WINDOW_MS, FABLE5_QUOTA_KEYS, MAX_STALE_QUOTA_AGE,
     };
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -1186,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_login_decision_requires_a_future_increased_expiry_and_throttles() {
+    fn refresh_login_decision_requires_a_future_increased_expiry() {
         let now = 1_000_000;
         assert_eq!(
             login_refresh_result(Some(now + 1), Some(now + 2), now),
@@ -1200,8 +1186,6 @@ mod tests {
             login_refresh_result(Some(now + 1), Some(now), now),
             ClaudeLoginRefreshResult::Unchanged
         );
-        assert!(refresh_throttled(now + 59_999, Some(now)));
-        assert!(!refresh_throttled(now + 60_000, Some(now)));
     }
 
     #[test]

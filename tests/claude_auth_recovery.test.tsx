@@ -25,6 +25,7 @@ function storage() {
 function installBackend(quota: QuotaData): void {
   vi.spyOn(backend, 'getQuota').mockResolvedValue(quota);
   vi.spyOn(backend, 'refreshClaudeLogin').mockResolvedValue('refreshed');
+  vi.spyOn(backend, 'pingClaudeWindow').mockResolvedValue({ kind: 'sentUnconfirmed' });
   vi.spyOn(backend, 'getCodexInfo').mockResolvedValue({ connected: true });
   vi.spyOn(backend, 'getCodexRateLimits').mockResolvedValue({ connected: true });
   vi.spyOn(backend, 'getCodexResetCredits').mockResolvedValue({ connected: true, availableCount: 0, credits: [] });
@@ -55,9 +56,14 @@ async function clickRefresh(renderer: ReactTestRenderer): Promise<void> {
   });
 }
 
+function pingButton(renderer: ReactTestRenderer) {
+  return renderer.root.find((node) => node.type === 'button'
+    && node.props.className === 'action-btn ping-btn');
+}
+
 const authError: QuotaData = {
   connected: false,
-  error: 'Claude Code login expired. Click Refresh to renew it.',
+  error: 'Claude Code login expired. Press Ping to renew it.',
 };
 
 beforeAll(() => { (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true; });
@@ -82,9 +88,50 @@ describe('Claude login recovery', () => {
     expect(backend.refreshClaudeLogin).toHaveBeenCalledTimes(1);
     expect(backend.refreshClaudeLogin.mock.invocationCallOrder[0])
       .toBeLessThan(backend.getQuota.mock.invocationCallOrder.at(-1)!);
+    expect(backend.pingClaudeWindow).not.toHaveBeenCalled();
     expect(JSON.stringify(renderer.toJSON())).toContain(
-      'Claude Code login is still expired. Open Claude Code and send a message, then click Refresh.',
+      'Claude Code login is still expired. Press Ping to renew it.',
     );
+    await act(async () => renderer.unmount());
+  });
+
+  it('uses Ping to confirm and renew an expired Claude Code login', async () => {
+    installBackend(authError);
+    const renderer = await renderApp();
+    const button = pingButton(renderer);
+    expect(button.props.disabled).toBeFalsy();
+    expect(button.props.title).toBe('Renew Claude Code login — sends a ping (starts a 5-hour window)');
+    await act(async () => { button.props.onClick(); await flush(); });
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Claude Code login expired. Send a ping to renew it? This starts a 5-hour window.',
+    );
+    await act(async () => {
+      renderer.root.find((node) => node.type === 'button' && node.children.join('') === 'Send').props.onClick();
+      await flush();
+    });
+    expect(backend.pingClaudeWindow).toHaveBeenCalledTimes(1);
+    expect(backend.pingClaudeWindow).toHaveBeenCalledWith(true);
+    await act(async () => renderer.unmount());
+  });
+
+  it('keeps Ping disabled for non-auth Claude errors', async () => {
+    installBackend({ connected: false, error: 'API error: 429 Too Many Requests' });
+    const renderer = await renderApp();
+    expect(pingButton(renderer).props.disabled).toBe(true);
+    expect(backend.pingClaudeWindow).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it('shows the Claude renewal failure guidance', async () => {
+    installBackend(authError);
+    vi.mocked(backend.pingClaudeWindow).mockResolvedValue({ kind: 'cliFailed', code: 'renewFailed' });
+    const renderer = await renderApp();
+    await act(async () => { pingButton(renderer).props.onClick(); await flush(); });
+    await act(async () => {
+      renderer.root.find((node) => node.type === 'button' && node.children.join('') === 'Send').props.onClick();
+      await flush();
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain('Renew failed · sign in to Claude Code in Terminal');
     await act(async () => renderer.unmount());
   });
 
@@ -109,7 +156,7 @@ describe('Claude login recovery', () => {
   });
 
   it('clears a renewal message once a later quota fetch succeeds', async () => {
-    const stillExpired = 'Claude Code login is still expired. Open Claude Code and send a message, then click Refresh.';
+    const stillExpired = 'Claude Code login is still expired. Press Ping to renew it.';
     installBackend(authError);
     vi.mocked(backend.refreshClaudeLogin).mockResolvedValue('unchanged');
     const renderer = await renderApp();
@@ -130,10 +177,8 @@ describe('Claude login recovery', () => {
 
   it('uses exact credential-safe result messages', () => {
     const expected: Record<Exclude<ClaudeLoginRefreshResult, 'refreshed'>, string> = {
-      unchanged: 'Claude Code login is still expired. Open Claude Code and send a message, then click Refresh.',
-      cliNotFound: 'Claude Code CLI not found. Sign in to Claude Code, then click Refresh.',
-      failed: "Couldn't renew the Claude Code login. Try again in a minute.",
-      throttled: "Couldn't renew the Claude Code login. Try again in a minute.",
+      unchanged: 'Claude Code login is still expired. Press Ping to renew it.',
+      failed: "Couldn't read the Claude Code login. Try again.",
     };
     expect(claudeLoginRefreshMessageFor('refreshed')).toBeNull();
     for (const [result, message] of Object.entries(expected) as Array<[keyof typeof expected, string]>) {
