@@ -31,6 +31,24 @@ fn profile_for_ping(
     .ok_or(window_ping::PingOutcome::ProfileUnavailable)
 }
 
+async fn resolve_and_ping_codex<F, Fut>(
+    alias: &str,
+    primary_dir: &std::path::Path,
+    legacy_dir: &std::path::Path,
+    force: bool,
+    ping: F,
+) -> window_ping::PingOutcome
+where
+    F: FnOnce(crate::domain::account::CodexProfile, bool) -> Fut,
+    Fut: std::future::Future<Output = window_ping::PingOutcome>,
+{
+    let profile = match profile_for_ping(alias, primary_dir, legacy_dir) {
+        Ok(profile) => profile,
+        Err(outcome) => return outcome,
+    };
+    ping(profile, force).await
+}
+
 #[tauri::command]
 pub async fn ping_codex_window(
     app: AppHandle,
@@ -43,23 +61,29 @@ pub async fn ping_codex_window(
         .map_err(|_| "Profile configuration is unavailable")?;
     let primary_dir = crate::services::state_location::primary_state_dir()
         .map_err(|_| "Profile configuration is unavailable")?;
-    let profile = match profile_for_ping(&alias, &primary_dir, &legacy_dir) {
-        Ok(profile) => profile,
-        Err(outcome) => return Ok(outcome),
-    };
-    Ok(window_ping::ping_codex(profile, force).await)
+    Ok(resolve_and_ping_codex(
+        &alias,
+        &primary_dir,
+        &legacy_dir,
+        force,
+        |profile, force| window_ping::ping_codex(profile, force),
+    )
+    .await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_root() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
+        // Canonicalize first: macOS temp dirs sit under the /var -> /private/var
+        // symlink, and the profile registry reader rejects symlinked ancestors.
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "quotabar-ping-command-{}-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -89,6 +113,63 @@ mod tests {
             profile_for_ping("broken", &root, &root),
             Err(window_ping::PingOutcome::ProfileUnavailable)
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ping_codex_window_resolves_alias_before_calling_ping() {
+        let root = temp_root();
+        let work_home = root.join("work-home");
+        fs::create_dir_all(&work_home).unwrap();
+        fs::write(
+            root.join(codex_profiles::CONFIG_FILE),
+            serde_json::json!({
+                "version": 1,
+                "profiles": [
+                    { "alias": "work", "home": work_home },
+                    { "alias": "broken" },
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        for alias in ["unknown", "broken", "contains/path"] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let ping_calls = Arc::clone(&calls);
+            let outcome = tauri::async_runtime::block_on(resolve_and_ping_codex(
+                alias,
+                &root,
+                &root,
+                false,
+                move |_, _| async move {
+                    ping_calls.fetch_add(1, Ordering::Relaxed);
+                    window_ping::PingOutcome::Busy
+                },
+            ));
+            assert_eq!(outcome, window_ping::PingOutcome::ProfileUnavailable);
+            assert_eq!(calls.load(Ordering::Relaxed), 0, "{alias}");
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_alias = Arc::new(Mutex::new(None));
+        let ping_calls = Arc::clone(&calls);
+        let ping_alias = Arc::clone(&seen_alias);
+        let outcome = tauri::async_runtime::block_on(resolve_and_ping_codex(
+            "work",
+            &root,
+            &root,
+            true,
+            move |profile, force| async move {
+                ping_calls.fetch_add(1, Ordering::Relaxed);
+                *ping_alias.lock().unwrap() = Some(profile.profile_id().to_string());
+                assert!(force);
+                window_ping::PingOutcome::Busy
+            },
+        ));
+        assert_eq!(outcome, window_ping::PingOutcome::Busy);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(seen_alias.lock().unwrap().as_deref(), Some("codex/work"));
         let _ = fs::remove_dir_all(root);
     }
 }

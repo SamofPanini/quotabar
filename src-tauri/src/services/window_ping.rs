@@ -608,6 +608,7 @@ fn build_claude_command() -> Result<Command, PingOutcome> {
         });
     };
     let mut command = clean_command(&binary, &cwd, None);
+    // PING1: multi-account = CLAUDE_CONFIG_DIR per profile; gated on Claude multi-account acquisition
     command.args(claude_args());
     Ok(command)
 }

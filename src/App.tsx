@@ -169,6 +169,7 @@ export default function App() {
   const [pingInFlight, setPingInFlight] = useState<Record<string, true>>({});
   const [pingResults, setPingResults] = useState<Record<string, PingResult>>({});
   const [pingConfirmations, setPingConfirmations] = useState<Record<string, PingConfirmation>>({});
+  const pingConfirmationGeneration = useRef(0);
   const pingResultTimers = useRef(new Map<string, { timer: ReturnType<typeof setTimeout>; generation: number }>());
   const pingResultGenerations = useRef(new Map<string, number>());
   const claudeIntervalRef = useRef(AUTO_REFRESH_INTERVAL_MS);
@@ -728,12 +729,14 @@ export default function App() {
   const pingCurrentInFlight = currentPingKey != null && Boolean(pingInFlight[currentPingKey]);
 
   useEffect(() => {
+    pingConfirmationGeneration.current += 1;
     setPingConfirmations({});
   }, [currentPingKey]);
 
   const runPing = useCallback(async (target: PingTarget, force: boolean) => {
     const key = pingTargetKey(target);
     if (pingInFlight[key]) return;
+    const confirmationGeneration = pingConfirmationGeneration.current;
     setPingConfirmations((previous) => {
       const { [key]: _confirmation, ...remaining } = previous;
       return remaining;
@@ -744,6 +747,7 @@ export default function App() {
         ? await backend.pingCodexWindow(target.alias, force)
         : await backend.pingClaudeWindow(force);
       if (outcome.kind === 'confirmationRequired') {
+        if (pingConfirmationGeneration.current !== confirmationGeneration) return;
         setPingConfirmations((previous) => ({
           ...previous,
           [key]: { ...target, message: formatPingOutcome(outcome) },
