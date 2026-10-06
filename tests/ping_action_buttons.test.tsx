@@ -15,12 +15,15 @@ function render(overrides: Partial<ComponentProps<typeof ActionButtons>> = {}) {
 }
 
 describe('Ping footer action', () => {
-  it('is absent unless a supported provider opts in and stays after Refresh as P', () => {
+  it('is absent unless a supported provider opts in and stays after the icon-only Refresh as Ping', () => {
     expect(render()).not.toContain('Ping');
     const html = render({ showPing: true });
-    expect(html.indexOf('Refresh')).toBeLessThan(html.indexOf('>P<'));
-    expect(html.indexOf('>P<')).toBeLessThan(html.indexOf('Web'));
-    expect(html).not.toContain('>Ping<');
+    expect(html.indexOf('Refresh')).toBeLessThan(html.indexOf('>Ping<'));
+    expect(html.indexOf('>Ping<')).toBeLessThan(html.indexOf('Web'));
+    expect(html).not.toContain('>P<');
+    expect(html).not.toContain('>Refresh<');
+    expect(html).toContain('aria-label="Refresh current provider"');
+    expect(render({ loading: true })).not.toContain('>Loading<');
     expect(html).toContain('aria-label="Ping selected account — start 5-hour window"');
   });
 
@@ -36,7 +39,7 @@ describe('Ping footer action', () => {
     const refreshLoading = render({ showPing: true, loading: true });
     expect(refreshLoading).toContain('title="Refresh is in progress"');
     const confirming = render({ showPing: true, pingState: 'confirming', pingDisabledReason: 'Ordinary usage blocked — ping would not open a window' });
-    expect(confirming).toContain('>P<');
+    expect(confirming).toContain('>Ping<');
     expect(confirming).toContain('disabled=""');
     expect(confirming).toContain('title="Confirming window…"');
   });
