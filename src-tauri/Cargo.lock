@@ -9,6 +9,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-sessions"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c078a983ce703c27069e826d9558d56b06c92723bb3480db526edbc3b4f89908"
+dependencies = [
+ "chrono",
+ "memchr",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -482,9 +494,11 @@ dependencies = [
 
 [[package]]
 name = "ccstats"
-version = "0.5.2"
-source = "git+https://github.com/majiayu000/ccstats.git?rev=0dfddefec11ecea5dfad5efd2e5725022fb52035#0dfddefec11ecea5dfad5efd2e5725022fb52035"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69a59db45c3aebcea3568ea596bb9b73edbb244faf09c17f750169b4acf592ba"
 dependencies = [
+ "agent-sessions",
  "base64 0.23.1",
  "chrono",
  "chrono-tz",
@@ -496,6 +510,7 @@ dependencies = [
  "json5",
  "jsonc-parser",
  "rayon",
+ "rpassword",
  "rusqlite",
  "serde",
  "serde_json",
@@ -503,6 +518,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 1.0.1+spec-1.1.0",
  "ureq",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -3759,6 +3775,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3766,6 +3793,16 @@ checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
 dependencies = [
  "hashbrown 0.16.1",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

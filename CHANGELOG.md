@@ -4,6 +4,8 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Update ccstats to 0.9.1 from crates.io (current model prices and parsers) and include its version in the cost cache identity.
+- Cursor cost now also uses Cursor credentials saved with the ccstats CLI (`credentials.toml`), not only the `CURSOR_API_KEY` / `CURSOR_SESSION_TOKEN` environment variables.
 - Discard cached cost snapshots written by a different app version or cache schema, or stamped in the future.
 - Renew an expired Claude Code login in the background with `claude doctor` before retrying quota reads.
 - Let Claude Ping renew an expired Claude Code login, while Refresh only re-reads local credentials.

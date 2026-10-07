@@ -10,12 +10,16 @@ use std::{
 /// Snapshots older than this are ignored entirely.
 pub const STALE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-pub const COST_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const COST_CACHE_SCHEMA_VERSION: u32 = 2;
+
+/// Identity of the compiled ccstats SDK, whose prices and parsers shape the payload.
+pub const CCSTATS_VERSION: &str = ccstats::VERSION;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Snapshot<T> {
     schema_version: u32,
     app_version: String,
+    ccstats_version: String,
     saved_at_unix_ms: u64,
     payload: T,
 }
@@ -68,6 +72,7 @@ pub fn write_snapshot<T: Serialize>(cache_key: &str, payload: &T) {
 fn snapshot_identity_matches<T>(snapshot: &Snapshot<T>) -> bool {
     snapshot.schema_version == COST_CACHE_SCHEMA_VERSION
         && snapshot.app_version == env!("CARGO_PKG_VERSION")
+        && snapshot.ccstats_version == CCSTATS_VERSION
 }
 
 fn read_snapshot_in<T: DeserializeOwned>(
@@ -130,6 +135,7 @@ fn write_snapshot_in<T: Serialize>(base_dir: &Path, cache_key: &str, payload: &T
     let snapshot = Snapshot {
         schema_version: COST_CACHE_SCHEMA_VERSION,
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        ccstats_version: CCSTATS_VERSION.to_owned(),
         saved_at_unix_ms,
         payload,
     };
@@ -204,6 +210,7 @@ mod tests {
                 .expect("snapshot should be valid JSON");
         assert_eq!(snapshot["schema_version"], COST_CACHE_SCHEMA_VERSION);
         assert_eq!(snapshot["app_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(snapshot["ccstats_version"], CCSTATS_VERSION);
         let _cleanup = std::fs::remove_dir_all(&base);
     }
 
@@ -233,6 +240,7 @@ mod tests {
             serde_json::json!({
                 "schema_version": COST_CACHE_SCHEMA_VERSION + 1,
                 "app_version": env!("CARGO_PKG_VERSION"),
+                "ccstats_version": CCSTATS_VERSION,
                 "saved_at_unix_ms": now_unix_ms(),
                 "payload": [1, 2, 3],
             }),
@@ -252,11 +260,32 @@ mod tests {
             serde_json::json!({
                 "schema_version": COST_CACHE_SCHEMA_VERSION,
                 "app_version": "0.0.0-other",
+                "ccstats_version": CCSTATS_VERSION,
                 "saved_at_unix_ms": now_unix_ms(),
                 "payload": [1, 2, 3],
             }),
         );
         let result: Option<(Duration, Vec<i64>)> = read_snapshot_in(&base, "app-mismatch");
+        assert!(result.is_none());
+        assert!(!path.exists(), "mismatched file should be deleted");
+        let _cleanup = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mismatched_ccstats_version_is_discarded() {
+        let base = temp_base();
+        let path = write_raw_snapshot(
+            &base,
+            "ccstats-mismatch",
+            serde_json::json!({
+                "schema_version": COST_CACHE_SCHEMA_VERSION,
+                "app_version": env!("CARGO_PKG_VERSION"),
+                "ccstats_version": "0.0.0-other",
+                "saved_at_unix_ms": now_unix_ms(),
+                "payload": [1, 2, 3],
+            }),
+        );
+        let result: Option<(Duration, Vec<i64>)> = read_snapshot_in(&base, "ccstats-mismatch");
         assert!(result.is_none());
         assert!(!path.exists(), "mismatched file should be deleted");
         let _cleanup = std::fs::remove_dir_all(&base);
@@ -271,6 +300,7 @@ mod tests {
             serde_json::json!({
                 "schema_version": COST_CACHE_SCHEMA_VERSION,
                 "app_version": env!("CARGO_PKG_VERSION"),
+                "ccstats_version": CCSTATS_VERSION,
                 "saved_at_unix_ms": now_unix_ms() + 86_400_000,
                 "payload": [1, 2, 3],
             }),
