@@ -16,7 +16,7 @@ export interface QuotaData {
   error?: string;
 }
 
-export type ClaudeLoginRefreshResult = 'refreshed' | 'unchanged' | 'failed';
+export type ClaudeLoginRefreshResult = 'refreshed' | 'unchanged' | 'failed' | 'signedOut';
 
 /** Read-only C3-A projection. It intentionally omits binding, sequence, source, and path data. */
 export type ClaudeBindingState = 'unbound' | 'bound' | 'unverified' | 'error';

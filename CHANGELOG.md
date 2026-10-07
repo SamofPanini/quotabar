@@ -4,11 +4,12 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Tell apart a signed-out Claude Code from an expired login: point to claude auth login and stop offering Ping renewal. QuotaBar no longer runs claude doctor automatically; it only checks the local login status.
 - Update ccstats to 0.9.1 from crates.io (current model prices and parsers) and include its version in the cost cache identity.
 - Cursor cost now also uses Cursor credentials saved with the ccstats CLI (`credentials.toml`), not only the `CURSOR_API_KEY` / `CURSOR_SESSION_TOKEN` environment variables.
 - Discard cached cost snapshots written by a different app version or cache schema, or stamped in the future.
-- Renew an expired Claude Code login in the background with `claude doctor` before retrying quota reads.
-- Let Claude Ping renew an expired Claude Code login, while Refresh only re-reads local credentials.
+- Refresh on an expired Claude Code login runs `claude doctor` once to try to renew it before re-reading quota.
+- Let Claude Ping renew an expired Claude Code login.
 - Position the tray popover on the display whose menu-bar icon was clicked, including mixed-scale macOS setups.
 - Make macOS app install, stop, and relaunch scripts transactional and restrict stopping to the selected app bundle.
 - Compact the footer status and return Ping after its first confirmation read while reporting final window confirmation in the background.

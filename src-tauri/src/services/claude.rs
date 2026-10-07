@@ -22,6 +22,8 @@ const DOCTOR_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_RETRY_AFTER_SECS: u64 = 300;
 const CLAUDE_TOKEN_ENV_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const CLAUDE_AUTH_RELOGIN_MESSAGE: &str = "Claude Code login expired. Press Ping to renew it.";
+const CLAUDE_SIGNED_OUT_MESSAGE: &str =
+    "Claude Code is signed out. Run claude auth login in Terminal.";
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 const CREDENTIAL_NAMES: [&str; 4] = [
@@ -42,6 +44,7 @@ static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_REQUEST_TIME: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 static LAST_AUTO_RENEW_ATTEMPT_MS: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
 static LAST_MANUAL_RENEW_ATTEMPT_MS: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+static SIGNED_OUT_MARK: OnceLock<Mutex<Option<Option<u64>>>> = OnceLock::new();
 
 fn last_request_time() -> &'static Mutex<Option<Instant>> {
     LAST_REQUEST_TIME.get_or_init(|| Mutex::new(None))
@@ -53,6 +56,10 @@ fn last_auto_renew_attempt_ms() -> &'static Mutex<Option<u64>> {
 
 fn last_manual_renew_attempt_ms() -> &'static Mutex<Option<u64>> {
     LAST_MANUAL_RENEW_ATTEMPT_MS.get_or_init(|| Mutex::new(None))
+}
+
+fn signed_out_mark() -> &'static Mutex<Option<Option<u64>>> {
+    SIGNED_OUT_MARK.get_or_init(|| Mutex::new(None))
 }
 
 fn rotate_log_if_needed(path: &Path) {
@@ -205,8 +212,10 @@ fn quota_request_gate(
     expires_at_ms: Option<u64>,
     auth_failure: Option<AuthFailure>,
     rate_limited_until: Option<u64>,
+    signed_out: bool,
 ) -> QuotaRequestGate {
-    if auth_failure.is_some_and(|failure| failure.expires_at_ms == expires_at_ms)
+    if signed_out
+        || auth_failure.is_some_and(|failure| failure.expires_at_ms == expires_at_ms)
         || expires_at_ms
             .is_some_and(|expires| expires <= now_ms.saturating_add(EXPIRY_SAFETY_WINDOW_MS))
     {
@@ -235,6 +244,68 @@ pub enum ClaudeLoginRefreshResult {
     Refreshed,
     Unchanged,
     Failed,
+    SignedOut,
+}
+
+pub(crate) fn parse_auth_status_logged_in(stdout: &[u8]) -> Option<bool> {
+    serde_json::from_slice::<serde_json::Value>(stdout)
+        .ok()?
+        .get("loggedIn")?
+        .as_bool()
+}
+
+fn signed_out_outcome(
+    refresh: ClaudeLoginRefreshResult,
+    auth_status: impl FnOnce() -> Option<bool>,
+) -> ClaudeLoginRefreshResult {
+    if refresh == ClaudeLoginRefreshResult::Unchanged && auth_status() == Some(false) {
+        ClaudeLoginRefreshResult::SignedOut
+    } else {
+        refresh
+    }
+}
+
+fn login_blocked_message(
+    signed_out_mark: Option<Option<u64>>,
+    current_expires_at_ms: Option<u64>,
+) -> &'static str {
+    if signed_out_mark == Some(current_expires_at_ms) {
+        CLAUDE_SIGNED_OUT_MESSAGE
+    } else {
+        CLAUDE_AUTH_RELOGIN_MESSAGE
+    }
+}
+
+fn login_blocked_message_for(current_expires_at_ms: Option<u64>) -> &'static str {
+    clear_signed_out_mark_if_changed(current_expires_at_ms);
+    let mark = signed_out_mark().lock().map(|mark| *mark).unwrap_or(None);
+    login_blocked_message(mark, current_expires_at_ms)
+}
+
+fn clear_signed_out_mark_if_changed(current_expires_at_ms: Option<u64>) {
+    let Ok(mut mark) = signed_out_mark().lock() else {
+        return;
+    };
+    if mark
+        .as_ref()
+        .is_some_and(|saved| *saved != current_expires_at_ms)
+    {
+        *mark = None;
+    }
+}
+
+fn signed_out_mark_matches(current_expires_at_ms: Option<u64>) -> bool {
+    let Ok(mut mark) = signed_out_mark().lock() else {
+        return false;
+    };
+    match *mark {
+        Some(saved) if saved == current_expires_at_ms => true,
+        Some(_) => {
+            *mark = None;
+            false
+        }
+        None => false,
+    }
 }
 
 fn login_refresh_result(
@@ -275,20 +346,24 @@ fn quota_is_login_expired(data: &QuotaData) -> bool {
 }
 
 type QuotaFuture = Pin<Box<dyn Future<Output = QuotaData> + Send>>;
-type RenewFuture = Pin<Box<dyn Future<Output = ClaudeLoginRefreshResult> + Send>>;
+type SignedOutProbeFuture = Pin<Box<dyn Future<Output = ClaudeLoginRefreshResult> + Send>>;
 
-async fn fetch_quota_with_auto_renew_core<F, R, D>(mut fetch: F, mut renew: R, due: D) -> QuotaData
+async fn fetch_quota_with_signed_out_probe_core<F, P, D>(
+    mut fetch: F,
+    mut probe: P,
+    due: D,
+) -> QuotaData
 where
     F: FnMut() -> QuotaFuture,
-    R: FnMut() -> RenewFuture,
+    P: FnMut() -> SignedOutProbeFuture,
     D: FnOnce() -> bool,
 {
-    let first = fetch().await;
+    let mut first = fetch().await;
     if quota_is_login_expired(&first)
         && due()
-        && renew().await == ClaudeLoginRefreshResult::Refreshed
+        && probe().await == ClaudeLoginRefreshResult::SignedOut
     {
-        return fetch().await;
+        first.error = Some(CLAUDE_SIGNED_OUT_MESSAGE.to_string());
     }
     first
 }
@@ -641,10 +716,10 @@ fn fallback_or_disconnected(error: String) -> QuotaData {
     QuotaData::disconnected(error)
 }
 
-fn gate_error(gate: QuotaRequestGate) -> QuotaData {
+fn gate_error(gate: QuotaRequestGate, expires_at_ms: Option<u64>) -> QuotaData {
     match gate {
         QuotaRequestGate::AuthBlocked => {
-            stale_or_disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE.to_string())
+            stale_or_disconnected(login_blocked_message_for(expires_at_ms).to_string())
         }
         QuotaRequestGate::RateLimited => {
             stale_or_disconnected("API error: 429 Too Many Requests".to_string())
@@ -685,8 +760,11 @@ fn request_gate_active(
     now_ms: u64,
     auth_failure: Option<AuthFailure>,
     rate_limited_until: Option<u64>,
+    signed_out_mark_present: bool,
 ) -> bool {
-    auth_failure.is_some() || rate_limited_until.is_some_and(|until| now_ms < until)
+    signed_out_mark_present
+        || auth_failure.is_some()
+        || rate_limited_until.is_some_and(|until| now_ms < until)
 }
 
 fn remember_rate_limit(retry_after: u64) {
@@ -696,7 +774,9 @@ fn remember_rate_limit(retry_after: u64) {
 }
 
 fn read_credentials(force_refresh: bool) -> Result<CachedCredentials, String> {
-    get_oauth_credentials(force_refresh)
+    let credentials = get_oauth_credentials(force_refresh)?;
+    clear_signed_out_mark_if_changed(credentials.expires_at_ms);
+    Ok(credentials)
 }
 
 fn clear_credentials_cache() {
@@ -714,14 +794,22 @@ pub(crate) async fn login_renewal_needed() -> bool {
     if read_oauth_token_from_env().is_some() {
         return false;
     }
-    let (auth_failure, _) = gate_snapshot();
-    if auth_failure.is_some() {
-        return true;
-    }
     match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
         Ok(Ok(credentials)) => {
-            quota_request_gate(now_epoch_ms(), credentials.expires_at_ms, None, None)
-                == QuotaRequestGate::AuthBlocked
+            if signed_out_mark_matches(credentials.expires_at_ms) {
+                return false;
+            }
+            let (auth_failure, _) = gate_snapshot();
+            if auth_failure.is_some() {
+                return true;
+            }
+            quota_request_gate(
+                now_epoch_ms(),
+                credentials.expires_at_ms,
+                None,
+                None,
+                signed_out_mark_matches(credentials.expires_at_ms),
+            ) == QuotaRequestGate::AuthBlocked
         }
         _ => false,
     }
@@ -737,9 +825,22 @@ pub(crate) fn invalidate_login_state() {
     }
 }
 
+fn invalidate_cached_login_reads() {
+    clear_credentials_cache();
+    if let Ok(mut guard) = quota_cache().lock() {
+        *guard = None;
+    }
+}
+
 fn login_is_blocked(expires_at_ms: Option<u64>, now_ms: u64) -> bool {
     let (auth_failure, _) = gate_snapshot();
-    quota_request_gate(now_ms, expires_at_ms, auth_failure, None) == QuotaRequestGate::AuthBlocked
+    quota_request_gate(
+        now_ms,
+        expires_at_ms,
+        auth_failure,
+        None,
+        signed_out_mark_matches(expires_at_ms),
+    ) == QuotaRequestGate::AuthBlocked
 }
 
 fn renew_attempt_due(attempts: &'static Mutex<Option<u64>>, now_ms: u64, interval_ms: u64) -> bool {
@@ -784,19 +885,12 @@ async fn renew_claude_login_with_doctor() -> ClaudeLoginRefreshResult {
             return ClaudeLoginRefreshResult::Unchanged;
         }
     };
-    if !matches!(
-        crate::services::window_ping::run_child_discarding_output_without_blocking(
-            command,
-            DOCTOR_TIMEOUT,
-        )
-        .await,
-        crate::services::window_ping::ChildResult::Success(_)
-    ) {
-        // The login is still as expired as before; only credential reads report Failed.
-        log_doctor_renew("failed", started);
-        return ClaudeLoginRefreshResult::Unchanged;
-    }
-    invalidate_login_state();
+    let doctor_result = crate::services::window_ping::run_child_discarding_output_without_blocking(
+        command,
+        DOCTOR_TIMEOUT,
+    )
+    .await;
+    invalidate_cached_login_reads();
     let after = match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
         Ok(Ok(credentials)) => credentials.expires_at_ms,
         _ => {
@@ -807,9 +901,94 @@ async fn renew_claude_login_with_doctor() -> ClaudeLoginRefreshResult {
     let result = login_refresh_result(before, after, now_epoch_ms());
     if result == ClaudeLoginRefreshResult::Refreshed {
         clear_auth_gate();
+        if let Ok(mut mark) = signed_out_mark().lock() {
+            *mark = None;
+        }
         log_doctor_renew("refreshed", started);
+        return result;
+    }
+    if !matches!(
+        doctor_result,
+        crate::services::window_ping::ChildResult::SpawnFailed
+    ) {
+        let auth_status = auth_status_logged_in().await.unwrap_or(None);
+        if signed_out_outcome(result, || auth_status) == ClaudeLoginRefreshResult::SignedOut {
+            if let Ok(mut mark) = signed_out_mark().lock() {
+                *mark = Some(after);
+            }
+            log_doctor_renew("signed_out", started);
+            return ClaudeLoginRefreshResult::SignedOut;
+        }
+    }
+    log_doctor_renew("unchanged", started);
+    result
+}
+
+/// Runs `claude auth status --json` and keeps only its `loggedIn` boolean.
+/// The caller must already hold the `ClaudeFlight`.
+async fn auth_status_logged_in() -> Result<Option<bool>, &'static str> {
+    let command = match crate::services::window_ping::build_claude_auth_status_command() {
+        Ok(command) => command,
+        Err(crate::services::window_ping::PingOutcome::CliNotFound { .. }) => {
+            return Err("cli_not_found");
+        }
+        Err(_) => return Err("failed"),
+    };
+    Ok(
+        match crate::services::window_ping::run_claude_auth_status_without_blocking(
+            command,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            crate::services::window_ping::ChildResult::Success(stdout) => {
+                parse_auth_status_logged_in(&stdout)
+            }
+            _ => None,
+        },
+    )
+}
+
+fn log_signed_out_probe(result: &str, started: Instant) {
+    log_msg(&format!(
+        "[Auth] signed-out probe: result={result} secs={:.1}",
+        started.elapsed().as_secs_f64()
+    ));
+}
+
+async fn probe_claude_signed_out() -> ClaudeLoginRefreshResult {
+    let started = Instant::now();
+    let Some(_flight) = crate::services::window_ping::ClaudeFlight::acquire() else {
+        log_signed_out_probe("skipped_busy", started);
+        return ClaudeLoginRefreshResult::Unchanged;
+    };
+    let expires_at_ms = match tauri::async_runtime::spawn_blocking(|| read_credentials(false)).await
+    {
+        Ok(Ok(credentials)) => credentials.expires_at_ms,
+        _ => {
+            log_signed_out_probe("failed", started);
+            return ClaudeLoginRefreshResult::Failed;
+        }
+    };
+    let auth_status = match auth_status_logged_in().await {
+        Ok(auth_status) => auth_status,
+        Err("cli_not_found") => {
+            log_signed_out_probe("cli_not_found", started);
+            return ClaudeLoginRefreshResult::Unchanged;
+        }
+        Err(_) => {
+            log_signed_out_probe("failed", started);
+            return ClaudeLoginRefreshResult::Failed;
+        }
+    };
+    let result = signed_out_outcome(ClaudeLoginRefreshResult::Unchanged, || auth_status);
+    if result == ClaudeLoginRefreshResult::SignedOut {
+        if let Ok(mut mark) = signed_out_mark().lock() {
+            *mark = Some(expires_at_ms);
+        }
+        log_signed_out_probe("signed_out", started);
     } else {
-        log_doctor_renew("unchanged", started);
+        log_signed_out_probe("unchanged", started);
     }
     result
 }
@@ -827,7 +1006,13 @@ pub async fn refresh_claude_login() -> ClaudeLoginRefreshResult {
     let result = login_refresh_result(before, after, now_epoch_ms());
     if result == ClaudeLoginRefreshResult::Refreshed {
         clear_auth_gate();
+        if let Ok(mut mark) = signed_out_mark().lock() {
+            *mark = None;
+        }
         return result;
+    }
+    if login_blocked_message_for(after) == CLAUDE_SIGNED_OUT_MESSAGE {
+        return ClaudeLoginRefreshResult::SignedOut;
     }
     let now_ms = now_epoch_ms();
     if !login_is_blocked(after, now_ms) {
@@ -858,9 +1043,9 @@ pub async fn refresh_claude_login() -> ClaudeLoginRefreshResult {
 pub async fn fetch_quota() -> QuotaData {
     let now_ms = now_epoch_ms();
     let env_token_present = read_oauth_token_from_env().is_some();
-    fetch_quota_with_auto_renew_core(
+    fetch_quota_with_signed_out_probe_core(
         || Box::pin(fetch_quota_once()),
-        || Box::pin(renew_claude_login_with_doctor()),
+        || Box::pin(probe_claude_signed_out()),
         || {
             auto_renew_due(
                 now_ms,
@@ -879,7 +1064,15 @@ async fn fetch_quota_once() -> QuotaData {
     log_msg("[Quota] ---- fetch_quota start ----");
 
     let (auth_failure, rate_limited_until) = gate_snapshot();
-    if request_gate_active(now_epoch_ms(), auth_failure, rate_limited_until) {
+    if request_gate_active(
+        now_epoch_ms(),
+        auth_failure,
+        rate_limited_until,
+        signed_out_mark()
+            .lock()
+            .map(|mark| mark.is_some())
+            .unwrap_or(false),
+    ) {
         // Local credential read first, so an expired login outranks the 429 window.
         let force_refresh = auth_failure.is_some();
         let credentials =
@@ -898,9 +1091,10 @@ async fn fetch_quota_once() -> QuotaData {
             credentials.expires_at_ms,
             auth_failure,
             rate_limited_until,
+            signed_out_mark_matches(credentials.expires_at_ms),
         );
         if gate != QuotaRequestGate::Allow {
-            return gate_error(gate);
+            return gate_error(gate, credentials.expires_at_ms);
         }
     }
 
@@ -927,9 +1121,10 @@ async fn fetch_quota_once() -> QuotaData {
         credentials.expires_at_ms,
         auth_failure,
         rate_limited_until,
+        signed_out_mark_matches(credentials.expires_at_ms),
     );
     if gate != QuotaRequestGate::Allow {
-        return gate_error(gate);
+        return gate_error(gate, credentials.expires_at_ms);
     }
 
     let mut response = match request_quota(&credentials.access_token).await {
@@ -978,10 +1173,11 @@ async fn fetch_quota_once() -> QuotaData {
             fresh_credentials.expires_at_ms,
             auth_failure,
             rate_limited_until,
+            signed_out_mark_matches(fresh_credentials.expires_at_ms),
         );
         if gate != QuotaRequestGate::Allow {
             log_msg("[Quota] re-read credential blocked by request gate; skipping retry");
-            return gate_error(gate);
+            return gate_error(gate, fresh_credentials.expires_at_ms);
         }
 
         response = match request_quota(&fresh_credentials.access_token).await {
@@ -1016,7 +1212,9 @@ async fn fetch_quota_once() -> QuotaData {
                 "[Quota] auth error ({status2}) after keychain re-read; stopping until Claude Code login is refreshed"
             ));
             remember_auth_failure(fresh_credentials.expires_at_ms);
-            return stale_or_disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE.to_string());
+            return stale_or_disconnected(
+                login_blocked_message_for(fresh_credentials.expires_at_ms).to_string(),
+            );
         }
     }
 
@@ -1085,13 +1283,16 @@ async fn fetch_quota_once() -> QuotaData {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_renew_due, fetch_quota_with_auto_renew_core, login_refresh_result, manual_renew_due,
-        mark_quota_fetch_error, oauth_cache_hit_diagnostic, oauth_env_source_diagnostic,
-        oauth_keychain_source_diagnostic, parse_first_quota_window, parse_quota_window,
-        parse_weekly_scoped_model_quota, quota_request_gate, rate_limited_until,
-        request_gate_active, request_quota_diagnostic, retry_after_secs, stale_quota_usable,
+        auto_renew_due, clear_auth_gate, fetch_quota_with_signed_out_probe_core, gate_snapshot,
+        invalidate_cached_login_reads, login_blocked_message, login_refresh_result,
+        manual_renew_due, mark_quota_fetch_error, oauth_cache_hit_diagnostic,
+        oauth_env_source_diagnostic, oauth_keychain_source_diagnostic, parse_auth_status_logged_in,
+        parse_first_quota_window, parse_quota_window, parse_weekly_scoped_model_quota,
+        quota_request_gate, rate_limited_until, remember_auth_failure, request_gate_active,
+        request_quota_diagnostic, retry_after_secs, signed_out_outcome, stale_quota_usable,
         AuthFailure, ClaudeLoginRefreshResult, QuotaRequestGate, CLAUDE_AUTH_RELOGIN_MESSAGE,
-        DEFAULT_RETRY_AFTER_SECS, EXPIRY_SAFETY_WINDOW_MS, FABLE5_QUOTA_KEYS, MAX_STALE_QUOTA_AGE,
+        CLAUDE_SIGNED_OUT_MESSAGE, DEFAULT_RETRY_AFTER_SECS, EXPIRY_SAFETY_WINDOW_MS,
+        FABLE5_QUOTA_KEYS, MAX_STALE_QUOTA_AGE,
     };
     use crate::domain::models::QuotaData;
     use serde_json::{json, Value};
@@ -1257,21 +1458,51 @@ mod tests {
     fn quota_gate_blocks_expired_or_near_expiry_credentials_without_a_request() {
         let now = 1_000_000;
         assert_eq!(
-            quota_request_gate(now, Some(now), None, None),
+            quota_request_gate(now, Some(now), None, None, false),
             QuotaRequestGate::AuthBlocked
         );
         assert_eq!(
-            quota_request_gate(now, Some(now + EXPIRY_SAFETY_WINDOW_MS), None, None),
+            quota_request_gate(now, Some(now + EXPIRY_SAFETY_WINDOW_MS), None, None, false),
             QuotaRequestGate::AuthBlocked
         );
         assert_eq!(
-            quota_request_gate(now, Some(now + 3_600_000), None, None),
+            quota_request_gate(now, Some(now + 3_600_000), None, None, false),
             QuotaRequestGate::Allow
         );
         assert_eq!(
-            quota_request_gate(now, None, None, None),
+            quota_request_gate(now, None, None, None, false),
             QuotaRequestGate::Allow
         );
+    }
+
+    #[test]
+    fn quota_gate_blocks_matching_signed_out_mark_even_with_valid_or_missing_expiry() {
+        let now = 1_000_000;
+        assert_eq!(
+            quota_request_gate(now, Some(now + 3_600_000), None, None, true),
+            QuotaRequestGate::AuthBlocked
+        );
+        assert_eq!(
+            quota_request_gate(now, None, None, None, true),
+            QuotaRequestGate::AuthBlocked
+        );
+        assert_eq!(
+            quota_request_gate(now, Some(now + 3_600_000), None, None, false),
+            QuotaRequestGate::Allow
+        );
+        assert_eq!(
+            quota_request_gate(now, None, None, None, false),
+            QuotaRequestGate::Allow
+        );
+    }
+
+    #[test]
+    fn invalidating_cached_login_reads_preserves_auth_failure_memory() {
+        clear_auth_gate();
+        remember_auth_failure(Some(42));
+        invalidate_cached_login_reads();
+        assert_eq!(gate_snapshot().0, failure(Some(42)));
+        clear_auth_gate();
     }
 
     #[test]
@@ -1282,7 +1513,8 @@ mod tests {
                 now,
                 Some(now + 3_600_000),
                 failure(Some(now + 3_600_000)),
-                None
+                None,
+                false
             ),
             QuotaRequestGate::AuthBlocked
         );
@@ -1291,17 +1523,18 @@ mod tests {
                 now,
                 Some(now + 7_200_000),
                 failure(Some(now + 3_600_000)),
-                None
+                None,
+                false
             ),
             QuotaRequestGate::Allow
         );
         // A failing credential without an expiry stays blocked while it is unchanged.
         assert_eq!(
-            quota_request_gate(now, None, failure(None), None),
+            quota_request_gate(now, None, failure(None), None, false),
             QuotaRequestGate::AuthBlocked
         );
         assert_eq!(
-            quota_request_gate(now, Some(now + 3_600_000), failure(None), None),
+            quota_request_gate(now, Some(now + 3_600_000), failure(None), None, false),
             QuotaRequestGate::Allow
         );
     }
@@ -1313,13 +1546,14 @@ mod tests {
     #[test]
     fn request_gate_reads_credentials_first_whenever_a_gate_is_active() {
         let now = 1_000_000;
-        assert!(!request_gate_active(now, None, None));
-        assert!(!request_gate_active(now, None, Some(now)));
-        assert!(request_gate_active(now, None, Some(now + 1)));
-        assert!(request_gate_active(now, failure(None), None));
+        assert!(!request_gate_active(now, None, None, false));
+        assert!(!request_gate_active(now, None, Some(now), false));
+        assert!(request_gate_active(now, None, Some(now + 1), false));
+        assert!(request_gate_active(now, failure(None), None, false));
+        assert!(request_gate_active(now, None, None, true));
         // Expired credential during an active 429 window reports the auth error.
         assert_eq!(
-            quota_request_gate(now, Some(now - 1), None, Some(now + 120_000)),
+            quota_request_gate(now, Some(now - 1), None, Some(now + 120_000), false),
             QuotaRequestGate::AuthBlocked
         );
     }
@@ -1329,11 +1563,11 @@ mod tests {
         let now = 1_000_000;
         let until = rate_limited_until(now, 120);
         assert_eq!(
-            quota_request_gate(now, None, None, Some(until)),
+            quota_request_gate(now, None, None, Some(until), false),
             QuotaRequestGate::RateLimited
         );
         assert_eq!(
-            quota_request_gate(until, None, None, Some(until)),
+            quota_request_gate(until, None, None, Some(until), false),
             QuotaRequestGate::Allow
         );
         assert_eq!(
@@ -1341,7 +1575,8 @@ mod tests {
                 now,
                 Some(now + 3_600_000),
                 failure(Some(now + 3_600_000)),
-                Some(until)
+                Some(until),
+                false
             ),
             QuotaRequestGate::AuthBlocked
         );
@@ -1370,6 +1605,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_claude_auth_status_logged_in_only_when_boolean() {
+        assert_eq!(
+            parse_auth_status_logged_in(br#"{"loggedIn":false,"authMethod":"none"}"#),
+            Some(false)
+        );
+        assert_eq!(
+            parse_auth_status_logged_in(br#"{"loggedIn":true}"#),
+            Some(true)
+        );
+        for stdout in [
+            b"{}".as_slice(),
+            b"not json",
+            b"",
+            br#"{"loggedIn":"false"}"#,
+        ] {
+            assert_eq!(parse_auth_status_logged_in(stdout), None);
+        }
+    }
+
+    #[test]
+    fn signed_out_outcome_only_checks_unchanged_refreshes() {
+        assert_eq!(
+            signed_out_outcome(ClaudeLoginRefreshResult::Unchanged, || Some(false)),
+            ClaudeLoginRefreshResult::SignedOut
+        );
+        for auth_status in [Some(true), None] {
+            assert_eq!(
+                signed_out_outcome(ClaudeLoginRefreshResult::Unchanged, || auth_status),
+                ClaudeLoginRefreshResult::Unchanged
+            );
+        }
+        for refresh in [
+            ClaudeLoginRefreshResult::Refreshed,
+            ClaudeLoginRefreshResult::Failed,
+        ] {
+            let calls = Cell::new(0);
+            assert_eq!(
+                signed_out_outcome(refresh, || {
+                    calls.set(calls.get() + 1);
+                    Some(false)
+                }),
+                refresh
+            );
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn login_blocked_message_uses_matching_signed_out_mark() {
+        assert_eq!(
+            login_blocked_message(Some(Some(0)), Some(0)),
+            CLAUDE_SIGNED_OUT_MESSAGE
+        );
+        assert_eq!(
+            login_blocked_message(Some(Some(0)), Some(123)),
+            CLAUDE_AUTH_RELOGIN_MESSAGE
+        );
+        assert_eq!(
+            login_blocked_message(None, Some(0)),
+            CLAUDE_AUTH_RELOGIN_MESSAGE
+        );
+        assert_eq!(
+            login_blocked_message(Some(None), None),
+            CLAUDE_SIGNED_OUT_MESSAGE
+        );
+    }
+
+    #[test]
     fn auto_and_manual_renew_due_obey_intervals_and_env_override() {
         let now = 1_000_000;
         assert!(auto_renew_due(now, None, false));
@@ -1387,41 +1690,35 @@ mod tests {
     }
 
     #[test]
-    fn auto_renew_core_refetches_once_after_refresh() {
+    fn signed_out_probe_core_replaces_expired_error_without_refetching() {
         let fetches = Cell::new(0);
-        let renewals = Cell::new(0);
+        let probes = Cell::new(0);
         let first = QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE.to_string());
-        let second = QuotaData::connected(None, None, None, None, None, None);
-        let result = tauri::async_runtime::block_on(fetch_quota_with_auto_renew_core(
+        let result = tauri::async_runtime::block_on(fetch_quota_with_signed_out_probe_core(
             || {
-                let count = fetches.get();
-                fetches.set(count + 1);
-                Box::pin(std::future::ready(if count == 0 {
-                    first.clone()
-                } else {
-                    second.clone()
-                }))
+                fetches.set(fetches.get() + 1);
+                Box::pin(std::future::ready(first.clone()))
             },
             || {
-                renewals.set(renewals.get() + 1);
-                Box::pin(std::future::ready(ClaudeLoginRefreshResult::Refreshed))
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
             },
             || true,
         ));
-        assert_eq!(fetches.get(), 2);
-        assert_eq!(renewals.get(), 1);
-        assert!(result.connected);
+        assert_eq!(fetches.get(), 1);
+        assert_eq!(probes.get(), 1);
+        assert_eq!(result.error.as_deref(), Some(CLAUDE_SIGNED_OUT_MESSAGE));
     }
 
     #[test]
-    fn auto_renew_core_keeps_expired_result_when_renewal_does_not_refresh() {
+    fn signed_out_probe_core_keeps_expired_result_when_probe_does_not_detect_sign_out() {
         for outcome in [
             ClaudeLoginRefreshResult::Unchanged,
             ClaudeLoginRefreshResult::Failed,
         ] {
             let fetches = Cell::new(0);
             let first = QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE.to_string());
-            let result = tauri::async_runtime::block_on(fetch_quota_with_auto_renew_core(
+            let result = tauri::async_runtime::block_on(fetch_quota_with_signed_out_probe_core(
                 || {
                     fetches.set(fetches.get() + 1);
                     Box::pin(std::future::ready(first.clone()))
@@ -1435,33 +1732,54 @@ mod tests {
     }
 
     #[test]
-    fn auto_renew_core_skips_renewal_before_due() {
-        let renewals = Cell::new(0);
+    fn signed_out_probe_core_skips_probe_before_due() {
+        let probes = Cell::new(0);
         let first = QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE.to_string());
-        let _ = tauri::async_runtime::block_on(fetch_quota_with_auto_renew_core(
+        let _ = tauri::async_runtime::block_on(fetch_quota_with_signed_out_probe_core(
             || Box::pin(std::future::ready(first.clone())),
             || {
-                renewals.set(renewals.get() + 1);
-                Box::pin(std::future::ready(ClaudeLoginRefreshResult::Refreshed))
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
             },
             || false,
         ));
-        assert_eq!(renewals.get(), 0);
+        assert_eq!(probes.get(), 0);
     }
 
     #[test]
-    fn auto_renew_core_does_not_consult_due_for_other_results() {
+    fn signed_out_probe_core_never_checks_due_or_probes_signed_out_result() {
+        let due_calls = Cell::new(0);
+        let probes = Cell::new(0);
+        let first = QuotaData::disconnected(CLAUDE_SIGNED_OUT_MESSAGE.to_string());
+        let result = tauri::async_runtime::block_on(fetch_quota_with_signed_out_probe_core(
+            || Box::pin(std::future::ready(first.clone())),
+            || {
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
+            },
+            || {
+                due_calls.set(due_calls.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(result.error.as_deref(), Some(CLAUDE_SIGNED_OUT_MESSAGE));
+        assert_eq!(due_calls.get(), 0);
+        assert_eq!(probes.get(), 0);
+    }
+
+    #[test]
+    fn signed_out_probe_core_does_not_consult_due_for_other_results() {
         for data in [
             QuotaData::disconnected("API error: 429 Too Many Requests".to_string()),
             QuotaData::connected(None, None, None, None, None, None),
         ] {
             let due_calls = Cell::new(0);
-            let renewals = Cell::new(0);
-            let _ = tauri::async_runtime::block_on(fetch_quota_with_auto_renew_core(
+            let probes = Cell::new(0);
+            let _ = tauri::async_runtime::block_on(fetch_quota_with_signed_out_probe_core(
                 || Box::pin(std::future::ready(data.clone())),
                 || {
-                    renewals.set(renewals.get() + 1);
-                    Box::pin(std::future::ready(ClaudeLoginRefreshResult::Refreshed))
+                    probes.set(probes.get() + 1);
+                    Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
                 },
                 || {
                     due_calls.set(due_calls.get() + 1);
@@ -1469,7 +1787,7 @@ mod tests {
                 },
             ));
             assert_eq!(due_calls.get(), 0);
-            assert_eq!(renewals.get(), 0);
+            assert_eq!(probes.get(), 0);
         }
     }
 
