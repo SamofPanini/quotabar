@@ -161,6 +161,8 @@ mod tests {
             estimated_weekly_tokens: 4_000.0,
             valid_entries: 1,
             dedup_skipped_entries: 0,
+            astra_equivalent_weekly_tokens: None,
+            model_estimates: Vec::new(),
         }
     }
 

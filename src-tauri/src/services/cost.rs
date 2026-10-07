@@ -650,6 +650,49 @@ mod tests {
     }
 
     #[test]
+    fn unpriced_costs_stay_none_instead_of_zero() {
+        let date = match NaiveDate::from_ymd_opt(2026, 7, 16) {
+            Some(date) => date,
+            None => panic!("fixture date should be valid"),
+        };
+        let mut daily_summary = summary(
+            UsageRange::DateRange {
+                since: Some(date),
+                until: Some(date),
+            },
+            1,
+        );
+        daily_summary.cost = None;
+        daily_summary.cost_usd = None;
+        let daily = match build_daily_series_from_batch(&[date], batch(vec![daily_summary])) {
+            Ok(daily) => daily,
+            Err(err) => panic!("daily response should build: {err}"),
+        };
+
+        let mut overview_summaries = vec![
+            summary(UsageRange::Today, 1),
+            summary(UsageRange::ThisWeek, 1),
+            summary(UsageRange::ThisMonth, 1),
+        ];
+        for summary in &mut overview_summaries {
+            summary.cost = None;
+            summary.cost_usd = None;
+        }
+        let overview =
+            match build_overview_from_batch(&cost_range_specs(), batch(overview_summaries)) {
+                Ok(overview) => overview,
+                Err(err) => panic!("overview response should build: {err}"),
+            };
+
+        assert_eq!(daily.days[0].cost, None);
+        assert_eq!(daily.days[0].cost_usd, None);
+        assert!(overview
+            .ranges
+            .iter()
+            .all(|range| range.cost.is_none() && range.cost_usd.is_none()));
+    }
+
+    #[test]
     fn rejects_unexpected_batch_summary_count() {
         let specs = cost_range_specs();
         let err = match map_batch_ranges(&specs, vec![summary(UsageRange::Today, 1)]) {
