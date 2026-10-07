@@ -4,6 +4,7 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Discard cached cost snapshots written by a different app version or cache schema, or stamped in the future.
 - Renew an expired Claude Code login in the background with `claude doctor` before retrying quota reads.
 - Let Claude Ping renew an expired Claude Code login, while Refresh only re-reads local credentials.
 - Position the tray popover on the display whose menu-bar icon was clicked, including mixed-scale macOS setups.
