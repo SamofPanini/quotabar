@@ -173,6 +173,7 @@ export function getClaudeTrayUsedPercentForWindow(
 export function isClaudeAuthError(error: string): boolean {
   const normalized = error.toLowerCase();
   return (
+    isClaudeSignedOutError(error) ||
     normalized.includes('oauth token') ||
     normalized.includes('re-login') ||
     normalized.includes('login to claude code') ||
@@ -186,6 +187,10 @@ export function isClaudeAuthError(error: string): boolean {
   );
 }
 
+export function isClaudeSignedOutError(error: string): boolean {
+  return error.toLowerCase().includes('claude code is signed out');
+}
+
 export function getClaudeRefreshIntervalMs(error?: string | null): number {
   if (!error) {
     return AUTO_REFRESH_INTERVAL_MS;
@@ -193,6 +198,10 @@ export function getClaudeRefreshIntervalMs(error?: string | null): number {
 
   if (error.includes('429')) {
     return BACKOFF_REFRESH_INTERVAL_MS;
+  }
+
+  if (isClaudeSignedOutError(error)) {
+    return AUTO_REFRESH_INTERVAL_MS;
   }
 
   if (isClaudeAuthError(error)) {

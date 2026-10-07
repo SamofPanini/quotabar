@@ -3,6 +3,13 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import App, { claudeLoginRefreshMessageFor } from '../src/App';
 import { backend } from '../src/services/backend';
+import {
+  AUTO_REFRESH_INTERVAL_MS,
+  AUTH_REFRESH_INTERVAL_MS,
+  getClaudeRefreshIntervalMs,
+  isClaudeAuthError,
+  isClaudeSignedOutError,
+} from '../src/services/app_state';
 import type { ClaudeLoginRefreshResult, QuotaData } from '../src/types/models';
 
 vi.mock('../src/hooks/use_popover_window', () => ({ usePopoverWindow: () => false }));
@@ -65,6 +72,10 @@ const authError: QuotaData = {
   connected: false,
   error: 'Claude Code login expired. Press Ping to renew it.',
 };
+const signedOutError: QuotaData = {
+  connected: false,
+  error: 'Claude Code is signed out. Run claude auth login in Terminal.',
+};
 
 beforeAll(() => { (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true; });
 beforeEach(() => {
@@ -111,6 +122,36 @@ describe('Claude login recovery', () => {
     });
     expect(backend.pingClaudeWindow).toHaveBeenCalledTimes(1);
     expect(backend.pingClaudeWindow).toHaveBeenCalledWith(true);
+    await act(async () => renderer.unmount());
+  });
+
+  it('disables Ping and does not offer renewal for a signed-out Claude Code login', async () => {
+    installBackend(signedOutError);
+    const renderer = await renderApp();
+    const button = pingButton(renderer);
+    expect(button.props.disabled).toBe(true);
+    expect(button.props.title).toBe('Sign in to Claude Code in Terminal first');
+    await act(async () => { button.props.onClick(); await flush(); });
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Send a ping to renew it?');
+    expect(backend.pingClaudeWindow).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it('clears an expired-login confirmation when Claude becomes signed out', async () => {
+    installBackend(authError);
+    const renderer = await renderApp();
+    await act(async () => { pingButton(renderer).props.onClick(); await flush(); });
+    expect(JSON.stringify(renderer.toJSON())).toContain('Send a ping to renew it?');
+
+    vi.mocked(backend.getQuota).mockResolvedValue(signedOutError);
+    await clickRefresh(renderer);
+    expect(pingButton(renderer).props.disabled).toBe(true);
+    expect(pingButton(renderer).props.title).toBe('Sign in to Claude Code in Terminal first');
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Send a ping to renew it?');
+
+    const actions = renderer.root.find((node) => typeof node.props.onPingConfirm === 'function');
+    await act(async () => { actions.props.onPingConfirm(); await flush(); });
+    expect(backend.pingClaudeWindow).not.toHaveBeenCalled();
     await act(async () => renderer.unmount());
   });
 
@@ -179,11 +220,21 @@ describe('Claude login recovery', () => {
     const expected: Record<Exclude<ClaudeLoginRefreshResult, 'refreshed'>, string> = {
       unchanged: 'Claude Code login is still expired. Press Ping to renew it.',
       failed: "Couldn't read the Claude Code login. Try again.",
+      signedOut: 'Claude Code is signed out. Run claude auth login in Terminal.',
     };
     expect(claudeLoginRefreshMessageFor('refreshed')).toBeNull();
     for (const [result, message] of Object.entries(expected) as Array<[keyof typeof expected, string]>) {
       expect(claudeLoginRefreshMessageFor(result)).toBe(message);
       expect(message).not.toMatch(/@|token=|\/(Users|home)\//);
     }
+  });
+
+  it('classifies signed-out errors before ordinary auth backoff', () => {
+    const signedOut = signedOutError.error!;
+    expect(isClaudeSignedOutError(signedOut)).toBe(true);
+    expect(isClaudeAuthError(signedOut)).toBe(true);
+    expect(getClaudeRefreshIntervalMs(signedOut)).toBe(AUTO_REFRESH_INTERVAL_MS);
+    expect(isClaudeSignedOutError(authError.error!)).toBe(false);
+    expect(getClaudeRefreshIntervalMs(authError.error!)).toBe(AUTH_REFRESH_INTERVAL_MS);
   });
 });

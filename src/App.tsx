@@ -87,6 +87,7 @@ import {
   getClaudeTrayUsedPercent,
   getClaudeTrayUsedPercentForWindow,
   isClaudeAuthError,
+  isClaudeSignedOutError,
   keepClaudeQuotaOnError,
   getInitialTrayEnabledState,
   getSavedDockHidden,
@@ -163,6 +164,7 @@ export function claudeLoginRefreshMessageFor(result: ClaudeLoginRefreshResult): 
     case 'refreshed': return null;
     case 'unchanged': return 'Claude Code login is still expired. Press Ping to renew it.';
     case 'failed': return "Couldn't read the Claude Code login. Try again.";
+    case 'signedOut': return 'Claude Code is signed out. Run claude auth login in Terminal.';
   }
 }
 
@@ -763,16 +765,27 @@ export default function App() {
     ? codexPingContext?.limits?.ordinaryUsageAllowed === false
       ? 'Ordinary usage blocked — ping would not open a window'
       : !codexPingContext?.available ? (codexPingContext?.unavailableReason ?? 'Quota unavailable') : undefined
+    : pingProvider === 'claude' && claudeError && isClaudeSignedOutError(claudeError)
+      ? 'Sign in to Claude Code in Terminal first'
     : pingProvider === 'claude' && (!quota?.connected || Boolean(claudeError))
       && !(claudeError && isClaudeAuthError(claudeError))
       ? (claudeError ?? 'Claude quota unavailable') : undefined;
   const pingCurrentInFlight = currentPingKey != null && Boolean(pingInFlight[currentPingKey]);
   const pingCurrentConfirming = currentPingKey != null && Boolean(pingConfirming[currentPingKey]);
+  const claudeSignedOut = Boolean(claudeError && isClaudeSignedOutError(claudeError));
 
   useEffect(() => {
     pingConfirmationGeneration.current += 1;
     setPingConfirmations({});
   }, [currentPingKey]);
+
+  useEffect(() => {
+    if (!claudeSignedOut || pingProvider !== 'claude' || currentPingKey == null) return;
+    setPingConfirmations((previous) => {
+      const { [currentPingKey]: _confirmation, ...remaining } = previous;
+      return remaining;
+    });
+  }, [claudeSignedOut, currentPingKey, pingProvider]);
 
   const refreshAfterPing = useCallback((target: PingTarget) => {
     if (target.provider === 'codex') {
@@ -1113,10 +1126,12 @@ export default function App() {
               pingState={pingCurrentConfirming ? 'confirming' : pingCurrentInFlight ? 'inFlight' : 'idle'}
               pingDisabledReason={pingDisabledReason}
               pingTitle={pingProvider === 'claude' && claudeError && isClaudeAuthError(claudeError)
+                && !isClaudeSignedOutError(claudeError)
                 ? 'Renew Claude Code login — sends a ping (starts a 5-hour window)'
                 : `Ping ${pingAlias} — start 5-hour window`}
               pingConfirmText={visiblePingConfirmation?.message}
               onPingConfirm={() => {
+                if (pingDisabledReason) return;
                 if (visiblePingConfirmation) void runPing(visiblePingConfirmation, true);
               }}
               onPingCancel={() => {
