@@ -4,6 +4,7 @@ import { getBudgetForSources, getSavedMonthlyBudgets } from '../services/budget'
 import type { CostDailyPoint, CostDailySeries, CostOverview, CostRangeSummary, CostSource } from '../types/models';
 import { getProgressStyle } from '../utils/quota_format';
 import { useLatestRequestGeneration } from '../hooks/use_latest_request_generation';
+import { getCursorOnlineCostEnabled } from '../services/storage';
 
 interface CostSummarySectionProps {
   source: CostSource | readonly CostSource[];
@@ -216,6 +217,10 @@ export default function CostSummarySection({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sourceKey = Array.isArray(source) ? source.join(',') : source;
+  const allowCursorOnline = getCursorOnlineCostEnabled();
+  const requestedSources = Array.isArray(source) ? source : [source];
+  const sources = requestedSources.filter((item) => item !== 'cursor' || allowCursorOnline);
+  const cursorCostIsOff = requestedSources.includes('cursor') && !allowCursorOnline;
   const overview_generation = useLatestRequestGeneration();
   const daily_generation = useLatestRequestGeneration();
   const lastRefreshKeyRef = useRef(refreshKey);
@@ -228,8 +233,13 @@ export default function CostSummarySection({
       try {
         setLoading(true);
         setError(null);
-        const sources = Array.isArray(source) ? source : [source];
-        const overviews = await Promise.all(sources.map((item) => backend.getCostOverview(item, force)));
+        if (sources.length === 0) {
+          setOverview(null);
+          return;
+        }
+        const overviews = await Promise.all(
+          sources.map((item) => backend.getCostOverview(item, force, allowCursorOnline)),
+        );
         if (!overview_generation.isCurrent(generation)) return;
         const data = mergeCostOverviews(overviews);
         setOverview(data);
@@ -246,9 +256,12 @@ export default function CostSummarySection({
     const loadDaily = async (force: boolean) => {
       const generation = daily_generation.begin();
       try {
-        const sources = Array.isArray(source) ? source : [source];
+        if (sources.length === 0) {
+          setDaily(null);
+          return;
+        }
         const seriesList = await Promise.all(
-          sources.map((item) => backend.getCostDaily(item, DAILY_SERIES_DAYS, force)),
+          sources.map((item) => backend.getCostDaily(item, DAILY_SERIES_DAYS, force, allowCursorOnline)),
         );
         if (!daily_generation.isCurrent(generation)) return;
         setDaily(mergeDailySeries(seriesList));
@@ -278,7 +291,7 @@ export default function CostSummarySection({
         clearInterval(interval);
       }
     };
-  }, [sourceKey, refreshKey, autoRefreshIntervalMs, overview_generation, daily_generation]);
+  }, [sourceKey, allowCursorOnline, refreshKey, autoRefreshIntervalMs, overview_generation, daily_generation]);
 
   const primaryRange = useMemo(() => pickPrimaryRange(overview), [overview]);
   const topModels = primaryRange?.models.slice(0, 3) ?? [];
@@ -286,9 +299,8 @@ export default function CostSummarySection({
   // Budgets are edited in Settings, which unmounts this component, so a
   // read-on-mount snapshot stays in sync.
   const monthlyBudget = useMemo(() => {
-    const sources = Array.isArray(source) ? source : [source];
     return getBudgetForSources(getSavedMonthlyBudgets(), sources);
-  }, [sourceKey]);
+  }, [sourceKey, allowCursorOnline]);
   const monthRange = overview?.ranges.find((range) => range.range === 'month') ?? null;
   const monthCost = monthRange ? monthRange.costUsd ?? monthRange.cost : null;
   const budgetPercent = monthlyBudget != null && monthCost != null
@@ -304,6 +316,10 @@ export default function CostSummarySection({
           {overview && <span className="cost-note">{formatCostNote(primaryRange)}</span>}
         </span>
       </div>
+
+      {cursorCostIsOff && (
+        <div className="cost-inline-error compact">Cursor online cost is off. Turn it on in Settings.</div>
+      )}
 
       {loading && !overview && (
         <div className="cost-loading">Loading cost...</div>

@@ -385,8 +385,8 @@ const attached_alias_call_fixtures = [
   [
     'sources.map callback',
     paths.cost,
-    'backend.getCostOverview(item, force)',
-    'backend.getCostOverview(item, force, backend_alias.getCostOverview(item, force))',
+    'backend.getCostOverview(item, force, allowCursorOnline)',
+    'backend.getCostOverview(item, force, allowCursorOnline, backend_alias.getCostOverview(item, force))',
   ],
 ];
 for (const [name, path, from, to] of attached_alias_call_fixtures) {
@@ -398,8 +398,8 @@ for (const [name, path, from, to] of attached_alias_call_fixtures) {
 test('rejects a wrong sources.map callback parameter', () => {
   rejects_change(
     paths.cost,
-    'sources.map((item) => backend.getCostOverview(item, force))',
-    'sources.map((wrong_item) => backend.getCostOverview(item, force))',
+    'sources.map((item) => backend.getCostOverview(item, force, allowCursorOnline))',
+    'sources.map((wrong_item) => backend.getCostOverview(item, force, allowCursorOnline))',
     /callback parameter/,
   );
 });
@@ -485,9 +485,18 @@ test('rejects a Codex member promise omitted from Promise.all settlement', () =>
 test('rejects a Cost backend call discarded inside the sources.map callback', () => {
   rejects_change(
     paths.cost,
-    'sources.map((item) => backend.getCostOverview(item, force))',
-    'sources.map((item) => (backend.getCostOverview(item, force), Promise.resolve(null)))',
+    'sources.map((item) => backend.getCostOverview(item, force, allowCursorOnline))',
+    'sources.map((item) => (backend.getCostOverview(item, force, allowCursorOnline), Promise.resolve(null)))',
     /map callback must directly return a backend call/,
+  );
+});
+
+test('rejects a missing explicit Cursor online cost argument', () => {
+  rejects_change(
+    paths.cost,
+    'backend.getCostOverview(item, force, allowCursorOnline)',
+    'backend.getCostOverview(item, force)',
+    /backend call arguments are wrong/,
   );
 });
 

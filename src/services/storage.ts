@@ -25,6 +25,7 @@ const failedWriteShadow = new Map<string, string>();
 const failureListeners = new Set<StorageWriteFailureListener>();
 const readFailureListeners = new Set<StorageReadFailureListener>();
 let pendingReadFailure = false;
+const CURSOR_ONLINE_COST_STORAGE_KEY = 'quotabar-cursor-online-cost';
 
 const DEFAULT_WRITE_OPTIONS: StorageWriteOptions = {
   preserveSessionValue: false,
@@ -131,4 +132,21 @@ export function subscribeStorageWriteFailures(
   return () => {
     failureListeners.delete(listener);
   };
+}
+
+/** Cursor cost is opt-in because ccstats may use saved credentials online. */
+export function getCursorOnlineCostEnabled(): boolean {
+  const result = readStorageValue(CURSOR_ONLINE_COST_STORAGE_KEY, (raw) => {
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+    throw new Error('Invalid Cursor online cost setting');
+  }, { notifyUser: true });
+  return result.status === 'value' ? result.value : false;
+}
+
+export function setCursorOnlineCostEnabled(enabled: boolean): boolean {
+  return writeStorageItem(CURSOR_ONLINE_COST_STORAGE_KEY, String(enabled), {
+    preserveSessionValue: true,
+    notifyUser: true,
+  });
 }
