@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import ActionButtons from './components/ActionButtons';
 import OverviewPanel from './components/OverviewPanel';
 import SettingsView from './components/SettingsView';
+import { useUiScale } from './hooks/use_ui_scale';
 import type { ThemeName } from './components/ThemeSelector';
 import TabSwitcher, { TabName } from './components/TabSwitcher';
 import ClaudePanel from './components/ClaudePanel';
@@ -239,8 +240,6 @@ export default function App() {
   const [notifSettings, setNotifSettings] = useState<NotificationSettings>(getSavedNotificationSettings);
   const bonusReadyPrevRef = useRef<{ exhausted: boolean; availableCount: number } | null>(null);
   const [switcherVisibility, setSwitcherVisibility] = useState<SwitcherVisibility>(getSavedSwitcherVisibility);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const windowVisible = usePopoverWindow(containerRef, [activeView, quota, connected]);
   const lastTrayIconRequestRef = useRef<Partial<Record<TrayServiceName, TrayIconRequest>>>({});
   const trayIconGenerationRef = useRef<Partial<Record<TrayServiceName, number>>>({});
 
@@ -300,6 +299,10 @@ export default function App() {
       setToast((current) => current === message ? null : current);
     }, delayMs);
   }, [setToast]);
+
+  const { scale: uiScale, changeScale } = useUiScale(showTimedToast);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const windowVisible = usePopoverWindow(containerRef, [activeView, quota, connected], uiScale);
 
   const showStorageWriteFailure = useCallback(() => {
     showTimedToast(STORAGE_WRITE_FAILURE_MESSAGE);
@@ -1007,6 +1010,7 @@ export default function App() {
               events={events}
               notificationSettings={notifSettings}
               switcherVisibility={switcherVisibility}
+              uiScale={uiScale}
               onClose={handleCloseSettings}
               onThemeChange={handleThemeChange}
               onDockToggle={handleDockToggle}
@@ -1018,6 +1022,7 @@ export default function App() {
               onClaudeMenuBarQuotaWindowChange={handleClaudeMenuBarQuotaWindowChange}
               onNotificationToggle={handleNotificationToggle}
               onSwitcherToggle={handleSwitcherToggle}
+              onUiScaleChange={changeScale}
               onApplyPreset={applyProviderPreset}
               onSelectEventProvider={handleSelectEventProvider}
               onAutostartNotice={showTimedToast}

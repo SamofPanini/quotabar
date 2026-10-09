@@ -232,7 +232,8 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  max-height: 580px;
+  max-height: min(580px, calc(100vh - 2px));
+  max-height: min(580px, calc(100dvh - 2px));
   overflow: hidden;
   scrollbar-width: none;
   -ms-overflow-style: none;
@@ -723,4 +724,3 @@ html, body, #root {
   font-size: 12px;
   line-height: 1.3;
 }
-

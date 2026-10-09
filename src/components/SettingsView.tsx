@@ -28,6 +28,7 @@ import {
   type PanelSectionVisibility,
 } from '../services/panel_sections';
 import type { MenuBarQuotaWindow } from '../services/codex_tray_window';
+import { UI_SCALES, type UiScale } from '../hooks/use_ui_scale';
 
 interface SettingsViewProps {
   isMacOS: boolean;
@@ -42,6 +43,7 @@ interface SettingsViewProps {
   events: AppEvent[];
   notificationSettings: NotificationSettings;
   switcherVisibility: SwitcherVisibility;
+  uiScale?: UiScale;
   onClose: () => void;
   onThemeChange: (theme: ThemeName) => void;
   onDockToggle: () => void;
@@ -53,6 +55,7 @@ interface SettingsViewProps {
   onClaudeMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
   onNotificationToggle: (key: NotificationKey) => void;
   onSwitcherToggle: (service: TrayServiceName) => void;
+  onUiScaleChange?: (scale: UiScale) => void;
   onApplyPreset: (preset: ProviderPreset) => void;
   onSelectEventProvider: (service: TrayServiceName) => void;
   onAutostartNotice?: (message: string) => void;
@@ -71,6 +74,7 @@ export default function SettingsView({
   events,
   notificationSettings,
   switcherVisibility,
+  uiScale = 1,
   onClose,
   onThemeChange,
   onDockToggle,
@@ -82,6 +86,7 @@ export default function SettingsView({
   onClaudeMenuBarQuotaWindowChange,
   onNotificationToggle,
   onSwitcherToggle,
+  onUiScaleChange,
   onApplyPreset,
   onSelectEventProvider,
   onAutostartNotice,
@@ -179,6 +184,23 @@ export default function SettingsView({
           </div>
         </div>
         <ThemeSelector currentTheme={theme} onThemeChange={onThemeChange} />
+        <div className="settings-subsection-title">Interface size</div>
+        <div className="settings-seg" aria-label="Interface size">
+          {UI_SCALES.map((scale) => (
+            <button
+              key={scale}
+              type="button"
+              className={`settings-seg-btn ${uiScale === scale ? 'active' : ''}`}
+              onClick={() => onUiScaleChange?.(scale)}
+              aria-pressed={uiScale === scale}
+            >
+              {scale * 100}%
+            </button>
+          ))}
+        </div>
+        <div className="settings-hint">
+          Enlarges text and controls in the panel. Your display scaling stays the same.
+        </div>
         <div className="settings-subsection-title">Menu bar style</div>
         <div className="settings-seg">
           {TRAY_STYLE_OPTIONS.map((option) => (
