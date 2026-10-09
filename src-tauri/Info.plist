@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>LSMinimumSystemVersion</key>
-  <string>10.15</string>
+  <string>11.0</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSHighResolutionCapable</key>
