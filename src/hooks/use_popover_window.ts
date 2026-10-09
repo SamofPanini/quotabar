@@ -7,26 +7,27 @@ const FOCUS_SUBSCRIPTION_ERROR_MESSAGE = 'Failed to subscribe to popover focus c
 
 /**
  * Tracks popover window visibility (via focus events) and keeps the
- * window height in sync with the rendered content while visible.
+ * window height in sync with the rendered content, including while hidden.
  * Returns the current visibility.
  */
 export function usePopoverWindow(
   containerRef: RefObject<HTMLDivElement | null>,
   resizeDeps: readonly unknown[],
+  uiScale = 1,
 ): boolean {
   const [windowVisible, setWindowVisible] = useState(false);
 
   // Auto-resize window to content.
   useEffect(() => {
-    if (!windowVisible) {
-      return;
-    }
-
     const updateHeight = async () => {
       if (containerRef.current) {
-        const height = containerRef.current.scrollHeight + 24;
+        const panelScroll = containerRef.current.querySelector<HTMLElement>('.panel-scroll');
+        const overflow = panelScroll
+          ? Math.max(0, panelScroll.scrollHeight - panelScroll.clientHeight)
+          : 0;
+        const height = Math.min(Math.max(containerRef.current.scrollHeight + 24 + overflow, 300), 620);
         try {
-          await backend.resizeWindow(Math.min(Math.max(height, 300), 620));
+          await backend.resizeWindow(height * uiScale, 340 * uiScale);
         } catch (err) {
           console.error('Failed to resize window:', err);
         }
@@ -42,6 +43,10 @@ export function usePopoverWindow(
 
     if (containerRef.current) {
       observer.observe(containerRef.current);
+      const panelScroll = containerRef.current.querySelector('.panel-scroll');
+      if (panelScroll) {
+        for (const child of panelScroll.children) observer.observe(child);
+      }
     }
 
     return () => {
@@ -50,7 +55,7 @@ export function usePopoverWindow(
       observer.disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowVisible, containerRef, ...resizeDeps]);
+  }, [windowVisible, containerRef, uiScale, ...resizeDeps]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {

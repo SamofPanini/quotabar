@@ -10,6 +10,7 @@ const allowedOpenerPermissions = new Set([
 ]);
 const defaultPermissions = new Set([
   'core:default',
+  'core:webview:allow-set-webview-zoom',
   'notification:default',
   'autostart:default',
   ...allowedOpenerPermissions,
