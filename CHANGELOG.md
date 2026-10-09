@@ -4,6 +4,9 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- QuotaBar no longer downloads model prices at runtime. Each release ships a price snapshot taken from LiteLLM (see THIRD_PARTY_NOTICES.md); it is copied into the ccstats price cache only when that cache is missing, unreadable, or older than the snapshot.
+- Codex weekly value estimates now use the local price cache instead of downloading prices.
+- Cursor cost is off by default. Turn on "Cursor online cost" in Settings to read Cursor usage online with ccstats credentials.
 - Refresh no longer runs claude doctor on an expired Claude Code login; it re-reads the local login and checks whether Claude Code is signed out. QuotaBar no longer runs claude doctor at all.
 - Add an interface size setting (100%, 125%, 150%) that enlarges text and controls; the panel keeps its tabs and footer reachable on short screens.
 - Require macOS 11 or later (the interface size setting uses the native page zoom that macOS 10.15 lacks).

@@ -112,13 +112,19 @@ fn estimate_from_official_window(
     codex_home: &Path,
     snapshot: &OfficialWeeklySnapshot,
 ) -> WeeklyValueResult {
+    let (offline, strict_pricing) = weekly_pricing_options();
+    super::pricing_snapshot::ensure_installed();
     ccstats::estimate_codex_weekly_value_for_window(
         &value_window(snapshot)?,
         Some(codex_home),
-        false,
-        false,
+        offline,
+        strict_pricing,
     )
     .map_err(|error| error.to_string())
+}
+
+fn weekly_pricing_options() -> (bool, bool) {
+    (true, false)
 }
 
 fn value_window(
@@ -225,6 +231,11 @@ mod tests {
     fn missing_official_snapshot_does_not_use_local_usage() {
         let error = estimate_codex_weekly_value(Path::new("unused"), None).unwrap_err();
         assert!(error.contains("official weekly quota snapshot is unavailable"));
+    }
+
+    #[test]
+    fn weekly_value_uses_offline_non_strict_pricing() {
+        assert_eq!(weekly_pricing_options(), (true, false));
     }
 
     #[test]

@@ -105,22 +105,24 @@ export const backend = {
     return invokeBackend<GrokData>('get_grok_info');
   },
 
-  getCostOverview(source: CostSource, force = false) {
+  getCostOverview(source: CostSource, force = false, allowCursorOnline = false) {
     return invokeBackend<CostOverview>('get_cost_overview', {
       source,
       currency: 'USD',
       timezone: null,
       force,
+      allowCursorOnline,
     });
   },
 
-  getCostDaily(source: CostSource, days: number, force = false) {
+  getCostDaily(source: CostSource, days: number, force = false, allowCursorOnline = false) {
     return invokeBackend<CostDailySeries>('get_cost_daily', {
       source,
       days,
       currency: 'USD',
       timezone: null,
       force,
+      allowCursorOnline,
     });
   },
 

@@ -470,8 +470,9 @@ pub async fn get_cost_overview(
     currency: Option<String>,
     timezone: Option<String>,
     force: Option<bool>,
+    allow_cursor_online: Option<bool>,
 ) -> Result<cost::CostOverview, String> {
-    cost::get_cost_overview(source, currency, timezone, force).await
+    cost::get_cost_overview(source, currency, timezone, force, allow_cursor_online).await
 }
 
 #[tauri::command]
@@ -481,8 +482,9 @@ pub async fn get_cost_daily(
     currency: Option<String>,
     timezone: Option<String>,
     force: Option<bool>,
+    allow_cursor_online: Option<bool>,
 ) -> Result<cost::CostDailySeries, String> {
-    cost::get_cost_daily(source, days, currency, timezone, force).await
+    cost::get_cost_daily(source, days, currency, timezone, force, allow_cursor_online).await
 }
 
 #[tauri::command]

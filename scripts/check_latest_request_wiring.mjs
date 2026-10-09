@@ -77,7 +77,7 @@ const owner_configs = [
     await_kind: 'promise_all',
     promise_all_kind: 'map',
     target_scope: 'cost_effect',
-    backend_arguments: { getCostOverview: ['item', 'force'] },
+    backend_arguments: { getCostOverview: ['item', 'force', 'allowCursorOnline'] },
   },
   {
     path: 'src/components/CostSummarySection.tsx',
@@ -89,7 +89,7 @@ const owner_configs = [
     await_kind: 'promise_all',
     promise_all_kind: 'map',
     target_scope: 'cost_effect',
-    backend_arguments: { getCostDaily: ['item', 'DAILY_SERIES_DAYS', 'force'] },
+    backend_arguments: { getCostDaily: ['item', 'DAILY_SERIES_DAYS', 'force', 'allowCursorOnline'] },
   },
 ];
 

@@ -78,8 +78,10 @@ describe('Overview cost visibility lifecycle', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(backend.getCostOverview).toHaveBeenCalledTimes(3);
-    expect(backend.getCostDaily).toHaveBeenCalledTimes(3);
+    // Cursor online cost defaults off, so the all-provider view requests only
+    // Claude and Codex until a user enables it in Settings.
+    expect(backend.getCostOverview).toHaveBeenCalledTimes(2);
+    expect(backend.getCostDaily).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(1);
 
     await act(async () => {

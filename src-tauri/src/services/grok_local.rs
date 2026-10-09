@@ -3,6 +3,8 @@
 use ccstats::{summarize_cost, ApiEquivalentCostCoverage, SummaryOptions, UsageRange, UsageSource};
 use chrono::{DateTime, Utc};
 
+use super::pricing_snapshot;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LocalPeriodUsage {
     pub observed_cost_usd: f64,
@@ -14,6 +16,7 @@ pub(super) fn sum_period(
     started: DateTime<Utc>,
     until: DateTime<Utc>,
 ) -> Result<LocalPeriodUsage, String> {
+    pricing_snapshot::ensure_installed();
     let summary = summarize_cost(SummaryOptions {
         source: UsageSource::Grok,
         range: UsageRange::TimestampRange {
@@ -97,6 +100,26 @@ mod tests {
         assert_eq!(usage.observed_cost_usd, 1.25);
         assert_eq!(usage.observed_tokens, 150);
         assert_eq!(usage.valid_entries, 2);
+    }
+
+    #[test]
+    fn production_grok_entry_installs_pricing_snapshot_before_summarizing() {
+        // Only the code above the test module counts; the needle is assembled at
+        // runtime so this test's own source cannot satisfy it.
+        let source = include_str!("grok_local.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code");
+        let install = ["pricing_snapshot::", "ensure_installed();"].concat();
+        let summarize = ["summarize_cost", "(SummaryOptions"].concat();
+        let install_at = production
+            .find(&install)
+            .expect("sum_period installs the snapshot");
+        let summarize_at = production
+            .find(&summarize)
+            .expect("sum_period summarizes cost");
+        assert!(install_at < summarize_at);
     }
 
     #[test]

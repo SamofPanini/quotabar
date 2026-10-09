@@ -1,6 +1,9 @@
 //! Local cost summaries powered by the `ccstats` SDK.
 
-use super::cost_disk_cache::{self as disk, SnapshotUse};
+use super::{
+    cost_disk_cache::{self as disk, SnapshotUse},
+    pricing_snapshot,
+};
 use ccstats::{
     summarize_cost_ranges, CostSummary, ModelCostSummary, MultiCostSummary, MultiSummaryOptions,
     TokenBreakdown, UsageRange, UsageSource,
@@ -17,6 +20,7 @@ use std::{
 
 const CACHE_TTL: Duration = Duration::from_secs(1200);
 const MAX_DAILY_DAYS: u32 = 60;
+pub(crate) const CURSOR_ONLINE_COST_DISABLED: &str = "CURSOR_ONLINE_COST_DISABLED";
 
 static COST_CACHE: Lazy<Mutex<HashMap<String, CachedOverview>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -112,9 +116,17 @@ pub async fn get_cost_daily(
     currency: Option<String>,
     timezone: Option<String>,
     force: Option<bool>,
+    allow_cursor_online: Option<bool>,
 ) -> Result<CostDailySeries, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let series = build_cost_daily(source, days, currency, timezone, force.unwrap_or(false));
+        let series = build_cost_daily(
+            source,
+            days,
+            currency,
+            timezone,
+            force.unwrap_or(false),
+            allow_cursor_online,
+        );
         relieve_allocator_pressure();
         series
     })
@@ -128,10 +140,14 @@ fn build_cost_daily(
     currency: Option<String>,
     timezone: Option<String>,
     force: bool,
+    allow_cursor_online: Option<bool>,
 ) -> Result<CostDailySeries, String> {
     if days == 0 || days > MAX_DAILY_DAYS {
         return Err(format!("days must be between 1 and {MAX_DAILY_DAYS}"));
     }
+
+    run_cost_entry(&source, allow_cursor_online, || Ok(None::<()>), || Ok(()))?;
+    pricing_snapshot::ensure_installed();
 
     let source = UsageSource::from_str(&source).map_err(|err| err.to_string())?;
     let currency = normalize_optional(currency);
@@ -296,9 +312,16 @@ pub async fn get_cost_overview(
     currency: Option<String>,
     timezone: Option<String>,
     force: Option<bool>,
+    allow_cursor_online: Option<bool>,
 ) -> Result<CostOverview, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let overview = build_cost_overview(source, currency, timezone, force.unwrap_or(false));
+        let overview = build_cost_overview(
+            source,
+            currency,
+            timezone,
+            force.unwrap_or(false),
+            allow_cursor_online,
+        );
         relieve_allocator_pressure();
         overview
     })
@@ -328,7 +351,10 @@ fn build_cost_overview(
     currency: Option<String>,
     timezone: Option<String>,
     force: bool,
+    allow_cursor_online: Option<bool>,
 ) -> Result<CostOverview, String> {
+    run_cost_entry(&source, allow_cursor_online, || Ok(None::<()>), || Ok(()))?;
+    pricing_snapshot::ensure_installed();
     let source = UsageSource::from_str(&source).map_err(|err| err.to_string())?;
     let currency = normalize_optional(currency);
     let timezone = normalize_optional(timezone);
@@ -362,6 +388,31 @@ fn build_cost_overview(
 
     set_cached_overview(cache_key, overview.clone())?;
     Ok(overview)
+}
+
+/// Cursor's ccstats source can read credentials and contact cursor.com. This
+/// check intentionally happens before either of QuotaBar's cost caches.
+fn require_cursor_online(source: &str, allow_cursor_online: Option<bool>) -> Result<(), String> {
+    // Judge the source the way ccstats will parse it (case, whitespace and the
+    // `cur` alias), so no spelling of Cursor slips past the gate.
+    let is_cursor = UsageSource::from_str(source).is_ok_and(|parsed| parsed == UsageSource::Cursor);
+    if is_cursor && allow_cursor_online != Some(true) {
+        return Err(CURSOR_ONLINE_COST_DISABLED.to_string());
+    }
+    Ok(())
+}
+
+fn run_cost_entry<T>(
+    source: &str,
+    allow_cursor_online: Option<bool>,
+    read_cache: impl FnOnce() -> Result<Option<T>, String>,
+    call_ccstats: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    require_cursor_online(source, allow_cursor_online)?;
+    if let Some(cached) = read_cache()? {
+        return Ok(cached);
+    }
+    call_ccstats()
 }
 
 #[derive(Clone)]
@@ -560,7 +611,14 @@ mod tests {
     #[ignore = "reads real local usage files; run manually with --ignored"]
     fn daily_series_smoke() {
         for source in ["claude", "codex", "cursor"] {
-            match build_cost_daily(source.to_string(), 7, Some("USD".into()), None, true) {
+            match build_cost_daily(
+                source.to_string(),
+                7,
+                Some("USD".into()),
+                None,
+                true,
+                Some(true),
+            ) {
                 Ok(series) => {
                     assert_eq!(series.days.len(), 7, "{source} should return 7 days");
                     eprintln!(
@@ -719,5 +777,87 @@ mod tests {
         };
 
         assert!(err.contains("ccstats returned ThisMonth for week cost range"));
+    }
+
+    #[test]
+    fn production_cost_entry_blocks_cursor_before_cache_or_ccstats() {
+        for allow_cursor_online in [None, Some(false)] {
+            for force in [false, true] {
+                let mut cache_reads = 0;
+                let mut ccstats_calls = 0;
+                let result = run_cost_entry(
+                    "cursor",
+                    allow_cursor_online,
+                    || {
+                        cache_reads += 1;
+                        Ok(Some(()))
+                    },
+                    || {
+                        ccstats_calls += 1;
+                        let _ = force;
+                        Ok(())
+                    },
+                );
+                assert_eq!(result.unwrap_err(), CURSOR_ONLINE_COST_DISABLED);
+                assert_eq!(cache_reads, 0);
+                assert_eq!(ccstats_calls, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn production_cost_entry_blocks_every_spelling_ccstats_parses_as_cursor() {
+        for source in ["cursor", "Cursor", " cursor ", "CURSOR", "cur", "Cur"] {
+            for allow_cursor_online in [None, Some(false)] {
+                let mut cache_reads = 0;
+                let mut ccstats_calls = 0;
+                let result = run_cost_entry(
+                    source,
+                    allow_cursor_online,
+                    || {
+                        cache_reads += 1;
+                        Ok(Some(()))
+                    },
+                    || {
+                        ccstats_calls += 1;
+                        Ok(())
+                    },
+                );
+                assert_eq!(
+                    result.unwrap_err(),
+                    CURSOR_ONLINE_COST_DISABLED,
+                    "{source:?} passed the gate"
+                );
+                assert_eq!((cache_reads, ccstats_calls), (0, 0), "{source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_gate_allows_enabled_cursor_and_other_sources() {
+        assert!(require_cursor_online("cursor", Some(true)).is_ok());
+        assert!(require_cursor_online("claude", None).is_ok());
+        assert!(require_cursor_online("codex", Some(false)).is_ok());
+    }
+
+    #[test]
+    fn production_cost_entry_allows_claude_to_call_ccstats() {
+        let mut cache_reads = 0;
+        let mut ccstats_calls = 0;
+        run_cost_entry(
+            "claude",
+            None,
+            || {
+                cache_reads += 1;
+                Ok(None)
+            },
+            || {
+                ccstats_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("claude should not be gated");
+        assert_eq!(cache_reads, 1);
+        assert_eq!(ccstats_calls, 1);
     }
 }
