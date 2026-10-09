@@ -18,7 +18,6 @@ const MAX_STALE_QUOTA_AGE: Duration = Duration::from_secs(15 * 60);
 const EXPIRY_SAFETY_WINDOW_MS: u64 = 60_000;
 const AUTO_RENEW_INTERVAL_MS: u64 = 10 * 60 * 1_000;
 const MANUAL_RENEW_INTERVAL_MS: u64 = 60 * 1_000;
-const DOCTOR_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_RETRY_AFTER_SECS: u64 = 300;
 const CLAUDE_TOKEN_ENV_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const CLAUDE_AUTH_RELOGIN_MESSAGE: &str = "Claude Code login expired. Press Ping to renew it.";
@@ -347,6 +346,7 @@ fn quota_is_login_expired(data: &QuotaData) -> bool {
 
 type QuotaFuture = Pin<Box<dyn Future<Output = QuotaData> + Send>>;
 type SignedOutProbeFuture = Pin<Box<dyn Future<Output = ClaudeLoginRefreshResult> + Send>>;
+type CredentialExpiryFuture = Pin<Box<dyn Future<Output = Result<Option<u64>, ()>> + Send>>;
 
 async fn fetch_quota_with_signed_out_probe_core<F, P, D>(
     mut fetch: F,
@@ -825,13 +825,6 @@ pub(crate) fn invalidate_login_state() {
     }
 }
 
-fn invalidate_cached_login_reads() {
-    clear_credentials_cache();
-    if let Ok(mut guard) = quota_cache().lock() {
-        *guard = None;
-    }
-}
-
 fn login_is_blocked(expires_at_ms: Option<u64>, now_ms: u64) -> bool {
     let (auth_failure, _) = gate_snapshot();
     quota_request_gate(
@@ -852,76 +845,6 @@ fn renew_attempt_due(attempts: &'static Mutex<Option<u64>>, now_ms: u64, interva
     }
     *last_attempt = Some(now_ms);
     true
-}
-
-fn log_doctor_renew(result: &str, started: Instant) {
-    log_msg(&format!(
-        "[Auth] doctor renew: result={result} secs={:.1}",
-        started.elapsed().as_secs_f64()
-    ));
-}
-
-async fn renew_claude_login_with_doctor() -> ClaudeLoginRefreshResult {
-    let started = Instant::now();
-    let Some(_flight) = crate::services::window_ping::ClaudeFlight::acquire() else {
-        log_doctor_renew("skipped_busy", started);
-        return ClaudeLoginRefreshResult::Unchanged;
-    };
-    let before = match tauri::async_runtime::spawn_blocking(|| read_credentials(false)).await {
-        Ok(Ok(credentials)) => credentials.expires_at_ms,
-        _ => {
-            log_doctor_renew("failed", started);
-            return ClaudeLoginRefreshResult::Failed;
-        }
-    };
-    let command = match crate::services::window_ping::build_claude_doctor_command() {
-        Ok(command) => command,
-        Err(crate::services::window_ping::PingOutcome::CliNotFound { .. }) => {
-            log_doctor_renew("cli_not_found", started);
-            return ClaudeLoginRefreshResult::Unchanged;
-        }
-        Err(_) => {
-            log_doctor_renew("failed", started);
-            return ClaudeLoginRefreshResult::Unchanged;
-        }
-    };
-    let doctor_result = crate::services::window_ping::run_child_discarding_output_without_blocking(
-        command,
-        DOCTOR_TIMEOUT,
-    )
-    .await;
-    invalidate_cached_login_reads();
-    let after = match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
-        Ok(Ok(credentials)) => credentials.expires_at_ms,
-        _ => {
-            log_doctor_renew("failed", started);
-            return ClaudeLoginRefreshResult::Failed;
-        }
-    };
-    let result = login_refresh_result(before, after, now_epoch_ms());
-    if result == ClaudeLoginRefreshResult::Refreshed {
-        clear_auth_gate();
-        if let Ok(mut mark) = signed_out_mark().lock() {
-            *mark = None;
-        }
-        log_doctor_renew("refreshed", started);
-        return result;
-    }
-    if !matches!(
-        doctor_result,
-        crate::services::window_ping::ChildResult::SpawnFailed
-    ) {
-        let auth_status = auth_status_logged_in().await.unwrap_or(None);
-        if signed_out_outcome(result, || auth_status) == ClaudeLoginRefreshResult::SignedOut {
-            if let Ok(mut mark) = signed_out_mark().lock() {
-                *mark = Some(after);
-            }
-            log_doctor_renew("signed_out", started);
-            return ClaudeLoginRefreshResult::SignedOut;
-        }
-    }
-    log_doctor_renew("unchanged", started);
-    result
 }
 
 /// Runs `claude auth status --json` and keeps only its `loggedIn` boolean.
@@ -993,51 +916,100 @@ async fn probe_claude_signed_out() -> ClaudeLoginRefreshResult {
     result
 }
 
+async fn refresh_claude_login_core<B, A, M, L, D, P>(
+    mut read_before: B,
+    mut read_after: A,
+    now_ms: u64,
+    signed_out_mark_matches: M,
+    login_is_blocked: L,
+    probe_due: D,
+    mut probe: P,
+) -> ClaudeLoginRefreshResult
+where
+    B: FnMut() -> CredentialExpiryFuture,
+    A: FnMut() -> CredentialExpiryFuture,
+    M: FnOnce(Option<u64>) -> bool,
+    L: FnOnce(Option<u64>, u64) -> bool,
+    D: FnOnce() -> bool,
+    P: FnMut() -> SignedOutProbeFuture,
+{
+    let before = match read_before().await {
+        Ok(expires_at_ms) => expires_at_ms,
+        Err(()) => return ClaudeLoginRefreshResult::Failed,
+    };
+    let after = match read_after().await {
+        Ok(expires_at_ms) => expires_at_ms,
+        Err(()) => return ClaudeLoginRefreshResult::Failed,
+    };
+    let result = login_refresh_result(before, after, now_ms);
+    if result == ClaudeLoginRefreshResult::Refreshed {
+        return result;
+    }
+    if signed_out_mark_matches(after) {
+        return ClaudeLoginRefreshResult::SignedOut;
+    }
+    if !login_is_blocked(after, now_ms) {
+        return result;
+    }
+    if !probe_due() {
+        log_signed_out_probe("skipped_throttle", Instant::now());
+        return result;
+    }
+    probe().await
+}
+
 pub async fn refresh_claude_login() -> ClaudeLoginRefreshResult {
-    let before = match tauri::async_runtime::spawn_blocking(|| read_credentials(false)).await {
-        Ok(Ok(credentials)) => credentials.expires_at_ms,
-        _ => return ClaudeLoginRefreshResult::Failed,
-    };
-    clear_credentials_cache();
-    let after = match tauri::async_runtime::spawn_blocking(|| read_credentials(true)).await {
-        Ok(Ok(credentials)) => credentials.expires_at_ms,
-        _ => return ClaudeLoginRefreshResult::Failed,
-    };
-    let result = login_refresh_result(before, after, now_epoch_ms());
+    let now_ms = now_epoch_ms();
+    let result = refresh_claude_login_core(
+        || {
+            Box::pin(async {
+                tauri::async_runtime::spawn_blocking(|| read_credentials(false))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|credentials| credentials.expires_at_ms)
+                    .ok_or(())
+            })
+        },
+        || {
+            clear_credentials_cache();
+            Box::pin(async {
+                tauri::async_runtime::spawn_blocking(|| read_credentials(true))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|credentials| credentials.expires_at_ms)
+                    .ok_or(())
+            })
+        },
+        now_ms,
+        signed_out_mark_matches,
+        login_is_blocked,
+        || {
+            let due = manual_renew_due(
+                now_ms,
+                last_manual_renew_attempt_ms()
+                    .lock()
+                    .ok()
+                    .and_then(|attempt| *attempt),
+                read_oauth_token_from_env().is_some(),
+            );
+            due && renew_attempt_due(
+                last_manual_renew_attempt_ms(),
+                now_ms,
+                MANUAL_RENEW_INTERVAL_MS,
+            )
+        },
+        || Box::pin(probe_claude_signed_out()),
+    )
+    .await;
     if result == ClaudeLoginRefreshResult::Refreshed {
         clear_auth_gate();
         if let Ok(mut mark) = signed_out_mark().lock() {
             *mark = None;
         }
-        return result;
     }
-    if login_blocked_message_for(after) == CLAUDE_SIGNED_OUT_MESSAGE {
-        return ClaudeLoginRefreshResult::SignedOut;
-    }
-    let now_ms = now_epoch_ms();
-    if !login_is_blocked(after, now_ms) {
-        return result;
-    }
-    if !manual_renew_due(
-        now_ms,
-        last_manual_renew_attempt_ms()
-            .lock()
-            .ok()
-            .and_then(|attempt| *attempt),
-        read_oauth_token_from_env().is_some(),
-    ) {
-        log_doctor_renew("skipped_throttle", Instant::now());
-        return result;
-    }
-    if !renew_attempt_due(
-        last_manual_renew_attempt_ms(),
-        now_ms,
-        MANUAL_RENEW_INTERVAL_MS,
-    ) {
-        log_doctor_renew("skipped_throttle", Instant::now());
-        return result;
-    }
-    renew_claude_login_with_doctor().await
+    result
 }
 
 pub async fn fetch_quota() -> QuotaData {
@@ -1283,12 +1255,11 @@ async fn fetch_quota_once() -> QuotaData {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_renew_due, clear_auth_gate, fetch_quota_with_signed_out_probe_core, gate_snapshot,
-        invalidate_cached_login_reads, login_blocked_message, login_refresh_result,
-        manual_renew_due, mark_quota_fetch_error, oauth_cache_hit_diagnostic,
+        auto_renew_due, fetch_quota_with_signed_out_probe_core, login_blocked_message,
+        login_refresh_result, manual_renew_due, mark_quota_fetch_error, oauth_cache_hit_diagnostic,
         oauth_env_source_diagnostic, oauth_keychain_source_diagnostic, parse_auth_status_logged_in,
         parse_first_quota_window, parse_quota_window, parse_weekly_scoped_model_quota,
-        quota_request_gate, rate_limited_until, remember_auth_failure, request_gate_active,
+        quota_request_gate, rate_limited_until, refresh_claude_login_core, request_gate_active,
         request_quota_diagnostic, retry_after_secs, signed_out_outcome, stale_quota_usable,
         AuthFailure, ClaudeLoginRefreshResult, QuotaRequestGate, CLAUDE_AUTH_RELOGIN_MESSAGE,
         CLAUDE_SIGNED_OUT_MESSAGE, DEFAULT_RETRY_AFTER_SECS, EXPIRY_SAFETY_WINDOW_MS,
@@ -1497,15 +1468,6 @@ mod tests {
     }
 
     #[test]
-    fn invalidating_cached_login_reads_preserves_auth_failure_memory() {
-        clear_auth_gate();
-        remember_auth_failure(Some(42));
-        invalidate_cached_login_reads();
-        assert_eq!(gate_snapshot().0, failure(Some(42)));
-        clear_auth_gate();
-    }
-
-    #[test]
     fn quota_gate_requires_a_changed_expiry_after_an_auth_failure() {
         let now = 1_000_000;
         assert_eq!(
@@ -1602,6 +1564,113 @@ mod tests {
             login_refresh_result(Some(now + 1), Some(now), now),
             ClaudeLoginRefreshResult::Unchanged
         );
+    }
+
+    #[test]
+    fn refresh_core_reports_refreshed_without_probing() {
+        let now = 1_000_000;
+        let probes = Cell::new(0);
+        let result = tauri::async_runtime::block_on(refresh_claude_login_core(
+            || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+            || Box::pin(std::future::ready(Ok(Some(now + 1)))),
+            now,
+            |_| panic!("a refreshed login must not check the signed-out mark"),
+            |_, _| panic!("a refreshed login must not check the auth gate"),
+            || panic!("a refreshed login must not check the throttle"),
+            || {
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
+            },
+        ));
+        assert_eq!(result, ClaudeLoginRefreshResult::Refreshed);
+        assert_eq!(probes.get(), 0);
+    }
+
+    #[test]
+    fn refresh_core_calls_probe_once_and_returns_its_result_when_expired_and_due() {
+        let now = 1_000_000;
+        for probe_result in [
+            ClaudeLoginRefreshResult::SignedOut,
+            ClaudeLoginRefreshResult::Unchanged,
+            ClaudeLoginRefreshResult::Failed,
+        ] {
+            let probes = Cell::new(0);
+            let result = tauri::async_runtime::block_on(refresh_claude_login_core(
+                || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+                || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+                now,
+                |_| false,
+                |_, _| true,
+                || true,
+                || {
+                    probes.set(probes.get() + 1);
+                    Box::pin(std::future::ready(probe_result))
+                },
+            ));
+            assert_eq!(result, probe_result);
+            assert_eq!(probes.get(), 1);
+        }
+    }
+
+    #[test]
+    fn refresh_core_skips_probe_when_throttled() {
+        let now = 1_000_000;
+        let probes = Cell::new(0);
+        let result = tauri::async_runtime::block_on(refresh_claude_login_core(
+            || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+            || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+            now,
+            |_| false,
+            |_, _| true,
+            || false,
+            || {
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
+            },
+        ));
+        assert_eq!(result, ClaudeLoginRefreshResult::Unchanged);
+        assert_eq!(probes.get(), 0);
+    }
+
+    #[test]
+    fn refresh_core_skips_probe_when_an_env_token_disables_manual_renewal() {
+        let now = 1_000_000;
+        let probes = Cell::new(0);
+        let env_token_present = true;
+        let result = tauri::async_runtime::block_on(refresh_claude_login_core(
+            || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+            || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+            now,
+            |_| false,
+            |_, _| true,
+            || !env_token_present,
+            || {
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
+            },
+        ));
+        assert_eq!(result, ClaudeLoginRefreshResult::Unchanged);
+        assert_eq!(probes.get(), 0);
+    }
+
+    #[test]
+    fn refresh_core_returns_signed_out_for_a_matching_mark_without_probing() {
+        let now = 1_000_000;
+        let probes = Cell::new(0);
+        let result = tauri::async_runtime::block_on(refresh_claude_login_core(
+            || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+            || Box::pin(std::future::ready(Ok(Some(now - 1)))),
+            now,
+            |_| true,
+            |_, _| panic!("a matching signed-out mark must bypass the auth gate"),
+            || panic!("a matching signed-out mark must bypass the throttle"),
+            || {
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::Unchanged))
+            },
+        ));
+        assert_eq!(result, ClaudeLoginRefreshResult::SignedOut);
+        assert_eq!(probes.get(), 0);
     }
 
     #[test]
