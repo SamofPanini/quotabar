@@ -8,7 +8,7 @@ use crate::{
     },
     services::{
         antigravity, claude, claude_snapshot, codex, codex_profiles, codex_weekly, cost, cursor,
-        grok, link, tray, tray_icon, window, window_ping,
+        grok, link, service_status, tray, tray_icon, window, window_ping,
     },
 };
 
@@ -513,6 +513,11 @@ pub fn open_grok_dashboard() -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn open_service_status_url(url: String) -> Result<(), String> {
+    link::open_service_status_url(&url)
+}
+
+#[tauri::command]
 pub async fn resize_window(app: AppHandle, height: f64, width: f64) -> Result<(), String> {
     window::resize_window(app, height, width).await
 }
@@ -542,6 +547,42 @@ pub async fn update_tray_icon(
         style,
     )
     .await
+}
+
+#[tauri::command]
+pub fn get_service_status(
+    state: State<'_, service_status::ServiceStatusState>,
+) -> service_status::ServiceStatusSnapshot {
+    state.snapshot()
+}
+
+#[tauri::command]
+pub fn set_service_status_prefs(
+    app: AppHandle,
+    state: State<'_, service_status::ServiceStatusState>,
+    tray_state: State<'_, tray::TrayState>,
+    enabled: bool,
+    notify: bool,
+) -> Result<(), String> {
+    let became_enabled = state.set_prefs(enabled, notify);
+    if !enabled {
+        let [claude_incident, codex_incident] = state.incident_flags();
+        tray::set_service_incident(
+            &app,
+            &tray_state,
+            tray::TrayService::Claude,
+            claude_incident,
+        );
+        tray::set_service_incident(&app, &tray_state, tray::TrayService::Codex, codex_incident);
+        let _ = app.emit("service-status-changed", state.snapshot());
+    }
+    if became_enabled {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            service_status::poll_once(&app).await;
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]

@@ -13,6 +13,7 @@ import GrokPanel from './components/GrokPanel';
 import AntigravityPanel from './components/AntigravityPanel';
 import type { TrayToggleEntry } from './components/TrayToggles';
 import { backend, hasTauriBackend } from './services/backend';
+import { claudePanelErrorWithServiceIncident, getServiceStatusEnabled, onServiceStatusChanged, serviceStatusForDisplay, setServiceStatusEnabled, type ServiceStatusSnapshot } from './services/service_status';
 import { SERVICE_META, SERVICES } from './services/service_meta';
 import { resolveTrayVisible, saveTrayEnabled, shouldShowTray, type TrayServiceName } from './services/tray_visibility';
 import {
@@ -238,6 +239,8 @@ export default function App() {
   const [trayCycleIndex, setTrayCycleIndex] = useState(0);
   const [events, setEvents] = useState<AppEvent[]>(getSavedEvents);
   const [notifSettings, setNotifSettings] = useState<NotificationSettings>(getSavedNotificationSettings);
+  const [serviceStatusEnabled, setServiceStatusEnabledState] = useState<boolean>(getServiceStatusEnabled);
+  const [serviceStatus, setServiceStatus] = useState<ServiceStatusSnapshot | null>(null);
   const bonusReadyPrevRef = useRef<{ exhausted: boolean; availableCount: number } | null>(null);
   const [switcherVisibility, setSwitcherVisibility] = useState<SwitcherVisibility>(getSavedSwitcherVisibility);
   const lastTrayIconRequestRef = useRef<Partial<Record<TrayServiceName, TrayIconRequest>>>({});
@@ -315,6 +318,30 @@ export default function App() {
   useEffect(() => {
     return subscribeStorageReadFailureToast(setToast);
   }, [setToast]);
+
+  useEffect(() => {
+    if (!serviceStatusEnabled) {
+      setServiceStatus(null);
+      return undefined;
+    }
+    let cancelled = false;
+    let disposed = false;
+    void backend.getServiceStatus().then((snapshot) => {
+      if (!cancelled) setServiceStatus(serviceStatusForDisplay(serviceStatusEnabled, snapshot));
+    }).catch(() => {});
+    let unlisten: (() => void) | undefined;
+    void onServiceStatusChanged((snapshot) => {
+      if (!disposed) setServiceStatus(serviceStatusForDisplay(serviceStatusEnabled, snapshot));
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => { cancelled = true; disposed = true; unlisten?.(); };
+  }, [serviceStatusEnabled]);
+
+  useEffect(() => {
+    void backend.setServiceStatusPrefs(serviceStatusEnabled, notifSettings.serviceStatus).catch(() => {});
+  }, [serviceStatusEnabled, notifSettings.serviceStatus]);
 
   const setAndPersistTab = useCallback((tab: TabName) => {
     setActiveView(tab);
@@ -522,6 +549,13 @@ export default function App() {
     saveNotificationSettings(next);
     setNotifSettings(next);
   }, [notifSettings]);
+
+  const handleServiceStatusToggle = useCallback(() => {
+    const next = !serviceStatusEnabled;
+    setServiceStatusEnabled(next);
+    setServiceStatusEnabledState(next);
+    if (!next) setServiceStatus(null);
+  }, [serviceStatusEnabled]);
 
   const handleBonusExpiring = useCallback((daysLeft: number) => {
     const text = daysLeft <= 0
@@ -1009,6 +1043,7 @@ export default function App() {
               claudeMenuBarQuotaWindow={claudeMenuBarQuotaWindow}
               events={events}
               notificationSettings={notifSettings}
+              serviceStatusEnabled={serviceStatusEnabled}
               switcherVisibility={switcherVisibility}
               uiScale={uiScale}
               onClose={handleCloseSettings}
@@ -1021,6 +1056,7 @@ export default function App() {
               onMenuBarQuotaWindowChange={handleMenuBarQuotaWindowChange}
               onClaudeMenuBarQuotaWindowChange={handleClaudeMenuBarQuotaWindowChange}
               onNotificationToggle={handleNotificationToggle}
+              onServiceStatusToggle={handleServiceStatusToggle}
               onSwitcherToggle={handleSwitcherToggle}
               onUiScaleChange={changeScale}
               onApplyPreset={applyProviderPreset}
@@ -1043,13 +1079,17 @@ export default function App() {
                 <ClaudePanel
                   quota={quota}
                   loading={claudeLoading}
-                  error={claudeError && isClaudeAuthError(claudeError)
-                    ? claudeLoginRefreshMessage ?? claudeError
-                    : claudeError}
+                  error={claudePanelErrorWithServiceIncident(
+                    claudeError,
+                    isClaudeAuthError(claudeError ?? ''),
+                    claudeLoginRefreshMessage,
+                    serviceStatus?.claude,
+                  )}
                   windowVisible={windowVisible}
                   costRefreshKey={claudeCostRefreshNonce}
                   onRetry={handleRefresh}
                   sections={panelSections}
+                  serviceStatus={serviceStatus?.claude}
                 />
               )}
 
@@ -1068,6 +1108,7 @@ export default function App() {
                   onBonusReadyChange={handleBonusReadyChange}
                   onOpenDashboard={handleOpenDashboard}
                   onPingContextChange={setCodexPingContext}
+                  serviceStatus={serviceStatus?.codex}
                 />
               </div>
 
@@ -1112,6 +1153,7 @@ export default function App() {
                   costRefreshKey={overviewCostRefreshKey} showCostSummary={windowVisible}
                   onProviderSelect={setAndPersistTab}
                   sections={panelSections}
+                  serviceStatus={serviceStatus}
                 />
               )}
             </div>

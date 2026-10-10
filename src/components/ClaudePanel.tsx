@@ -8,6 +8,8 @@ import { formatPaceText, formatResetTime } from '../utils/quota_format';
 import { buildClaudeQuotaWindows, sortMostConstrained } from '../services/provider_summary';
 import { getHighUsageTip } from '../services/detail_helpers';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
+import ServiceStatusNotice from './ServiceStatusNotice';
+import type { ProviderServiceStatus } from '../services/service_status';
 
 interface ClaudePanelProps {
   quota: QuotaData | null;
@@ -17,6 +19,7 @@ interface ClaudePanelProps {
   costRefreshKey: number;
   onRetry: () => void;
   sections?: PanelSectionVisibility;
+  serviceStatus?: ProviderServiceStatus;
 }
 
 const SESSION_WINDOW_MINUTES = 5 * 60;
@@ -47,6 +50,7 @@ export default function ClaudePanel({
   costRefreshKey,
   onRetry,
   sections = defaultPanelSections(),
+  serviceStatus,
 }: ClaudePanelProps) {
   const windows = buildClaudeQuotaWindows(quota);
   const topWindow = sortMostConstrained(windows)[0];
@@ -67,6 +71,8 @@ export default function ClaudePanel({
         </div>
       )}
 
+      {!quota && <ServiceStatusNotice provider="claude" status={serviceStatus} />}
+
       {quota && (
         <div className="detail-stack">
           <ProviderDetailHeader
@@ -77,6 +83,7 @@ export default function ClaudePanel({
             usageLabel={topWindow?.label}
             tone={error ? 'pending' : quota.connected ? 'online' : 'offline'}
           />
+          <ServiceStatusNotice provider="claude" status={serviceStatus} />
 
           <div className="section">
             <div className="section-title">Current session</div>

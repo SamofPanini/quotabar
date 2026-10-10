@@ -189,6 +189,7 @@ const notificationSettings = {
   q100: true,
   bonusReady: true,
   bonus: false,
+  serviceStatus: true,
 };
 const panelSections = { timeline: false, cost: true, trend: false, tips: true };
 const switcherVisibility = {

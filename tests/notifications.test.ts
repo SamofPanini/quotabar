@@ -39,6 +39,7 @@ describe('notification settings', () => {
       q100: false,
       bonusReady: true,
       bonus: false,
+      serviceStatus: true,
     });
     expect(getSavedNotificationSettings()).toEqual({
       q80: false,
@@ -46,6 +47,7 @@ describe('notification settings', () => {
       q100: false,
       bonusReady: true,
       bonus: false,
+      serviceStatus: true,
     });
   });
 
@@ -62,6 +64,7 @@ describe('notification settings', () => {
       q100: true,
       bonusReady: true,
       bonus: false,
+      serviceStatus: true,
     });
   });
 

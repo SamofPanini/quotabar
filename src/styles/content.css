@@ -89,6 +89,16 @@
 .status-badge.warning { background: var(--color-warning-bg); color: var(--color-warning); }
 .status-badge.critical { background: var(--color-critical-bg); color: var(--color-critical); }
 
+.service-status-notice { margin: 8px 0 12px; padding: 9px 10px; border-radius: 8px; font-size: 12px; line-height: 1.45; color: var(--text-primary); background: var(--color-warning-bg); }
+.service-status-notice.partial_outage, .service-status-notice.major_outage { background: var(--color-critical-bg); }
+.service-status-notice.maintenance, .service-status-notice.unavailable { background: var(--bg-tertiary); color: var(--text-secondary); }
+.service-status-notice button { color: inherit; background: transparent; border: 0; padding: 0; float: right; cursor: pointer; }
+.service-status-pill { margin-left: 6px; padding: 2px 6px; border-radius: 999px; font-size: 11px; background: var(--color-warning-bg); color: var(--color-warning); }
+.service-status-pill.partial_outage, .service-status-pill.major_outage { background: var(--color-critical-bg); color: var(--color-critical); }
+.service-status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--color-success); margin-left: 6px; }
+.service-status-overview { display: flex; align-items: center; gap: 10px; margin: 8px 0 12px; font-size: 12px; color: var(--text-secondary); }
+.service-status-overview .service-status-dot { margin-left: 4px; }
+
 .quota-percentage {
   flex-shrink: 0;
   font-family: var(--metric-font);
