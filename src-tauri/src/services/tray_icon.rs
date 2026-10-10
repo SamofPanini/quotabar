@@ -77,6 +77,7 @@ struct TrayIconCacheKey {
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
+    incident: bool,
 }
 
 struct CachedTrayIcon {
@@ -336,12 +337,14 @@ pub fn generate_tray_icon(
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
+    incident: bool,
 ) -> Vec<u8> {
     let key = TrayIconCacheKey {
         identity,
         used_percent: used_percent.map(|value| value.min(100)),
         size,
         style,
+        incident,
     };
     if let Some(png) = tray_icon_cache()
         .lock()
@@ -351,7 +354,13 @@ pub fn generate_tray_icon(
         return png;
     }
 
-    let png = render_tray_icon(key.identity, key.used_percent, key.size, key.style);
+    let png = render_tray_icon(
+        key.identity,
+        key.used_percent,
+        key.size,
+        key.style,
+        key.incident,
+    );
     tray_icon_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -364,6 +373,7 @@ fn render_tray_icon(
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
+    incident: bool,
 ) -> Vec<u8> {
     let mut img: RgbaImage = ImageBuffer::new(size, size);
     let center = size as f32 / 2.0;
@@ -452,6 +462,27 @@ fn render_tray_icon(
     }
 
     draw_badge(&mut img, identity);
+    if incident {
+        let radius = (size / 10).max(2) as i32;
+        let center_x = size as i32 - radius - 1;
+        let center_y = radius + 1;
+        for y in (center_y - radius - 1)..=(center_y + radius + 1) {
+            for x in (center_x - radius - 1)..=(center_x + radius + 1) {
+                if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
+                    continue;
+                }
+                let dx = x - center_x;
+                let dy = y - center_y;
+                let distance = dx * dx + dy * dy;
+                if distance <= (radius + 1) * (radius + 1) {
+                    img.put_pixel(x as u32, y as u32, Rgba([255, 255, 255, 255]));
+                }
+                if distance <= radius * radius {
+                    img.put_pixel(x as u32, y as u32, Rgba([220, 38, 38, 255]));
+                }
+            }
+        }
+    }
     encode_png(&img, size)
 }
 
@@ -469,13 +500,20 @@ mod tests {
             Some(73),
             44,
             TrayIconStyle::Percent,
+            false,
         );
         assert!(!bytes.is_empty());
     }
 
     #[test]
     fn generate_placeholder_icon_returns_png_bytes() {
-        let bytes = generate_tray_icon(TrayIconIdentity::Claude, None, 44, TrayIconStyle::Percent);
+        let bytes = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            None,
+            44,
+            TrayIconStyle::Percent,
+            false,
+        );
         assert!(!bytes.is_empty());
     }
 
@@ -486,12 +524,14 @@ mod tests {
             Some(42),
             44,
             TrayIconStyle::Percent,
+            false,
         );
         let codex = generate_tray_icon(
             TrayIconIdentity::Codex,
             Some(42),
             44,
             TrayIconStyle::Percent,
+            false,
         );
         assert_ne!(claude, codex);
     }
@@ -503,18 +543,21 @@ mod tests {
             Some(99),
             44,
             TrayIconStyle::Percent,
+            false,
         );
         let full = generate_tray_icon(
             TrayIconIdentity::Claude,
             Some(100),
             44,
             TrayIconStyle::Percent,
+            false,
         );
         let over_limit = generate_tray_icon(
             TrayIconIdentity::Claude,
             Some(130),
             44,
             TrayIconStyle::Percent,
+            false,
         );
 
         assert_ne!(ninety_nine, full);
@@ -528,6 +571,7 @@ mod tests {
             used_percent: Some(37),
             size: 37,
             style: TrayIconStyle::Ring,
+            incident: false,
         };
         {
             let mut cache = tray_icon_cache()
@@ -537,8 +581,20 @@ mod tests {
             cache.insertion_order.retain(|candidate| candidate != &key);
         }
 
-        let first = generate_tray_icon(key.identity, key.used_percent, key.size, key.style);
-        let second = generate_tray_icon(key.identity, key.used_percent, key.size, key.style);
+        let first = generate_tray_icon(
+            key.identity,
+            key.used_percent,
+            key.size,
+            key.style,
+            key.incident,
+        );
+        let second = generate_tray_icon(
+            key.identity,
+            key.used_percent,
+            key.size,
+            key.style,
+            key.incident,
+        );
         let hits = tray_icon_cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -559,6 +615,7 @@ mod tests {
                 used_percent: Some(1),
                 size,
                 style: TrayIconStyle::Icon,
+                incident: false,
             };
             cache.insert(key, vec![size as u8]);
         }
@@ -577,7 +634,7 @@ mod tests {
             (TrayIconIdentity::Grok, "grok"),
             (TrayIconIdentity::Antigravity, "antigravity"),
         ] {
-            let bytes = generate_tray_icon(id, Some(65), 44, TrayIconStyle::Percent);
+            let bytes = generate_tray_icon(id, Some(65), 44, TrayIconStyle::Percent, false);
             std::fs::write(format!("/tmp/tray_{}.png", name), &bytes).unwrap();
         }
     }
@@ -588,5 +645,148 @@ mod tests {
         assert_eq!(usage_color(50), (245, 158, 11));
         assert_eq!(usage_color(79), (245, 158, 11));
         assert_eq!(usage_color(80), (239, 68, 68));
+    }
+
+    #[test]
+    fn incident_dot_changes_png_and_cache_key_without_changing_digit_color() {
+        let plain = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            44,
+            TrayIconStyle::Percent,
+            false,
+        );
+        let incident = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            44,
+            TrayIconStyle::Percent,
+            true,
+        );
+        assert_ne!(plain, incident);
+        // The rendered digit is away from the upper-right dot.
+        let plain_image = image::load_from_memory(&plain).unwrap().into_rgba8();
+        let incident_image = image::load_from_memory(&incident).unwrap().into_rgba8();
+        assert_eq!(
+            plain_image.get_pixel(18, 17),
+            incident_image.get_pixel(18, 17)
+        );
+    }
+
+    #[test]
+    fn incident_true_and_false_produce_different_png_bytes() {
+        let plain = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            48,
+            TrayIconStyle::Percent,
+            false,
+        );
+        let incident = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            48,
+            TrayIconStyle::Percent,
+            true,
+        );
+        assert_ne!(plain, incident);
+    }
+
+    #[test]
+    fn incident_cache_keys_do_not_collide() {
+        let plain = TrayIconCacheKey {
+            identity: TrayIconIdentity::Codex,
+            used_percent: Some(31),
+            size: 47,
+            style: TrayIconStyle::Ring,
+            incident: false,
+        };
+        let incident = TrayIconCacheKey {
+            incident: true,
+            ..plain
+        };
+        assert_ne!(plain, incident);
+        {
+            let mut cache = tray_icon_cache().lock().unwrap();
+            cache.entries.remove(&plain);
+            cache.entries.remove(&incident);
+            cache
+                .insertion_order
+                .retain(|key| key != &plain && key != &incident);
+        }
+        let _ = generate_tray_icon(
+            plain.identity,
+            plain.used_percent,
+            plain.size,
+            plain.style,
+            plain.incident,
+        );
+        let _ = generate_tray_icon(
+            incident.identity,
+            incident.used_percent,
+            incident.size,
+            incident.style,
+            incident.incident,
+        );
+        let cache = tray_icon_cache().lock().unwrap();
+        assert!(cache.entries.contains_key(&plain));
+        assert!(cache.entries.contains_key(&incident));
+    }
+
+    #[test]
+    fn incident_dot_preserves_percent_digit_pixels() {
+        let plain = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            44,
+            TrayIconStyle::Percent,
+            false,
+        );
+        let incident = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            44,
+            TrayIconStyle::Percent,
+            true,
+        );
+        let plain_image = image::load_from_memory(&plain).unwrap().into_rgba8();
+        let incident_image = image::load_from_memory(&incident).unwrap().into_rgba8();
+        assert_eq!(
+            plain_image.get_pixel(18, 17),
+            incident_image.get_pixel(18, 17)
+        );
+    }
+
+    #[test]
+    fn incident_dot_is_rendered_for_percent_ring_and_icon_styles() {
+        for style in [
+            TrayIconStyle::Percent,
+            TrayIconStyle::Ring,
+            TrayIconStyle::Icon,
+        ] {
+            let plain = generate_tray_icon(TrayIconIdentity::Codex, Some(65), 44, style, false);
+            let incident = generate_tray_icon(TrayIconIdentity::Codex, Some(65), 44, style, true);
+            assert_ne!(plain, incident, "{style:?} should render the incident dot");
+        }
+    }
+
+    #[test]
+    fn maintenance_state_does_not_render_an_incident_dot() {
+        // The caller passes `false` for maintenance; only incidents get a tray badge.
+        let maintenance = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            46,
+            TrayIconStyle::Percent,
+            false,
+        );
+        let operational = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            46,
+            TrayIconStyle::Percent,
+            false,
+        );
+        assert_eq!(maintenance, operational);
     }
 }

@@ -3,6 +3,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App';
 import { backend } from '../src/services/backend';
+import type { ServiceStatusSnapshot } from '../src/services/service_status';
 import type { CodexProfilesResponse, PingConfirmationEvent, PingOutcome } from '../src/types/models';
 
 let pingConfirmationHandler: ((event: PingConfirmationEvent) => void) | undefined;
@@ -78,6 +79,11 @@ function text(renderer: ReactTestRenderer): string {
 
 function installBackend(): void {
   const resetsAt = Math.floor(Date.now() / 1000) + 5 * 60 * 60;
+  vi.spyOn(backend, 'getServiceStatus').mockResolvedValue({
+    claude: { provider: 'claude', level: 'operational', components: [], incidents: [], maintenances: [] },
+    codex: { provider: 'codex', level: 'operational', components: [], incidents: [], maintenances: [] },
+  });
+  vi.spyOn(backend, 'setServiceStatusPrefs').mockResolvedValue(undefined);
   vi.spyOn(backend, 'getQuota').mockResolvedValue({
     connected: true,
     session: { used: 0, limit: 100, percentage: 0 },
@@ -136,6 +142,85 @@ afterAll(() => {
 });
 
 describe('App ping result and provider refresh isolation', () => {
+  it('syncs service-status defaults and both settings toggles to the backend', async () => {
+    const renderer = await renderApp();
+    expect(backend.setServiceStatusPrefs).toHaveBeenCalledWith(true, true);
+
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Open settings' }).props.onClick();
+      await flush();
+    });
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Service status' }).props.onClick();
+      await flush();
+    });
+    expect(backend.setServiceStatusPrefs).toHaveBeenLastCalledWith(false, true);
+
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Service status changes' }).props.onClick();
+      await flush();
+    });
+    expect(backend.setServiceStatusPrefs).toHaveBeenLastCalledWith(false, false);
+    await act(async () => renderer.unmount());
+  });
+
+  it('cleans a late service-status listener without applying its event', async () => {
+    let resolveListen!: (stop: () => void) => void;
+    let lateHandler!: (snapshot: ServiceStatusSnapshot) => void;
+    const stop = vi.fn();
+    const lateListen = new Promise<() => void>((resolve) => { resolveListen = resolve; });
+    const serviceStatus = await import('../src/services/service_status');
+    vi.spyOn(serviceStatus, 'onServiceStatusChanged').mockImplementation((handler) => {
+      lateHandler = handler as typeof lateHandler;
+      return lateListen;
+    });
+    const renderer = await renderApp();
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Open settings' }).props.onClick();
+      await flush();
+    });
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Service status' }).props.onClick();
+      await flush();
+    });
+    await act(async () => { resolveListen(stop); await flush(); });
+    await act(async () => {
+      lateHandler({
+        claude: { provider: 'claude', level: 'degraded', components: [], incidents: [], maintenances: [] },
+        codex: { provider: 'codex', level: 'operational', components: [], incidents: [], maintenances: [] },
+      });
+      await flush();
+    });
+    await act(async () => {
+      renderer.root.findByProps({ 'aria-label': 'Back to provider view' }).props.onClick();
+      await flush();
+    });
+    expect(stop).toHaveBeenCalledOnce();
+    expect(renderer.root.findAll((node) => node.props.className === 'service-status-notice degraded')).toHaveLength(0);
+    await act(async () => renderer.unmount());
+  });
+
+  it('shows the Codex service notice below the header for a custom profile', async () => {
+    const resetsAt = Math.floor(Date.now() / 1000) + 5 * 60 * 60;
+    vi.mocked(backend.getServiceStatus).mockResolvedValue({
+      claude: { provider: 'claude', level: 'operational', components: [], incidents: [], maintenances: [] },
+      codex: { provider: 'codex', level: 'degraded', components: [], incidents: [{ id: 'i', name: 'Codex incident', status: 'monitoring' }], maintenances: [] },
+    });
+    vi.mocked(backend.getCodexProfiles).mockResolvedValue({
+      profiles: [{ alias: 'work', status: 'connected', primary: { usedPercent: 1, windowMinutes: 300, resetsAt }, availableResetCredits: 0, ordinaryUsageAllowed: true }], registryError: null, registryProvenance: 'primary',
+    });
+    const renderer = await renderApp();
+    await clickProvider(renderer, 'codex');
+    await act(async () => { accountTab(renderer, 'work').props.onClick(); await flush(); });
+    const nodes = renderer.root.findAll((node) => node.props.className === 'service-status-notice degraded');
+    expect(nodes).toHaveLength(1);
+    expect(text(renderer)).toContain('"OpenAI",": ","degraded"');
+    const header = renderer.root.findAll((node) => node.props.className === 'provider-detail-header')[0];
+    const allNodes = renderer.root.findAll(() => true);
+    expect(allNodes.indexOf(header)).toBeLessThan(allNodes.indexOf(nodes[0]));
+    await act(async () => renderer.unmount());
+  });
+
   it('keeps a Claude result on its initiating tab and expires it after a tab round trip', async () => {
     const outcome = deferred<PingOutcome>();
     vi.mocked(backend.pingClaudeWindow).mockReturnValue(outcome.promise);

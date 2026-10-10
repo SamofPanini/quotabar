@@ -22,6 +22,7 @@ mod grok_local;
 pub mod http;
 pub mod link;
 pub(crate) mod pricing_snapshot;
+pub mod service_status;
 pub(crate) mod state_location;
 pub mod tray;
 pub mod tray_icon;

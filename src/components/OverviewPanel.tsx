@@ -5,6 +5,7 @@ import CostSummarySection from './CostSummarySection';
 import ProviderDetailHeader from './ProviderDetailHeader';
 import ResetTimeline from './ResetTimeline';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
+import { serviceStatusLabel, type ServiceStatusSnapshot } from '../services/service_status';
 
 const ALL_COST_SOURCES = ['claude', 'codex', 'cursor'] as const;
 
@@ -16,6 +17,7 @@ interface OverviewPanelProps {
   showCostSummary?: boolean;
   onProviderSelect: (provider: TrayServiceName) => void;
   sections?: PanelSectionVisibility;
+  serviceStatus?: ServiceStatusSnapshot | null;
 }
 
 export default function OverviewPanel({
@@ -26,6 +28,7 @@ export default function OverviewPanel({
   showCostSummary = true,
   onProviderSelect,
   sections = defaultPanelSections(),
+  serviceStatus,
 }: OverviewPanelProps) {
   const connectedCount = summaries.filter((summary) => summary.connected).length;
 
@@ -41,10 +44,23 @@ export default function OverviewPanel({
         tone={connectedCount > 0 ? 'online' : 'offline'}
       />
 
+      {serviceStatus && (['claude', 'codex'] as const).some((provider) => serviceStatus[provider].level !== 'unknown') && (
+        <div className="service-status-overview" aria-label="Service status">
+          {(['claude', 'codex'] as const).map((provider) => {
+            const status = serviceStatus[provider];
+            if (status.level === 'unknown') return null;
+            const name = provider === 'claude' ? 'Anthropic' : 'OpenAI';
+            const label = serviceStatusLabel(status);
+            return <span key={provider} className="service-status-overview-item">{name}{status.level === 'operational' ? <span className="service-status-dot" title={`${name}: all watched services operational`} /> : <span className={`service-status-pill ${status.level}`}>{label}</span>}</span>;
+          })}
+        </div>
+      )}
+
       <div className="section">
         <div className="section-title">Most constrained</div>
         <div className="quota-group">
-          {mostConstrained.length > 0 ? mostConstrained.map((window, index) => (
+          {mostConstrained.length > 0 ? mostConstrained.map((window, index) => {
+            return (
             <button
               type="button"
               className={`quota-card overview-quota-row${index === 0 ? ' primary' : ''}`}
@@ -69,7 +85,7 @@ export default function OverviewPanel({
               </div>
               {window.resetLabel && <div className="reset-time">Resets in {window.resetLabel}</div>}
             </button>
-          )) : (
+          ); }) : (
             <div className="no-data">No provider data</div>
           )}
         </div>

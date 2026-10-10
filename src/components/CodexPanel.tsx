@@ -34,8 +34,11 @@ import { getAvailableResetCredits, getHighUsageTip } from '../services/detail_he
 import { clampProgressValue, formatPaceText, formatPlanType, formatResetAt, formatResetTime, getProgressStyle } from '../utils/quota_format';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
 import { useLatestRequestGeneration } from '../hooks/use_latest_request_generation';
+import ServiceStatusNotice from './ServiceStatusNotice';
+import type { ProviderServiceStatus } from '../services/service_status';
 
 interface CodexPanelProps {
+  serviceStatus?: ProviderServiceStatus;
   onConnectionChange?: (connected: boolean) => void;
   onUsageChange?: (usedPercent: number | null) => void;
   autoRefreshIntervalMs?: number;
@@ -259,6 +262,7 @@ function ordinaryUsageLabel(allowed?: boolean | null): string {
 }
 
 export default function CodexPanel({
+  serviceStatus,
   onConnectionChange,
   onUsageChange,
   autoRefreshIntervalMs = 60 * 1000,
@@ -551,6 +555,7 @@ export default function CodexPanel({
   if (loading && !codexData && !rateLimits) {
     return (
       <div className="codex-panel">
+        <ServiceStatusNotice provider="codex" status={serviceStatus} />
         <div className="loading-state">Loading Codex info...</div>
       </div>
     );
@@ -742,6 +747,7 @@ export default function CodexPanel({
             usageLabel={customTopWindow?.label}
             tone={status.tone}
           />
+          <ServiceStatusNotice provider="codex" status={serviceStatus} />
           <div className="codex-updated">{ordinaryUsageLabel(customLimits.ordinaryUsageAllowed)}</div>
           {hasCustomLimits ? (
             <div className="section">
@@ -799,6 +805,7 @@ export default function CodexPanel({
             usageLabel={topWindow?.label}
             tone={headerTone}
           />
+          <ServiceStatusNotice provider="codex" status={serviceStatus} />
           <div className="codex-updated">{ordinaryUsageLabel(rateLimits?.ordinaryUsageAllowed)}</div>
           {officialUpdatedAt != null && (
             <div className="codex-updated">

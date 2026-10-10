@@ -18,6 +18,7 @@ import type {
   PingOutcome,
   PingConfirmationEvent,
 } from '../types/models';
+import type { ServiceStatusSnapshot } from './service_status';
 
 type TrayService = 'claude' | 'codex' | 'cursor' | 'grok' | 'antigravity';
 
@@ -52,6 +53,18 @@ export function onPingConfirmation(
 
 export const backend = {
   onPingConfirmation,
+
+  getServiceStatus() {
+    return invokeBackend<ServiceStatusSnapshot>('get_service_status');
+  },
+
+  setServiceStatusPrefs(enabled: boolean, notify: boolean) {
+    return invokeBackend<void>('set_service_status_prefs', { enabled, notify });
+  },
+
+  openServiceStatusUrl(url: string) {
+    return invokeBackend<void>('open_service_status_url', { url });
+  },
 
   getQuota() {
     return invokeBackend<QuotaData>('get_quota');

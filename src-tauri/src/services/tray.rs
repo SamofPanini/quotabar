@@ -35,6 +35,7 @@ struct TraySnapshot {
     percentage: Option<u8>,
     visible: bool,
     style: tray_icon::TrayIconStyle,
+    incident: bool,
 }
 
 #[derive(Default)]
@@ -49,6 +50,8 @@ struct TrayRuntimeState {
     cursor_snapshot: Option<TraySnapshot>,
     grok_snapshot: Option<TraySnapshot>,
     antigravity_snapshot: Option<TraySnapshot>,
+    claude_incident: bool,
+    codex_incident: bool,
 }
 
 impl TrayRuntimeState {
@@ -98,6 +101,22 @@ impl TrayRuntimeState {
         }
     }
 
+    fn incident(&self, service: TrayService) -> bool {
+        match service {
+            TrayService::Claude => self.claude_incident,
+            TrayService::Codex => self.codex_incident,
+            _ => false,
+        }
+    }
+
+    fn set_incident(&mut self, service: TrayService, incident: bool) {
+        match service {
+            TrayService::Claude => self.claude_incident = incident,
+            TrayService::Codex => self.codex_incident = incident,
+            _ => {}
+        }
+    }
+
     fn should_skip_update(
         &self,
         service: TrayService,
@@ -115,6 +134,42 @@ impl TrayRuntimeState {
             TrayService::Grok => self.grok_snapshot = Some(snapshot),
             TrayService::Antigravity => self.antigravity_snapshot = Some(snapshot),
         }
+    }
+
+    fn apply_service_incident(
+        &mut self,
+        service: TrayService,
+        incident: bool,
+    ) -> Option<(TraySnapshot, u64)> {
+        if self.incident(service) == incident {
+            return None;
+        }
+        self.set_incident(service, incident);
+        let snapshot = self.snapshot(service).map(|mut snapshot| {
+            snapshot.incident = incident;
+            self.set_snapshot(service, snapshot);
+            snapshot
+        });
+        // The first normal draw has not captured a snapshot yet.  Retain the
+        // flag for it, but do not invalidate that queued draw's generation.
+        let Some(snapshot) = snapshot else {
+            return None;
+        };
+        let generation = self.bump_generation(service);
+        Some((snapshot, generation))
+    }
+
+    fn snapshot_for_current_generation(
+        &self,
+        service: TrayService,
+        generation: u64,
+        mut snapshot: TraySnapshot,
+    ) -> Option<TraySnapshot> {
+        if self.generation(service) != generation {
+            return None;
+        }
+        snapshot.incident = self.incident(service);
+        Some(snapshot)
     }
 }
 
@@ -517,6 +572,7 @@ fn build_service_tray(app: &AppHandle, service: TrayService) -> tauri::Result<()
         None,
         ICON_SIZE,
         tray_icon::TrayIconStyle::default(),
+        false,
     ))?;
 
     let menu_service = service;
@@ -645,15 +701,17 @@ pub async fn update_tray_icon(
 ) -> Result<(), String> {
     let runtime = tray_state.runtime.clone();
     let style = style.unwrap_or_default();
-    let snapshot = TraySnapshot {
+    let mut snapshot = TraySnapshot {
         percentage,
         visible,
         style,
+        incident: false,
     };
     let request_generation = {
         let mut state = runtime
             .lock()
             .map_err(|_| "failed to lock tray runtime state".to_string())?;
+        snapshot.incident = state.incident(service);
         if state.should_skip_update(service, snapshot, force) {
             return Ok(());
         }
@@ -666,14 +724,14 @@ pub async fn update_tray_icon(
 
     app.run_on_main_thread(move || {
         let result = (|| -> Result<(), String> {
-            {
+            let Some(snapshot) = ({
                 let state = runtime
                     .lock()
                     .map_err(|_| "failed to lock tray runtime state".to_string())?;
-                if state.generation(service) != request_generation {
-                    return Ok(());
-                }
-            }
+                state.snapshot_for_current_generation(service, request_generation, snapshot)
+            }) else {
+                return Ok(());
+            };
 
             if !visible {
                 if destroy_hidden_tray() {
@@ -708,6 +766,7 @@ pub async fn update_tray_icon(
                 percentage,
                 ICON_SIZE,
                 style,
+                snapshot.incident,
             ))
             .map_err(|e| e.to_string())?;
 
@@ -741,6 +800,53 @@ pub async fn update_tray_icon(
         .map_err(|_| "failed to receive tray update result".to_string())?
 }
 
+/// Force a redraw using the latest frontend snapshot when service health
+/// changes. Other providers deliberately never receive an incident flag.
+pub fn set_service_incident(
+    app: &AppHandle,
+    tray_state: &TrayState,
+    service: TrayService,
+    incident: bool,
+) {
+    let runtime = tray_state.runtime.clone();
+    let Some((snapshot, generation)) = ({
+        let mut state = runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.apply_service_incident(service, incident)
+    }) else {
+        return;
+    };
+    if !snapshot.visible {
+        return;
+    }
+    let app = app.clone();
+    let app_for_main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if runtime
+            .lock()
+            .is_ok_and(|state| state.generation(service) != generation)
+        {
+            return;
+        }
+        let Some(tray) = app_for_main.tray_by_id(service.tray_id()) else {
+            return;
+        };
+        match Image::from_bytes(&tray_icon::generate_tray_icon(
+            service.icon_identity(),
+            snapshot.percentage,
+            ICON_SIZE,
+            snapshot.style,
+            incident,
+        )) {
+            Ok(icon) => {
+                let _ = tray.set_icon(Some(icon));
+            }
+            Err(error) => eprintln!("[Tray] failed to render service-status dot: {error}"),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -772,6 +878,7 @@ mod tests {
             percentage: Some(100),
             visible: true,
             style: TrayIconStyle::Percent,
+            incident: false,
         };
 
         assert_eq!(state.snapshot(TrayService::Claude), None);
@@ -790,12 +897,61 @@ mod tests {
             percentage: Some(42),
             visible: true,
             style: TrayIconStyle::Percent,
+            incident: false,
         };
 
         state.set_snapshot(TrayService::Claude, snapshot);
 
         assert!(state.should_skip_update(TrayService::Claude, snapshot, false));
         assert!(!state.should_skip_update(TrayService::Claude, snapshot, true));
+    }
+
+    #[test]
+    fn service_incident_bumps_generation_and_updates_the_saved_snapshot() {
+        let mut state = TrayRuntimeState::default();
+        let snapshot = TraySnapshot {
+            percentage: Some(42),
+            visible: true,
+            style: TrayIconStyle::Percent,
+            incident: false,
+        };
+        state.set_snapshot(TrayService::Claude, snapshot);
+
+        let (redraw, generation) = state
+            .apply_service_incident(TrayService::Claude, true)
+            .expect("incident change needs redraw");
+        assert_eq!(generation, 1);
+        assert!(redraw.incident);
+        assert_eq!(state.snapshot(TrayService::Claude), Some(redraw));
+        assert_eq!(state.generation(TrayService::Claude), generation);
+    }
+
+    #[test]
+    fn queued_first_normal_draw_reads_incident_that_arrived_after_queueing() {
+        let mut state = TrayRuntimeState::default();
+        let queued_snapshot = TraySnapshot {
+            percentage: Some(42),
+            visible: true,
+            style: TrayIconStyle::Percent,
+            incident: state.incident(TrayService::Codex),
+        };
+        let generation = state.bump_generation(TrayService::Codex);
+
+        // A status event arrives after the normal update captured false but
+        // before its main-thread closure executes; no snapshot means this does
+        // not invalidate the queued generation.
+        assert!(state
+            .apply_service_incident(TrayService::Codex, true)
+            .is_none());
+        assert!(state.incident(TrayService::Codex));
+        assert_eq!(state.generation(TrayService::Codex), generation);
+
+        let first_normal_draw = state
+            .snapshot_for_current_generation(TrayService::Codex, generation, queued_snapshot)
+            .unwrap();
+        state.set_snapshot(TrayService::Codex, first_normal_draw);
+        assert!(first_normal_draw.incident);
+        assert_eq!(state.snapshot(TrayService::Codex), Some(first_normal_draw));
     }
 
     #[test]

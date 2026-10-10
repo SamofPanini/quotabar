@@ -43,6 +43,7 @@ interface SettingsViewProps {
   claudeMenuBarQuotaWindow: MenuBarQuotaWindow;
   events: AppEvent[];
   notificationSettings: NotificationSettings;
+  serviceStatusEnabled: boolean;
   switcherVisibility: SwitcherVisibility;
   uiScale?: UiScale;
   onClose: () => void;
@@ -55,6 +56,7 @@ interface SettingsViewProps {
   onMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
   onClaudeMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
   onNotificationToggle: (key: NotificationKey) => void;
+  onServiceStatusToggle: () => void;
   onSwitcherToggle: (service: TrayServiceName) => void;
   onUiScaleChange?: (scale: UiScale) => void;
   onApplyPreset: (preset: ProviderPreset) => void;
@@ -74,6 +76,7 @@ export default function SettingsView({
   claudeMenuBarQuotaWindow,
   events,
   notificationSettings,
+  serviceStatusEnabled,
   switcherVisibility,
   uiScale = 1,
   onClose,
@@ -86,6 +89,7 @@ export default function SettingsView({
   onMenuBarQuotaWindowChange,
   onClaudeMenuBarQuotaWindowChange,
   onNotificationToggle,
+  onServiceStatusToggle,
   onSwitcherToggle,
   onUiScaleChange,
   onApplyPreset,
@@ -441,6 +445,11 @@ export default function SettingsView({
             <p>Usage and bonus notifications</p>
           </div>
         </div>
+        <div className="settings-line">
+          <span>Service status</span>
+          <button type="button" role="switch" aria-checked={serviceStatusEnabled} aria-label="Service status" className={`target-switch ${serviceStatusEnabled ? 'on' : ''}`} onClick={onServiceStatusToggle}><span /></button>
+        </div>
+        <div className="settings-hint">Checks status.claude.com and status.openai.com every 5 minutes, every minute while there's an incident. Sends no account data.</div>
         {NOTIFICATION_ROWS.map(({ key, label }) => (
           <div className="settings-line" key={key}>
             <span>{label}</span>
