@@ -645,3 +645,35 @@
 .container:hover::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
+.claude-stale-notice {
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+}
+
+.quota-card-stale {
+  color: var(--text-secondary);
+}
+
+.quota-card-stale .quota-label,
+.quota-card-stale .quota-percentage,
+.quota-card-stale .quota-value,
+.quota-card-stale .reset-text,
+.quota-card-stale .reset-at-text,
+.quota-card-stale .quota-pace {
+  color: var(--text-secondary);
+}
+
+.progress-fill.stale {
+  background: var(--text-muted) !important;
+}
+
+.overview-stale-label {
+  color: var(--text-secondary);
+  font-size: 10px;
+}

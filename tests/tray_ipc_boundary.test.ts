@@ -26,6 +26,7 @@ describe('tray IPC percentage boundary', () => {
       visible: true,
       force: false,
       style: 'percent',
+      grayed: false,
     });
   });
 

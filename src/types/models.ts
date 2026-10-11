@@ -13,6 +13,9 @@ export interface QuotaData {
   weeklySonnet?: UsageInfo;
   weeklyDesign?: UsageInfo;
   weeklyFable5?: UsageInfo;
+  staleSince?: string;
+  staleReason?: 'expired' | 'signed_out';
+  autoRenew?: 'pending' | 'sent' | 'skipped';
   error?: string;
 }
 

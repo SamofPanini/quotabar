@@ -22,6 +22,11 @@ pub async fn refresh_claude_login() -> Result<claude::ClaudeLoginRefreshResult, 
     Ok(claude::refresh_claude_login().await)
 }
 
+#[tauri::command]
+pub fn set_claude_auto_renew(enabled: bool) {
+    claude::set_auto_renew_enabled(enabled);
+}
+
 fn profile_for_ping(
     alias: &str,
     primary_dir: &std::path::Path,
@@ -536,6 +541,7 @@ pub async fn update_tray_icon(
     visible: bool,
     force: Option<bool>,
     style: Option<tray_icon::TrayIconStyle>,
+    grayed: Option<bool>,
 ) -> Result<(), String> {
     tray::update_tray_icon(
         app,
@@ -545,6 +551,7 @@ pub async fn update_tray_icon(
         visible,
         force.unwrap_or(false),
         style,
+        grayed.unwrap_or(false),
     )
     .await
 }

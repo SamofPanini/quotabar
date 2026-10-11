@@ -78,6 +78,7 @@ struct TrayIconCacheKey {
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
+    grayed: bool,
     alert: ServiceAlert,
 }
 
@@ -340,12 +341,24 @@ pub fn generate_tray_icon(
     style: TrayIconStyle,
     alert: impl Into<ServiceAlert>,
 ) -> Vec<u8> {
+    generate_tray_icon_with_tone(identity, used_percent, size, style, false, alert)
+}
+
+pub fn generate_tray_icon_with_tone(
+    identity: TrayIconIdentity,
+    used_percent: Option<u8>,
+    size: u32,
+    style: TrayIconStyle,
+    grayed: bool,
+    alert: impl Into<ServiceAlert>,
+) -> Vec<u8> {
     let alert = alert.into();
     let key = TrayIconCacheKey {
         identity,
         used_percent: used_percent.map(|value| value.min(100)),
         size,
         style,
+        grayed,
         alert,
     };
     if let Some(png) = tray_icon_cache()
@@ -361,6 +374,7 @@ pub fn generate_tray_icon(
         key.used_percent,
         key.size,
         key.style,
+        key.grayed,
         key.alert,
     );
     tray_icon_cache()
@@ -375,13 +389,18 @@ fn render_tray_icon(
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
+    grayed: bool,
     alert: ServiceAlert,
 ) -> Vec<u8> {
     let mut img: RgbaImage = ImageBuffer::new(size, size);
     let center = size as f32 / 2.0;
     let is_large = size >= 44;
     let pct = used_percent.map(|value| value.min(100));
-    let (pr, pg, pb) = pct.map(usage_color).unwrap_or_else(neutral_color);
+    let (pr, pg, pb) = if grayed {
+        neutral_color()
+    } else {
+        pct.map(usage_color).unwrap_or_else(neutral_color)
+    };
     let ring_width = if is_large {
         LARGE_RING_WIDTH
     } else {
@@ -457,9 +476,15 @@ fn render_tray_icon(
         };
         let start_x = (((size as i32 - total_width as i32) / 2) + digit_offset_x).max(0);
         let start_y = (((size as i32 - digit_h as i32) / 2) + digit_offset_y).max(0);
+        let digit_color = if grayed {
+            let (red, green, blue) = neutral_color();
+            Rgba([red, green, blue, 255])
+        } else {
+            BADGE_TEXT
+        };
         for (index, digit) in digits.into_iter().enumerate() {
             let x = start_x + index as i32 * (digit_w + spacing) as i32;
-            draw_digit(&mut img, digit, x, start_y, scale, BADGE_TEXT);
+            draw_digit(&mut img, digit, x, start_y, scale, digit_color);
         }
     }
 
@@ -496,8 +521,8 @@ fn render_tray_icon(
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_tray_icon, tray_icon_cache, usage_color, TrayIconCache, TrayIconCacheKey,
-        TrayIconIdentity, TrayIconStyle, TRAY_ICON_CACHE_LIMIT,
+        generate_tray_icon, generate_tray_icon_with_tone, tray_icon_cache, usage_color,
+        TrayIconCache, TrayIconCacheKey, TrayIconIdentity, TrayIconStyle, TRAY_ICON_CACHE_LIMIT,
     };
     use crate::services::service_status::ServiceAlert;
 
@@ -579,6 +604,7 @@ mod tests {
             used_percent: Some(37),
             size: 37,
             style: TrayIconStyle::Ring,
+            grayed: false,
             alert: ServiceAlert::None,
         };
         {
@@ -623,6 +649,7 @@ mod tests {
                 used_percent: Some(1),
                 size,
                 style: TrayIconStyle::Icon,
+                grayed: false,
                 alert: ServiceAlert::None,
             };
             cache.insert(key, vec![size as u8]);
@@ -653,6 +680,39 @@ mod tests {
         assert_eq!(usage_color(50), (245, 158, 11));
         assert_eq!(usage_color(79), (245, 158, 11));
         assert_eq!(usage_color(80), (239, 68, 68));
+    }
+
+    #[test]
+    fn grayed_claude_tray_uses_neutral_digits_and_distinct_cache_key() {
+        let normal = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(73),
+            44,
+            TrayIconStyle::Percent,
+            ServiceAlert::None,
+        );
+        let grayed = generate_tray_icon_with_tone(
+            TrayIconIdentity::Claude,
+            Some(73),
+            44,
+            TrayIconStyle::Percent,
+            true,
+            ServiceAlert::None,
+        );
+        assert_ne!(normal, grayed);
+        let normal_key = TrayIconCacheKey {
+            identity: TrayIconIdentity::Claude,
+            used_percent: Some(73),
+            size: 44,
+            style: TrayIconStyle::Percent,
+            grayed: false,
+            alert: ServiceAlert::None,
+        };
+        let gray_key = TrayIconCacheKey {
+            grayed: true,
+            ..normal_key
+        };
+        assert_ne!(normal_key, gray_key);
     }
 
     #[test]
@@ -738,6 +798,7 @@ mod tests {
             used_percent: Some(31),
             size: 47,
             style: TrayIconStyle::Ring,
+            grayed: false,
             alert: ServiceAlert::None,
         };
         let incident = TrayIconCacheKey {
@@ -827,5 +888,38 @@ mod tests {
             false,
         );
         assert_eq!(maintenance, operational);
+    }
+    #[test]
+    fn grayed_claude_tray_digit_pixels_are_neutral() {
+        let count = |png: &[u8], rgb: [u8; 3]| {
+            image::load_from_memory(png)
+                .unwrap()
+                .into_rgba8()
+                .pixels()
+                .filter(|pixel| pixel.0 == [rgb[0], rgb[1], rgb[2], 255])
+                .count()
+        };
+        let normal = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(73),
+            44,
+            TrayIconStyle::Percent,
+            ServiceAlert::None,
+        );
+        let grayed = generate_tray_icon_with_tone(
+            TrayIconIdentity::Claude,
+            Some(73),
+            44,
+            TrayIconStyle::Percent,
+            true,
+            ServiceAlert::None,
+        );
+        let (ur, ug, ub) = usage_color(73);
+        let (nr, ng, nb) = super::neutral_color();
+        assert!(count(&normal, [ur, ug, ub]) > 0);
+        assert_eq!(count(&grayed, [ur, ug, ub]), 0);
+        assert!(count(&grayed, [nr, ng, nb]) > count(&normal, [nr, ng, nb]));
+        // Percent digits are white normally and neutral when grayed.
+        assert!(count(&grayed, [255, 255, 255]) < count(&normal, [255, 255, 255]));
     }
 }

@@ -18,6 +18,7 @@ interface OverviewPanelProps {
   onProviderSelect: (provider: TrayServiceName) => void;
   sections?: PanelSectionVisibility;
   serviceStatus?: ServiceStatusSnapshot | null;
+  claudeStaleReason?: 'expired' | 'signed_out';
 }
 
 export default function OverviewPanel({
@@ -29,6 +30,7 @@ export default function OverviewPanel({
   onProviderSelect,
   sections = defaultPanelSections(),
   serviceStatus,
+  claudeStaleReason,
 }: OverviewPanelProps) {
   const connectedCount = summaries.filter((summary) => summary.connected).length;
 
@@ -66,7 +68,7 @@ export default function OverviewPanel({
             return (
             <button
               type="button"
-              className={`quota-card overview-quota-row${index === 0 ? ' primary' : ''}`}
+              className={`quota-card overview-quota-row${index === 0 ? ' primary' : ''}${window.provider === 'claude' && claudeStaleReason ? ' quota-card-stale' : ''}`}
               key={`${window.provider}-${window.label}`}
               onClick={() => onProviderSelect(window.provider)}
               aria-label={`Open ${window.providerLabel}: ${window.label}, ${Math.round(window.usedPercent)}% used`}
@@ -84,9 +86,10 @@ export default function OverviewPanel({
                 aria-valuenow={clampProgressValue(window.usedPercent)}
                 aria-valuetext={`${Math.round(window.usedPercent)}% used`}
               >
-                <div className="progress-fill" style={getProgressStyle(window.usedPercent)} />
+                <div className={`progress-fill${window.provider === 'claude' && claudeStaleReason ? ' stale' : ''}`} style={getProgressStyle(window.usedPercent)} />
               </div>
               {window.resetLabel && <div className="reset-time">Resets in {window.resetLabel}</div>}
+              {window.provider === 'claude' && claudeStaleReason && <small className="overview-stale-label">{claudeStaleReason === 'expired' ? 'expired' : 'signed out'}</small>}
             </button>
           ); }) : (
             <div className="no-data">No provider data</div>

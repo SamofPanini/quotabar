@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeStaleReason {
+    Expired,
+    SignedOut,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAutoRenewStatus {
+    Pending,
+    Sent,
+    Skipped,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageInfo {
     pub used: f64,
@@ -24,6 +39,12 @@ pub struct QuotaData {
     pub weekly_design: Option<UsageInfo>,
     #[serde(rename = "weeklyFable5")]
     pub weekly_fable5: Option<UsageInfo>,
+    #[serde(rename = "staleSince", skip_serializing_if = "Option::is_none")]
+    pub stale_since: Option<String>,
+    #[serde(rename = "staleReason", skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<ClaudeStaleReason>,
+    #[serde(rename = "autoRenew", skip_serializing_if = "Option::is_none")]
+    pub auto_renew: Option<ClaudeAutoRenewStatus>,
     pub error: Option<String>,
 }
 
@@ -37,6 +58,9 @@ impl QuotaData {
             weekly_sonnet: None,
             weekly_design: None,
             weekly_fable5: None,
+            stale_since: None,
+            stale_reason: None,
+            auto_renew: None,
             error: Some(error.into()),
         }
     }
@@ -57,6 +81,9 @@ impl QuotaData {
             weekly_sonnet,
             weekly_design,
             weekly_fable5,
+            stale_since: None,
+            stale_reason: None,
+            auto_renew: None,
             error: None,
         }
     }

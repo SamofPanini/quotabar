@@ -10,6 +10,7 @@ import { getHighUsageTip } from '../services/detail_helpers';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
 import ServiceStatusNotice from './ServiceStatusNotice';
 import type { ProviderServiceStatus } from '../services/service_status';
+import { formatServiceStatusDate } from '../services/service_status';
 
 interface ClaudePanelProps {
   quota: QuotaData | null;
@@ -21,8 +22,6 @@ interface ClaudePanelProps {
   sections?: PanelSectionVisibility;
   serviceStatus?: ProviderServiceStatus;
 }
-
-const SESSION_WINDOW_MINUTES = 5 * 60;
 
 function formatClaudeResetTime(resetTime?: string): string {
   return formatResetTime(resetTime, {
@@ -42,6 +41,18 @@ function hasWeeklyData(quota: QuotaData): boolean {
   );
 }
 
+function staleClaudeNotice(quota: QuotaData): string | null {
+  if (!quota.staleReason || !quota.staleSince) return null;
+  const at = formatServiceStatusDate(quota.staleSince);
+  if (!at) return null;
+  if (quota.staleReason === 'signed_out') {
+    return `Signed out · showing values from ${at} · sign in with claude in Terminal`;
+  }
+  return quota.autoRenew === 'pending' || quota.autoRenew === 'sent'
+    ? `Login expired · showing values from ${at} · renewing automatically`
+    : 'Login expired · showing values from ' + at + ' · open Claude Code or press Ping to renew';
+}
+
 export default function ClaudePanel({
   quota,
   loading,
@@ -54,6 +65,8 @@ export default function ClaudePanel({
 }: ClaudePanelProps) {
   const windows = buildClaudeQuotaWindows(quota);
   const topWindow = sortMostConstrained(windows)[0];
+  const staleNotice = quota ? staleClaudeNotice(quota) : null;
+  const grayed = quota?.staleReason != null;
 
   return (
     <>
@@ -61,7 +74,7 @@ export default function ClaudePanel({
         <div className="loading-state">Loading Claude quota...</div>
       )}
 
-      {error && (
+      {error && !staleNotice && (
         <div className="error-banner" role="alert">
           <span className="error-icon">!</span>
           <span className="error-text">
@@ -84,6 +97,7 @@ export default function ClaudePanel({
             tone={error ? 'pending' : quota.connected ? 'online' : 'offline'}
           />
           <ServiceStatusNotice provider="claude" status={serviceStatus} />
+          {staleNotice && <div className="claude-stale-notice">{staleNotice}</div>}
 
           <div className="section">
             <div className="section-title">Current session</div>
@@ -94,7 +108,8 @@ export default function ClaudePanel({
                   percentage={Math.round(quota.session.percentage)}
                   resetsIn={formatClaudeResetTime(quota.session.resetTime)}
                   resetAt={quota.session.resetTime}
-                  pace={formatPaceText(quota.session.percentage, quota.session.resetTime, SESSION_WINDOW_MINUTES)}
+                  pace={formatPaceText(quota.session.percentage, quota.session.resetTime, 5 * 60)}
+                  grayed={grayed}
                 />
               ) : (
                 <div className="no-data">No session data</div>
@@ -112,6 +127,7 @@ export default function ClaudePanel({
                   resetsIn={formatClaudeResetTime(quota.weeklyTotal.resetTime)}
                   resetAt={quota.weeklyTotal.resetTime}
                   featured
+                  grayed={grayed}
                 />
               )}
 
@@ -121,6 +137,7 @@ export default function ClaudePanel({
                   percentage={Math.round(quota.weeklyOpus.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklyOpus.resetTime)}
                   resetAt={quota.weeklyOpus.resetTime}
+                  grayed={grayed}
                 />
               )}
 
@@ -130,6 +147,7 @@ export default function ClaudePanel({
                   percentage={Math.round(quota.weeklySonnet.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklySonnet.resetTime)}
                   resetAt={quota.weeklySonnet.resetTime}
+                  grayed={grayed}
                 />
               )}
 
@@ -139,6 +157,7 @@ export default function ClaudePanel({
                   percentage={Math.round(quota.weeklyDesign.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklyDesign.resetTime)}
                   resetAt={quota.weeklyDesign.resetTime}
+                  grayed={grayed}
                 />
               )}
 
@@ -148,6 +167,7 @@ export default function ClaudePanel({
                   percentage={Math.round(quota.weeklyFable5.percentage)}
                   resetsIn={formatClaudeResetTime(quota.weeklyFable5.resetTime)}
                   resetAt={quota.weeklyFable5.resetTime}
+                  grayed={grayed}
                 />
               )}
 

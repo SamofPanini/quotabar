@@ -29,7 +29,12 @@ import {
 } from '../services/panel_sections';
 import type { MenuBarQuotaWindow } from '../services/codex_tray_window';
 import { UI_SCALES, type UiScale } from '../hooks/use_ui_scale';
-import { getCursorOnlineCostEnabled, setCursorOnlineCostEnabled } from '../services/storage';
+import {
+  getClaudeAutoRenewEnabled,
+  getCursorOnlineCostEnabled,
+  setClaudeAutoRenewEnabled,
+  setCursorOnlineCostEnabled,
+} from '../services/storage';
 
 interface SettingsViewProps {
   isMacOS: boolean;
@@ -62,6 +67,7 @@ interface SettingsViewProps {
   onApplyPreset: (preset: ProviderPreset) => void;
   onSelectEventProvider: (service: TrayServiceName) => void;
   onAutostartNotice?: (message: string) => void;
+  onClaudeAutoRenewChange?: (enabled: boolean) => void;
 }
 
 export default function SettingsView({
@@ -95,9 +101,11 @@ export default function SettingsView({
   onApplyPreset,
   onSelectEventProvider,
   onAutostartNotice,
+  onClaudeAutoRenewChange,
 }: SettingsViewProps) {
   const [budgets, setBudgets] = useState<MonthlyBudgets>(getSavedMonthlyBudgets);
   const [cursorOnlineCost, setCursorOnlineCost] = useState<boolean>(getCursorOnlineCostEnabled);
+  const [claudeAutoRenew, setClaudeAutoRenew] = useState<boolean>(getClaudeAutoRenewEnabled);
   const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
   const [autostartError, setAutostartError] = useState<string | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(true);
@@ -168,6 +176,13 @@ export default function SettingsView({
     const next = !cursorOnlineCost;
     setCursorOnlineCostEnabled(next);
     setCursorOnlineCost(next);
+  };
+
+  const handleClaudeAutoRenewToggle = () => {
+    const next = !claudeAutoRenew;
+    setClaudeAutoRenewEnabled(next);
+    setClaudeAutoRenew(next);
+    onClaudeAutoRenewChange?.(next);
   };
 
   return (
@@ -365,6 +380,20 @@ export default function SettingsView({
           })}
         </div>
         <div className="settings-hint">Hidden panel providers still refresh in the background.</div>
+        <div className="settings-line">
+          <span>Auto-renew Claude login</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={claudeAutoRenew}
+            aria-label="Auto-renew Claude login"
+            className={`target-switch ${claudeAutoRenew ? 'on' : ''}`}
+            onClick={handleClaudeAutoRenewToggle}
+          >
+            <span />
+          </button>
+        </div>
+        <div className="settings-hint">When your Claude login expires while a 5-hour window is already open, QuotaBar sends one short Haiku message to renew it. It never opens a new window.</div>
       </section>
 
       <section className="settings-group" aria-labelledby="settings-sections-title">

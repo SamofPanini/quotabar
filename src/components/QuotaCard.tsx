@@ -8,6 +8,7 @@ interface QuotaCardProps {
   pace?: string | null;
   featured?: boolean;
   resetAt?: string | number;
+  grayed?: boolean;
 }
 
 function getStatusColor(percentage: number): string {
@@ -16,7 +17,7 @@ function getStatusColor(percentage: number): string {
   return 'good';
 }
 
-export default function QuotaCard({ label, percentage, resetsIn, pace, featured = false, resetAt }: QuotaCardProps) {
+export default function QuotaCard({ label, percentage, resetsIn, pace, featured = false, resetAt, grayed = false }: QuotaCardProps) {
   const status = getStatusColor(percentage);
   const resetAtEpochSeconds = typeof resetAt === 'string'
     ? parseRfc3339EpochSeconds(resetAt)
@@ -28,7 +29,7 @@ export default function QuotaCard({ label, percentage, resetsIn, pace, featured 
   const resetAtText = resetAtIso ? formatResetAt(resetAt) : '';
 
   return (
-    <div className={`quota-card${featured ? ' featured' : ''}`}>
+    <div className={`quota-card${featured ? ' featured' : ''}${grayed ? ' quota-card-stale' : ''}`}>
       <div className="quota-header">
         <span className="quota-label">{label}</span>
         <span className="quota-percentage">{percentage}%</span>
@@ -44,7 +45,7 @@ export default function QuotaCard({ label, percentage, resetsIn, pace, featured 
         aria-valuetext={`${Math.round(percentage)}% used`}
       >
         <div
-          className={`progress-fill ${status}`}
+          className={`progress-fill ${grayed ? 'stale' : status}`}
           style={getProgressStyle(percentage)}
         />
       </div>

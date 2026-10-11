@@ -4,6 +4,9 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- When the Claude login expires while your 5-hour window is open, QuotaBar now renews it automatically with one short Haiku message. It never starts a new window. Turn this off under Settings.
+- While the Claude login is expired or signed out, the last readings stay visible in gray with the time they were taken.
+
 - Service status now separates the services you use directly (claude.ai, Claude Code, Codex) from the rest. Incidents on the Claude API, Claude Console, Claude Cowork or OpenAI Responses/Login, and any incident that has moved to Monitoring, show a yellow dot instead of a red one.
 - The Claude and Codex panels now show each incident's stage (Investigating, Identified, Monitoring) and when it started and was last updated, with dates.
 - Codex incidents from status.openai.com now appear in the Codex panel with their name, stage and link.

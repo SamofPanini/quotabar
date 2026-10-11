@@ -35,6 +35,7 @@ struct TraySnapshot {
     percentage: Option<u8>,
     visible: bool,
     style: tray_icon::TrayIconStyle,
+    grayed: bool,
     alert: ServiceAlert,
 }
 
@@ -698,6 +699,7 @@ pub async fn update_tray_icon(
     visible: bool,
     force: bool,
     style: Option<tray_icon::TrayIconStyle>,
+    grayed: bool,
 ) -> Result<(), String> {
     let runtime = tray_state.runtime.clone();
     let style = style.unwrap_or_default();
@@ -705,6 +707,7 @@ pub async fn update_tray_icon(
         percentage,
         visible,
         style,
+        grayed,
         alert: ServiceAlert::None,
     };
     let request_generation = {
@@ -761,11 +764,12 @@ pub async fn update_tray_icon(
                 return Err(format!("missing tray icon for {}", service.label()));
             };
 
-            let icon = Image::from_bytes(&tray_icon::generate_tray_icon(
+            let icon = Image::from_bytes(&tray_icon::generate_tray_icon_with_tone(
                 service.icon_identity(),
                 percentage,
                 ICON_SIZE,
                 style,
+                snapshot.grayed,
                 snapshot.alert,
             ))
             .map_err(|e| e.to_string())?;
@@ -832,11 +836,12 @@ pub fn set_service_alert(
         let Some(tray) = app_for_main.tray_by_id(service.tray_id()) else {
             return;
         };
-        match Image::from_bytes(&tray_icon::generate_tray_icon(
+        match Image::from_bytes(&tray_icon::generate_tray_icon_with_tone(
             service.icon_identity(),
             snapshot.percentage,
             ICON_SIZE,
             snapshot.style,
+            snapshot.grayed,
             alert,
         )) {
             Ok(icon) => {
@@ -879,6 +884,7 @@ mod tests {
             percentage: Some(100),
             visible: true,
             style: TrayIconStyle::Percent,
+            grayed: false,
             alert: ServiceAlert::None,
         };
 
@@ -898,6 +904,7 @@ mod tests {
             percentage: Some(42),
             visible: true,
             style: TrayIconStyle::Percent,
+            grayed: false,
             alert: ServiceAlert::None,
         };
 
@@ -914,6 +921,7 @@ mod tests {
             percentage: Some(42),
             visible: true,
             style: TrayIconStyle::Percent,
+            grayed: false,
             alert: ServiceAlert::None,
         };
         state.set_snapshot(TrayService::Claude, snapshot);
@@ -934,6 +942,7 @@ mod tests {
             percentage: Some(42),
             visible: true,
             style: TrayIconStyle::Percent,
+            grayed: false,
             alert: state.alert(TrayService::Codex),
         };
         let generation = state.bump_generation(TrayService::Codex);
