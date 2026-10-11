@@ -4,6 +4,10 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Service status now separates the services you use directly (claude.ai, Claude Code, Codex) from the rest. Incidents on the Claude API, Claude Console, Claude Cowork or OpenAI Responses/Login, and any incident that has moved to Monitoring, show a yellow dot instead of a red one.
+- The Claude and Codex panels now show each incident's stage (Investigating, Identified, Monitoring) and when it started and was last updated, with dates.
+- Codex incidents from status.openai.com now appear in the Codex panel with their name, stage and link.
+
 - QuotaBar now watches status.claude.com and status.openai.com for the services it depends on, shows incidents in the Claude and Codex panels and on the All page, and sends a notification when an incident starts, changes, or is resolved. Turn it off under Settings → Service status.
 - During an incident the Claude or Codex menu bar icon shows a red dot. Usage colors are unchanged.
 - QuotaBar no longer downloads model prices at runtime. Each release ships a price snapshot taken from LiteLLM (see THIRD_PARTY_NOTICES.md); it is copied into the ccstats price cache only when that cache is missing, unreadable, or older than the snapshot.

@@ -204,7 +204,7 @@ describe('App ping result and provider refresh isolation', () => {
     const resetsAt = Math.floor(Date.now() / 1000) + 5 * 60 * 60;
     vi.mocked(backend.getServiceStatus).mockResolvedValue({
       claude: { provider: 'claude', level: 'operational', components: [], incidents: [], maintenances: [] },
-      codex: { provider: 'codex', level: 'degraded', components: [], incidents: [{ id: 'i', name: 'Codex incident', status: 'monitoring' }], maintenances: [] },
+      codex: { provider: 'codex', level: 'degraded', components: [], incidents: [{ id: 'i', name: 'Codex incident', status: 'monitoring' }], maintenances: [], alert: 'warning' },
     });
     vi.mocked(backend.getCodexProfiles).mockResolvedValue({
       profiles: [{ alias: 'work', status: 'connected', primary: { usedPercent: 1, windowMinutes: 300, resetsAt }, availableResetCredits: 0, ordinaryUsageAllowed: true }], registryError: null, registryProvenance: 'primary',
@@ -212,9 +212,10 @@ describe('App ping result and provider refresh isolation', () => {
     const renderer = await renderApp();
     await clickProvider(renderer, 'codex');
     await act(async () => { accountTab(renderer, 'work').props.onClick(); await flush(); });
-    const nodes = renderer.root.findAll((node) => node.props.className === 'service-status-notice degraded');
+    const nodes = renderer.root.findAll((node) => node.props.className === 'service-status-notice warning');
     expect(nodes).toHaveLength(1);
-    expect(text(renderer)).toContain('"OpenAI",": ","degraded"');
+    expect(text(renderer)).toContain('"OpenAI"');
+    expect(text(renderer)).toContain('"Monitoring"');
     const header = renderer.root.findAll((node) => node.props.className === 'provider-detail-header')[0];
     const allNodes = renderer.root.findAll(() => true);
     expect(allNodes.indexOf(header)).toBeLessThan(allNodes.indexOf(nodes[0]));
