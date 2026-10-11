@@ -49,6 +49,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_quota,
             commands::refresh_claude_login,
+            commands::set_claude_auto_renew,
             commands::get_claude_current_snapshots,
             commands::get_codex_info,
             commands::get_codex_rate_limits,

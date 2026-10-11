@@ -58,6 +58,10 @@ export const backend = {
     return invokeBackend<ServiceStatusSnapshot>('get_service_status');
   },
 
+  setClaudeAutoRenew(enabled: boolean) {
+    return invokeBackend<void>('set_claude_auto_renew', { enabled });
+  },
+
   setServiceStatusPrefs(enabled: boolean, notify: boolean) {
     return invokeBackend<void>('set_service_status_prefs', { enabled, notify });
   },
@@ -165,6 +169,7 @@ export const backend = {
     visible: boolean,
     force = false,
     style: 'percent' | 'ring' | 'icon' = 'percent',
+    grayed = false,
   ) {
     return invokeBackend<void>('update_tray_icon', {
       service,
@@ -172,6 +177,7 @@ export const backend = {
       visible,
       force,
       style,
+      grayed,
     });
   },
 

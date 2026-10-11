@@ -104,12 +104,13 @@ import {
   saveTheme,
   type ServiceMap,
   type TrayEnabledState,
-  type TrayIconRequest,
   type TrayServiceActivatedPayload,
 } from './services/app_state';
 import {
   STORAGE_READ_FAILURE_MESSAGE,
   STORAGE_WRITE_FAILURE_MESSAGE,
+  getClaudeAutoRenewEnabled,
+  setClaudeAutoRenewEnabled,
   subscribeStorageReadFailures,
   subscribeStorageWriteFailures,
 } from './services/storage';
@@ -140,6 +141,12 @@ type PingProvider = 'codex' | 'claude';
 type PingTarget = { provider: PingProvider; alias: string };
 type PingResult = { message: string; generation: number };
 type PingConfirmation = PingTarget & { message: string };
+type TrayIconRequest = {
+  percentage: number | null;
+  visible: boolean;
+  style: TrayStyle;
+  grayed: boolean;
+};
 
 function pingTargetKey({ provider, alias }: PingTarget): string {
   return `${provider}/${alias}`;
@@ -178,6 +185,8 @@ export default function App() {
   const [claudeLoading, setClaudeLoading] = useState(false);
   const [claudeError, setClaudeError] = useState<string | null>(null);
   const [claudeLoginRefreshMessage, setClaudeLoginRefreshMessage] = useState<string | null>(null);
+  const [claudeAutoRenew, setClaudeAutoRenew] = useState<boolean>(getClaudeAutoRenewEnabled);
+  const [claudeAutoRenewSynced, setClaudeAutoRenewSynced] = useState(false);
   const [claudeCostRefreshNonce, setClaudeCostRefreshNonce] = useState(0);
   const [codexPingContext, setCodexPingContext] = useState<CodexPingContext | null>(null);
   const [pingInFlight, setPingInFlight] = useState<Record<string, true>>({});
@@ -343,6 +352,17 @@ export default function App() {
     void backend.setServiceStatusPrefs(serviceStatusEnabled, notifSettings.serviceStatus).catch(() => {});
   }, [serviceStatusEnabled, notifSettings.serviceStatus]);
 
+  useEffect(() => {
+    let active = true;
+    setClaudeAutoRenewSynced(false);
+    void backend.setClaudeAutoRenew(claudeAutoRenew).catch(() => {}).finally(() => {
+      if (active) setClaudeAutoRenewSynced(true);
+    });
+    return () => {
+      active = false;
+    };
+  }, [claudeAutoRenew]);
+
   const setAndPersistTab = useCallback((tab: TabName) => {
     setActiveView(tab);
     if (isProviderTab(tab)) {
@@ -358,13 +378,15 @@ export default function App() {
     visible: boolean,
     force = false,
     style: TrayStyle = 'percent',
+    grayed = false,
   ) => {
     const previous = lastTrayIconRequestRef.current[service];
     if (
       !force &&
       previous?.percentage === percentage &&
       previous.visible === visible &&
-      previous.style === style
+      previous.style === style &&
+      previous.grayed === grayed
     ) {
       return;
     }
@@ -373,9 +395,9 @@ export default function App() {
     trayIconGenerationRef.current[service] = generation;
 
     try {
-      await backend.updateTrayIcon(service, percentage, visible, force, style);
+      await backend.updateTrayIcon(service, percentage, visible, force, style, grayed);
       if (trayIconGenerationRef.current[service] !== generation) return;
-      lastTrayIconRequestRef.current[service] = { percentage, visible, style };
+      lastTrayIconRequestRef.current[service] = { percentage, visible, style, grayed };
     } catch (err) {
       console.error(`Failed to update ${service} tray icon:`, err);
     }
@@ -421,6 +443,7 @@ export default function App() {
   }, [claude_request_generation, setServiceConnected]);
 
   useEffect(() => {
+    if (!claudeAutoRenewSynced) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
 
@@ -438,7 +461,7 @@ export default function App() {
         clearTimeout(timer);
       }
     };
-  }, [fetchClaudeQuota]);
+  }, [claudeAutoRenewSynced, fetchClaudeQuota]);
 
   useEffect(() => {
     setServiceUsedPercent('claude', getClaudeTrayUsedPercent(quota));
@@ -456,8 +479,9 @@ export default function App() {
         : svc === 'codex'
           ? getCodexTrayUsedPercent(codexTraySnapshots, menuBarQuotaWindow)
           : usedPercent[svc];
+      const grayed = svc === 'claude' && quota?.staleReason != null;
       const visible = resolveTrayVisible(svc, candidates, trayCycle, trayCycleIndex);
-      updateTrayIcon(svc, pct, visible, force, trayStyle);
+      updateTrayIcon(svc, pct, visible, force, trayStyle, grayed);
     }
   }, [
     quota,
@@ -952,6 +976,11 @@ export default function App() {
     setActiveView(opening ? 'settings' : getSavedTab());
   }, [activeView]);
 
+  const handleClaudeAutoRenewChange = useCallback((enabled: boolean) => {
+    setClaudeAutoRenewEnabled(enabled);
+    setClaudeAutoRenew(enabled);
+  }, []);
+
   const handleCloseSettings = useCallback(() => {
     saveSettingsExpanded(false);
     setActiveView(getSavedTab());
@@ -1062,6 +1091,7 @@ export default function App() {
               onApplyPreset={applyProviderPreset}
               onSelectEventProvider={handleSelectEventProvider}
               onAutostartNotice={showTimedToast}
+              onClaudeAutoRenewChange={handleClaudeAutoRenewChange}
             />
           </div>
         ) : (
@@ -1146,14 +1176,15 @@ export default function App() {
               </div>
 
               {activeView === 'all' && (
-                <OverviewPanel
+              <OverviewPanel
                   summaries={providerSummaries}
                   mostConstrained={mostConstrained}
                   upcomingResets={upcomingResets}
                   costRefreshKey={overviewCostRefreshKey} showCostSummary={windowVisible}
                   onProviderSelect={setAndPersistTab}
                   sections={panelSections}
-                  serviceStatus={serviceStatus}
+                serviceStatus={serviceStatus}
+                claudeStaleReason={quota?.staleReason}
                 />
               )}
             </div>

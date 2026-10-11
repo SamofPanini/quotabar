@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 pub const MARGIN_SECS: i64 = 60;
 const WINDOW_SECS: i64 = 5 * 60 * 60;
 const CODEX_MODEL: &str = "gpt-5.6-luna"; // gpt-5.6-* generation; change here and re-test argv when it changes.
-const CLAUDE_MODEL: &str = "claude-haiku-4-5"; // Claude model selection is deliberately fixed; re-test argv when it changes.
+const CLAUDE_MODEL: &str = "claude-haiku-5-5"; // Claude model selection is deliberately fixed; re-test argv when it changes.
 const CLI_TIMEOUT: Duration = Duration::from_secs(120);
 pub const CONFIRM_DELAYS_SECS: [u64; 5] = [0, 30, 60, 120, 300];
 const CONFIRM_TOTAL_SECS: u64 = 0 + 30 + 60 + 120 + 300;
@@ -448,6 +448,8 @@ fn claude_args() -> Vec<String> {
         "Reply with the single character 1.".into(),
         "--model".into(),
         CLAUDE_MODEL.into(),
+        "--effort".into(),
+        "low".into(),
         "--tools".into(),
         "".into(),
         "--strict-mcp-config".into(),
@@ -459,6 +461,99 @@ fn claude_args() -> Vec<String> {
         "--max-turns".into(),
         "1".into(),
     ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutoPingInput<'a> {
+    pub enabled: bool,
+    pub expired: bool,
+    pub signed_out: bool,
+    pub last_reset_time: Option<&'a str>,
+    pub now_secs: i64,
+    pub other_claude_running: bool,
+    pub expires_at_ms: Option<u64>,
+    pub last_expires_at_ms: Option<Option<u64>>,
+    pub last_attempt_ms: Option<u64>,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoPingDecision {
+    Send,
+    SettingOff,
+    NotExpired,
+    SignedOut,
+    WindowNotOpen,
+    OtherClaudeRunning,
+    SameExpiry,
+    TooSoon,
+}
+
+/// The automatic path intentionally requires a real future reset timestamp;
+/// unlike the manual window state, a non-zero percentage is not evidence that
+/// a previous five-hour window is still open.
+pub(crate) fn auto_ping_decision(input: AutoPingInput<'_>) -> AutoPingDecision {
+    if !input.enabled {
+        return AutoPingDecision::SettingOff;
+    }
+    if !input.expired {
+        return AutoPingDecision::NotExpired;
+    }
+    if input.signed_out {
+        return AutoPingDecision::SignedOut;
+    }
+    let reset = input
+        .last_reset_time
+        .filter(|value| is_strict_rfc3339(value))
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp());
+    if !reset.is_some_and(|reset| reset > input.now_secs && reset - input.now_secs <= WINDOW_SECS) {
+        return AutoPingDecision::WindowNotOpen;
+    }
+    if input.other_claude_running {
+        return AutoPingDecision::OtherClaudeRunning;
+    }
+    if input.last_expires_at_ms == Some(input.expires_at_ms) {
+        return AutoPingDecision::SameExpiry;
+    }
+    if input
+        .last_attempt_ms
+        .is_some_and(|last| input.now_ms.saturating_sub(last) < 30 * 60 * 1_000)
+    {
+        return AutoPingDecision::TooSoon;
+    }
+    AutoPingDecision::Send
+}
+
+pub(crate) fn other_claude_process_running() -> bool {
+    other_claude_process_running_from_exit(
+        claude_process_probe_command()
+            .status()
+            .ok()
+            .and_then(|status| status.code()),
+    )
+}
+
+fn claude_process_probe_command() -> Command {
+    let mut command = Command::new("/usr/bin/pgrep");
+    command.args(["-x", "claude"]);
+    command
+}
+
+/// Runs the Claude child after the caller has acquired `ClaudeFlight` and
+/// completed all automatic-renewal safety checks.
+pub(crate) async fn run_claude_renewal_ping() -> bool {
+    let Ok(command) = build_claude_command() else {
+        return false;
+    };
+    matches!(
+        run_child_without_blocking(command, CLI_TIMEOUT).await,
+        ChildResult::Success(_)
+    )
+}
+
+fn other_claude_process_running_from_exit(exit_code: Option<i32>) -> bool {
+    exit_code != Some(1)
 }
 
 pub(crate) enum ChildResult {
@@ -2028,6 +2123,8 @@ mod tests {
                 "Reply with the single character 1.",
                 "--model",
                 CLAUDE_MODEL,
+                "--effort",
+                "low",
                 "--tools",
                 "",
                 "--strict-mcp-config",
@@ -2046,6 +2143,102 @@ mod tests {
             claude_tokens(b"{\"type\":\"result\",\"is_error\":true}"),
             None
         );
+    }
+
+    fn auto_ping_input<'a>(reset: Option<&'a str>) -> AutoPingInput<'a> {
+        AutoPingInput {
+            enabled: true,
+            expired: true,
+            signed_out: false,
+            last_reset_time: reset,
+            now_secs: 1_700_000_000,
+            other_claude_running: false,
+            expires_at_ms: Some(9),
+            last_expires_at_ms: None,
+            last_attempt_ms: None,
+            now_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn auto_ping_fires_when_expired_and_window_open() {
+        let input = auto_ping_input(Some("2023-11-15T03:13:20Z"));
+        assert_eq!(auto_ping_decision(input), AutoPingDecision::Send);
+    }
+
+    #[test]
+    fn auto_ping_skipped_when_window_reset_in_past() {
+        // A non-zero old percentage never enters this decision: only reset_time
+        // can prove that the five-hour window is still open.
+        let input = auto_ping_input(Some("2023-11-14T20:13:20Z"));
+        assert_eq!(auto_ping_decision(input), AutoPingDecision::WindowNotOpen);
+    }
+
+    #[test]
+    fn auto_ping_skipped_when_reset_time_missing_or_unparseable() {
+        assert_eq!(
+            auto_ping_decision(auto_ping_input(None)),
+            AutoPingDecision::WindowNotOpen
+        );
+        assert_eq!(
+            auto_ping_decision(auto_ping_input(Some("not-a-time"))),
+            AutoPingDecision::WindowNotOpen
+        );
+    }
+
+    #[test]
+    fn auto_ping_skipped_when_signed_out() {
+        let mut input = auto_ping_input(Some("2023-11-15T03:13:20Z"));
+        input.signed_out = true;
+        assert_eq!(auto_ping_decision(input), AutoPingDecision::SignedOut);
+    }
+
+    #[test]
+    fn auto_ping_skipped_when_other_claude_running() {
+        let mut input = auto_ping_input(Some("2023-11-15T03:13:20Z"));
+        input.other_claude_running = true;
+        assert_eq!(
+            auto_ping_decision(input),
+            AutoPingDecision::OtherClaudeRunning
+        );
+        // The production pgrep adapter maps both a match and a probe failure
+        // to this same conservative input.
+        assert!(other_claude_process_running_from_exit(Some(0)));
+        assert!(other_claude_process_running_from_exit(None));
+    }
+
+    #[test]
+    fn pgrep_uses_absolute_path() {
+        assert_eq!(
+            claude_process_probe_command().get_program(),
+            std::ffi::OsStr::new("/usr/bin/pgrep")
+        );
+    }
+
+    #[test]
+    fn auto_ping_once_per_expires_at_and_30_minute_spacing() {
+        let mut input = auto_ping_input(Some("2023-11-15T03:13:20Z"));
+        input.last_expires_at_ms = Some(Some(9));
+        assert_eq!(auto_ping_decision(input), AutoPingDecision::SameExpiry);
+        input.last_expires_at_ms = Some(Some(8));
+        input.last_attempt_ms = Some(input.now_ms - 29 * 60 * 1_000);
+        assert_eq!(auto_ping_decision(input), AutoPingDecision::TooSoon);
+    }
+
+    #[test]
+    fn auto_ping_skipped_when_setting_off() {
+        let mut input = auto_ping_input(Some("2023-11-15T03:13:20Z"));
+        input.enabled = false;
+        assert_eq!(auto_ping_decision(input), AutoPingDecision::SettingOff);
+    }
+
+    #[test]
+    fn claude_ping_args_use_haiku_5_5_low_effort() {
+        let args = claude_args();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "claude-haiku-5-5"]));
+        assert!(args.windows(2).any(|pair| pair == ["--effort", "low"]));
     }
 
     #[test]
@@ -2301,5 +2494,13 @@ mod tests {
             };
             assert_eq!(serde_json::to_value(outcome).unwrap(), expected);
         }
+    }
+    #[test]
+    fn auto_ping_skipped_when_reset_more_than_five_hours_ahead() {
+        // now_secs = 1_700_000_000 (2023-11-14T22:13:20Z); five hours and one minute later.
+        let input = auto_ping_input(Some("2023-11-15T03:14:20Z"));
+        assert_eq!(auto_ping_decision(input), AutoPingDecision::WindowNotOpen);
+        let inside = auto_ping_input(Some("2023-11-15T03:12:20Z"));
+        assert_eq!(auto_ping_decision(inside), AutoPingDecision::Send);
     }
 }

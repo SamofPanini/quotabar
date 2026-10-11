@@ -26,6 +26,7 @@ const failureListeners = new Set<StorageWriteFailureListener>();
 const readFailureListeners = new Set<StorageReadFailureListener>();
 let pendingReadFailure = false;
 const CURSOR_ONLINE_COST_STORAGE_KEY = 'quotabar-cursor-online-cost';
+const CLAUDE_AUTO_RENEW_STORAGE_KEY = 'quotabar-claude-auto-renew';
 
 const DEFAULT_WRITE_OPTIONS: StorageWriteOptions = {
   preserveSessionValue: false,
@@ -146,6 +147,22 @@ export function getCursorOnlineCostEnabled(): boolean {
 
 export function setCursorOnlineCostEnabled(enabled: boolean): boolean {
   return writeStorageItem(CURSOR_ONLINE_COST_STORAGE_KEY, String(enabled), {
+    preserveSessionValue: true,
+    notifyUser: true,
+  });
+}
+
+export function getClaudeAutoRenewEnabled(): boolean {
+  const result = readStorageValue(CLAUDE_AUTO_RENEW_STORAGE_KEY, (raw) => {
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+    throw new Error('Invalid Claude auto-renew setting');
+  }, { notifyUser: true });
+  return result.status === 'value' ? result.value : true;
+}
+
+export function setClaudeAutoRenewEnabled(enabled: boolean): boolean {
+  return writeStorageItem(CLAUDE_AUTO_RENEW_STORAGE_KEY, String(enabled), {
     preserveSessionValue: true,
     notifyUser: true,
   });
