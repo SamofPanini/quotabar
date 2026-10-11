@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use super::tray_icon;
+use super::{service_status::ServiceAlert, tray_icon};
 use serde::{Deserialize, Serialize};
 use tauri::{
     image::Image,
@@ -35,7 +35,7 @@ struct TraySnapshot {
     percentage: Option<u8>,
     visible: bool,
     style: tray_icon::TrayIconStyle,
-    incident: bool,
+    alert: ServiceAlert,
 }
 
 #[derive(Default)]
@@ -50,8 +50,8 @@ struct TrayRuntimeState {
     cursor_snapshot: Option<TraySnapshot>,
     grok_snapshot: Option<TraySnapshot>,
     antigravity_snapshot: Option<TraySnapshot>,
-    claude_incident: bool,
-    codex_incident: bool,
+    claude_alert: ServiceAlert,
+    codex_alert: ServiceAlert,
 }
 
 impl TrayRuntimeState {
@@ -101,18 +101,18 @@ impl TrayRuntimeState {
         }
     }
 
-    fn incident(&self, service: TrayService) -> bool {
+    fn alert(&self, service: TrayService) -> ServiceAlert {
         match service {
-            TrayService::Claude => self.claude_incident,
-            TrayService::Codex => self.codex_incident,
-            _ => false,
+            TrayService::Claude => self.claude_alert,
+            TrayService::Codex => self.codex_alert,
+            _ => ServiceAlert::None,
         }
     }
 
-    fn set_incident(&mut self, service: TrayService, incident: bool) {
+    fn set_alert(&mut self, service: TrayService, alert: ServiceAlert) {
         match service {
-            TrayService::Claude => self.claude_incident = incident,
-            TrayService::Codex => self.codex_incident = incident,
+            TrayService::Claude => self.claude_alert = alert,
+            TrayService::Codex => self.codex_alert = alert,
             _ => {}
         }
     }
@@ -136,17 +136,17 @@ impl TrayRuntimeState {
         }
     }
 
-    fn apply_service_incident(
+    fn apply_service_alert(
         &mut self,
         service: TrayService,
-        incident: bool,
+        alert: ServiceAlert,
     ) -> Option<(TraySnapshot, u64)> {
-        if self.incident(service) == incident {
+        if self.alert(service) == alert {
             return None;
         }
-        self.set_incident(service, incident);
+        self.set_alert(service, alert);
         let snapshot = self.snapshot(service).map(|mut snapshot| {
-            snapshot.incident = incident;
+            snapshot.alert = alert;
             self.set_snapshot(service, snapshot);
             snapshot
         });
@@ -168,7 +168,7 @@ impl TrayRuntimeState {
         if self.generation(service) != generation {
             return None;
         }
-        snapshot.incident = self.incident(service);
+        snapshot.alert = self.alert(service);
         Some(snapshot)
     }
 }
@@ -705,13 +705,13 @@ pub async fn update_tray_icon(
         percentage,
         visible,
         style,
-        incident: false,
+        alert: ServiceAlert::None,
     };
     let request_generation = {
         let mut state = runtime
             .lock()
             .map_err(|_| "failed to lock tray runtime state".to_string())?;
-        snapshot.incident = state.incident(service);
+        snapshot.alert = state.alert(service);
         if state.should_skip_update(service, snapshot, force) {
             return Ok(());
         }
@@ -766,7 +766,7 @@ pub async fn update_tray_icon(
                 percentage,
                 ICON_SIZE,
                 style,
-                snapshot.incident,
+                snapshot.alert,
             ))
             .map_err(|e| e.to_string())?;
 
@@ -802,18 +802,18 @@ pub async fn update_tray_icon(
 
 /// Force a redraw using the latest frontend snapshot when service health
 /// changes. Other providers deliberately never receive an incident flag.
-pub fn set_service_incident(
+pub fn set_service_alert(
     app: &AppHandle,
     tray_state: &TrayState,
     service: TrayService,
-    incident: bool,
+    alert: ServiceAlert,
 ) {
     let runtime = tray_state.runtime.clone();
     let Some((snapshot, generation)) = ({
         let mut state = runtime
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.apply_service_incident(service, incident)
+        state.apply_service_alert(service, alert)
     }) else {
         return;
     };
@@ -837,7 +837,7 @@ pub fn set_service_incident(
             snapshot.percentage,
             ICON_SIZE,
             snapshot.style,
-            incident,
+            alert,
         )) {
             Ok(icon) => {
                 let _ = tray.set_icon(Some(icon));
@@ -853,6 +853,7 @@ mod tests {
         destroy_hidden_tray, format_tooltip, popover_origin_from_physical, tray_click_action,
         LRect, TrayClickAction, TrayRuntimeState, TrayService, TraySnapshot,
     };
+    use crate::services::service_status::ServiceAlert;
     use crate::services::tray_icon::TrayIconStyle;
 
     #[test]
@@ -878,7 +879,7 @@ mod tests {
             percentage: Some(100),
             visible: true,
             style: TrayIconStyle::Percent,
-            incident: false,
+            alert: ServiceAlert::None,
         };
 
         assert_eq!(state.snapshot(TrayService::Claude), None);
@@ -897,7 +898,7 @@ mod tests {
             percentage: Some(42),
             visible: true,
             style: TrayIconStyle::Percent,
-            incident: false,
+            alert: ServiceAlert::None,
         };
 
         state.set_snapshot(TrayService::Claude, snapshot);
@@ -913,15 +914,15 @@ mod tests {
             percentage: Some(42),
             visible: true,
             style: TrayIconStyle::Percent,
-            incident: false,
+            alert: ServiceAlert::None,
         };
         state.set_snapshot(TrayService::Claude, snapshot);
 
         let (redraw, generation) = state
-            .apply_service_incident(TrayService::Claude, true)
+            .apply_service_alert(TrayService::Claude, ServiceAlert::Critical)
             .expect("incident change needs redraw");
         assert_eq!(generation, 1);
-        assert!(redraw.incident);
+        assert_eq!(redraw.alert, ServiceAlert::Critical);
         assert_eq!(state.snapshot(TrayService::Claude), Some(redraw));
         assert_eq!(state.generation(TrayService::Claude), generation);
     }
@@ -933,7 +934,7 @@ mod tests {
             percentage: Some(42),
             visible: true,
             style: TrayIconStyle::Percent,
-            incident: state.incident(TrayService::Codex),
+            alert: state.alert(TrayService::Codex),
         };
         let generation = state.bump_generation(TrayService::Codex);
 
@@ -941,16 +942,16 @@ mod tests {
         // before its main-thread closure executes; no snapshot means this does
         // not invalidate the queued generation.
         assert!(state
-            .apply_service_incident(TrayService::Codex, true)
+            .apply_service_alert(TrayService::Codex, ServiceAlert::Critical)
             .is_none());
-        assert!(state.incident(TrayService::Codex));
+        assert_eq!(state.alert(TrayService::Codex), ServiceAlert::Critical);
         assert_eq!(state.generation(TrayService::Codex), generation);
 
         let first_normal_draw = state
             .snapshot_for_current_generation(TrayService::Codex, generation, queued_snapshot)
             .unwrap();
         state.set_snapshot(TrayService::Codex, first_normal_draw);
-        assert!(first_normal_draw.incident);
+        assert_eq!(first_normal_draw.alert, ServiceAlert::Critical);
         assert_eq!(state.snapshot(TrayService::Codex), Some(first_normal_draw));
     }
 

@@ -5,7 +5,7 @@ import CostSummarySection from './CostSummarySection';
 import ProviderDetailHeader from './ProviderDetailHeader';
 import ResetTimeline from './ResetTimeline';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
-import { serviceStatusLabel, type ServiceStatusSnapshot } from '../services/service_status';
+import { componentStatusLabel, orderedServiceEvents, serviceStageLabel, type ServiceStatusSnapshot } from '../services/service_status';
 
 const ALL_COST_SOURCES = ['claude', 'codex', 'cursor'] as const;
 
@@ -50,8 +50,11 @@ export default function OverviewPanel({
             const status = serviceStatus[provider];
             if (status.level === 'unknown') return null;
             const name = provider === 'claude' ? 'Anthropic' : 'OpenAI';
-            const label = serviceStatusLabel(status);
-            return <span key={provider} className="service-status-overview-item">{name}{status.level === 'operational' ? <span className="service-status-dot" title={`${name}: all watched services operational`} /> : <span className={`service-status-pill ${status.level}`}>{label}</span>}</span>;
+            const event = orderedServiceEvents(status)[0];
+            const component = status.components.find((item) => item.status !== 'operational');
+            const label = event ? serviceStageLabel(event, status.maintenances.includes(event)) : component ? componentStatusLabel(component.status) : '';
+            const detail = event ? `${event.name} · ${event.affectedComponents?.join(', ') ?? ''}` : component?.name ?? '';
+            return <span key={provider} className="service-status-overview-item">{name}{status.level === 'operational' ? <span className="service-status-dot" title={`${name}: all watched services operational`} /> : <span className={`service-status-pill ${status.alert ?? 'none'}`} title={`${name}: ${detail}`}>{label}</span>}</span>;
           })}
         </div>
       )}

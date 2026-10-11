@@ -3,6 +3,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use super::service_status::ServiceAlert;
 use image::{
     imageops::{resize, FilterType},
     load_from_memory_with_format, ImageBuffer, ImageEncoder, ImageFormat, Rgba, RgbaImage,
@@ -77,7 +78,7 @@ struct TrayIconCacheKey {
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
-    incident: bool,
+    alert: ServiceAlert,
 }
 
 struct CachedTrayIcon {
@@ -337,14 +338,15 @@ pub fn generate_tray_icon(
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
-    incident: bool,
+    alert: impl Into<ServiceAlert>,
 ) -> Vec<u8> {
+    let alert = alert.into();
     let key = TrayIconCacheKey {
         identity,
         used_percent: used_percent.map(|value| value.min(100)),
         size,
         style,
-        incident,
+        alert,
     };
     if let Some(png) = tray_icon_cache()
         .lock()
@@ -359,7 +361,7 @@ pub fn generate_tray_icon(
         key.used_percent,
         key.size,
         key.style,
-        key.incident,
+        key.alert,
     );
     tray_icon_cache()
         .lock()
@@ -373,7 +375,7 @@ fn render_tray_icon(
     used_percent: Option<u8>,
     size: u32,
     style: TrayIconStyle,
-    incident: bool,
+    alert: ServiceAlert,
 ) -> Vec<u8> {
     let mut img: RgbaImage = ImageBuffer::new(size, size);
     let center = size as f32 / 2.0;
@@ -462,7 +464,7 @@ fn render_tray_icon(
     }
 
     draw_badge(&mut img, identity);
-    if incident {
+    if alert != ServiceAlert::None {
         let radius = (size / 10).max(2) as i32;
         let center_x = size as i32 - radius - 1;
         let center_y = radius + 1;
@@ -478,7 +480,12 @@ fn render_tray_icon(
                     img.put_pixel(x as u32, y as u32, Rgba([255, 255, 255, 255]));
                 }
                 if distance <= radius * radius {
-                    img.put_pixel(x as u32, y as u32, Rgba([220, 38, 38, 255]));
+                    let color = if alert == ServiceAlert::Warning {
+                        Rgba([245, 158, 11, 255])
+                    } else {
+                        Rgba([220, 38, 38, 255])
+                    };
+                    img.put_pixel(x as u32, y as u32, color);
                 }
             }
         }
@@ -492,6 +499,7 @@ mod tests {
         generate_tray_icon, tray_icon_cache, usage_color, TrayIconCache, TrayIconCacheKey,
         TrayIconIdentity, TrayIconStyle, TRAY_ICON_CACHE_LIMIT,
     };
+    use crate::services::service_status::ServiceAlert;
 
     #[test]
     fn generate_icon_returns_png_bytes() {
@@ -571,7 +579,7 @@ mod tests {
             used_percent: Some(37),
             size: 37,
             style: TrayIconStyle::Ring,
-            incident: false,
+            alert: ServiceAlert::None,
         };
         {
             let mut cache = tray_icon_cache()
@@ -586,14 +594,14 @@ mod tests {
             key.used_percent,
             key.size,
             key.style,
-            key.incident,
+            key.alert,
         );
         let second = generate_tray_icon(
             key.identity,
             key.used_percent,
             key.size,
             key.style,
-            key.incident,
+            key.alert,
         );
         let hits = tray_icon_cache()
             .lock()
@@ -615,7 +623,7 @@ mod tests {
                 used_percent: Some(1),
                 size,
                 style: TrayIconStyle::Icon,
-                incident: false,
+                alert: ServiceAlert::None,
             };
             cache.insert(key, vec![size as u8]);
         }
@@ -674,6 +682,37 @@ mod tests {
     }
 
     #[test]
+    fn warning_dot_differs_from_critical_and_none() {
+        let none = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            44,
+            TrayIconStyle::Percent,
+            ServiceAlert::None,
+        );
+        let warning = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            44,
+            TrayIconStyle::Percent,
+            ServiceAlert::Warning,
+        );
+        let critical = generate_tray_icon(
+            TrayIconIdentity::Claude,
+            Some(65),
+            44,
+            TrayIconStyle::Percent,
+            ServiceAlert::Critical,
+        );
+        assert_ne!(none, warning);
+        assert_ne!(warning, critical);
+        let yellow = image::load_from_memory(&warning).unwrap().into_rgba8();
+        let red = image::load_from_memory(&critical).unwrap().into_rgba8();
+        assert_eq!(yellow.get_pixel(39, 5).0, [245, 158, 11, 255]);
+        assert_eq!(red.get_pixel(39, 5).0, [220, 38, 38, 255]);
+    }
+
+    #[test]
     fn incident_true_and_false_produce_different_png_bytes() {
         let plain = generate_tray_icon(
             TrayIconIdentity::Claude,
@@ -699,10 +738,10 @@ mod tests {
             used_percent: Some(31),
             size: 47,
             style: TrayIconStyle::Ring,
-            incident: false,
+            alert: ServiceAlert::None,
         };
         let incident = TrayIconCacheKey {
-            incident: true,
+            alert: ServiceAlert::Critical,
             ..plain
         };
         assert_ne!(plain, incident);
@@ -719,14 +758,14 @@ mod tests {
             plain.used_percent,
             plain.size,
             plain.style,
-            plain.incident,
+            plain.alert,
         );
         let _ = generate_tray_icon(
             incident.identity,
             incident.used_percent,
             incident.size,
             incident.style,
-            incident.incident,
+            incident.alert,
         );
         let cache = tray_icon_cache().lock().unwrap();
         assert!(cache.entries.contains_key(&plain));

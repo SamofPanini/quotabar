@@ -566,14 +566,9 @@ pub fn set_service_status_prefs(
 ) -> Result<(), String> {
     let became_enabled = state.set_prefs(enabled, notify);
     if !enabled {
-        let [claude_incident, codex_incident] = state.incident_flags();
-        tray::set_service_incident(
-            &app,
-            &tray_state,
-            tray::TrayService::Claude,
-            claude_incident,
-        );
-        tray::set_service_incident(&app, &tray_state, tray::TrayService::Codex, codex_incident);
+        let [claude_alert, codex_alert] = state.incident_flags();
+        tray::set_service_alert(&app, &tray_state, tray::TrayService::Claude, claude_alert);
+        tray::set_service_alert(&app, &tray_state, tray::TrayService::Codex, codex_alert);
         let _ = app.emit("service-status-changed", state.snapshot());
     }
     if became_enabled {

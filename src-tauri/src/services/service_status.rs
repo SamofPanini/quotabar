@@ -1,7 +1,7 @@
 //! Public service-status polling.  This module deliberately has no account or
 //! credential inputs: requests only go to the two public status pages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,11 +33,33 @@ pub enum ServiceLevel {
     Unknown,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAlert {
+    #[default]
+    None,
+    Warning,
+    Critical,
+}
+
+impl From<bool> for ServiceAlert {
+    fn from(incident: bool) -> Self {
+        if incident {
+            Self::Critical
+        } else {
+            Self::None
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceComponent {
     pub name: String,
     pub status: String,
+    pub tier: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -58,6 +80,9 @@ pub struct ServiceEvent {
     pub impact: Option<String>,
     pub url: Option<String>,
     pub latest_update: Option<ServiceUpdate>,
+    pub started_at: Option<String>,
+    pub affected_components: Vec<String>,
+    pub alert: ServiceAlert,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,6 +95,7 @@ pub struct ServiceStatus {
     pub maintenances: Vec<ServiceEvent>,
     pub fetched_at: Option<String>,
     pub error: Option<String>,
+    pub alert: ServiceAlert,
 }
 
 impl ServiceStatus {
@@ -82,6 +108,7 @@ impl ServiceStatus {
             maintenances: vec![],
             fetched_at: None,
             error: Some(error.into()),
+            alert: ServiceAlert::None,
         }
     }
     fn is_incident(&self) -> bool {
@@ -192,12 +219,12 @@ impl ServiceStatusState {
         }
         became_enabled
     }
-    pub fn incident_flags(&self) -> [bool; 2] {
+    pub fn incident_flags(&self) -> [ServiceAlert; 2] {
         let runtime = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        [runtime.claude.is_incident(), runtime.codex.is_incident()]
+        [runtime.claude.alert, runtime.codex.alert]
     }
     fn enabled(&self) -> bool {
         self.inner
@@ -271,9 +298,9 @@ pub async fn poll_once(app: &AppHandle) {
     finish_poll_side_effects(
         &state,
         outcome,
-        |index, incident| match index {
-            0 => tray::set_service_incident(app, &tray_state, TrayService::Claude, incident),
-            1 => tray::set_service_incident(app, &tray_state, TrayService::Codex, incident),
+        |index, alert| match index {
+            0 => tray::set_service_alert(app, &tray_state, TrayService::Claude, alert),
+            1 => tray::set_service_alert(app, &tray_state, TrayService::Codex, alert),
             _ => unreachable!("service status only has two providers"),
         },
         |snapshot| {
@@ -306,7 +333,7 @@ fn finish_poll_side_effects<SetIncident, EmitSnapshot, ShowNotification>(
     mut emit_snapshot: EmitSnapshot,
     mut show_notification: ShowNotification,
 ) where
-    SetIncident: FnMut(usize, bool),
+    SetIncident: FnMut(usize, ServiceAlert),
     EmitSnapshot: FnMut(ServiceStatusSnapshot),
     ShowNotification: FnMut(&NotificationDecision) -> Result<(), String>,
 {
@@ -321,8 +348,8 @@ fn finish_poll_side_effects<SetIncident, EmitSnapshot, ShowNotification>(
         return;
     }
 
-    set_incident(0, snapshot.claude.is_incident());
-    set_incident(1, snapshot.codex.is_incident());
+    set_incident(0, snapshot.claude.alert);
+    set_incident(1, snapshot.codex.alert);
     if changed {
         emit_snapshot(snapshot.clone());
     }
@@ -364,7 +391,7 @@ fn compensate_stale_poll_effects<SetIncident, EmitSnapshot>(
     set_incident: &mut SetIncident,
     emit_snapshot: &mut EmitSnapshot,
 ) where
-    SetIncident: FnMut(usize, bool),
+    SetIncident: FnMut(usize, ServiceAlert),
     EmitSnapshot: FnMut(ServiceStatusSnapshot),
 {
     for (index, incident) in state.incident_flags().into_iter().enumerate() {
@@ -708,8 +735,13 @@ fn changed_event<'a>(status: &'a ServiceStatus, previous: &[String]) -> Option<&
 fn notification_body(item: Option<&ServiceEvent>) -> String {
     item.map(|event| match &event.latest_update {
         Some(update) => format!(
-            "{} — {}: {}",
+            "{}{} — {}: {}",
             event.name,
+            if event.affected_components.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", event.affected_components.join(", "))
+            },
             title_case(&update.status),
             update.body
         ),
@@ -788,15 +820,44 @@ fn parse_json_body(body: &[u8]) -> Result<Value, String> {
 }
 
 fn watched_claude(component: &Component) -> bool {
-    ["Claude API", "Claude Code", "Claude Console", "claude.ai"]
-        .iter()
-        .any(|prefix| component.name.starts_with(prefix))
+    [
+        "Claude API",
+        "Claude Code",
+        "Claude Console",
+        "Claude Cowork",
+        "claude.ai",
+    ]
+    .iter()
+    .any(|prefix| component.name.starts_with(prefix))
 }
 fn watched_codex(component: &Component) -> bool {
     matches!(
         component.name.as_str(),
         "Responses" | "Login" | "Codex in ChatGPT Desktop"
     )
+}
+
+fn component_tier(
+    provider: &str,
+    component: &Component,
+    codex_core_ids: &HashSet<String>,
+) -> &'static str {
+    match provider {
+        "claude"
+            if component.name.starts_with("claude.ai")
+                || component.name.starts_with("Claude Code") =>
+        {
+            "core"
+        }
+        "claude" => "other",
+        "codex"
+            if codex_core_ids.contains(&component.id)
+                || component.name == "Codex in ChatGPT Desktop" =>
+        {
+            "core"
+        }
+        _ => "other",
+    }
 }
 
 #[derive(Deserialize)]
@@ -830,9 +891,18 @@ struct RawEvent {
     #[serde(default)]
     scheduled_for: Option<String>,
     #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
     components: Vec<Component>,
     #[serde(default)]
     incident_updates: Vec<RawUpdate>,
+}
+
+struct RelevantEvent {
+    event: ServiceEvent,
+    affected_component_ids: HashSet<String>,
 }
 #[derive(Clone, Deserialize)]
 struct RawUpdate {
@@ -842,6 +912,10 @@ struct RawUpdate {
     #[serde(default)]
     body: String,
     updated_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    display_at: Option<String>,
 }
 
 fn parse_statuspage(
@@ -867,12 +941,18 @@ fn parse_statuspage(
         summary.incidents,
         summary.scheduled_maintenances,
         &watched_refs,
+        &HashSet::new(),
     ))
 }
 
 fn parse_openai(v2: &Value, proxy: Option<&Value>) -> Result<ServiceStatus, String> {
     let summary: Summary = serde_json::from_value(v2.clone())
         .map_err(|error| format!("Invalid OpenAI summary shape: {error}"))?;
+    let v2_names: HashMap<String, String> = summary
+        .components
+        .iter()
+        .map(|component| (component.id.clone(), component.name.clone()))
+        .collect();
     let mut watched_ids: HashSet<String> = summary
         .components
         .iter()
@@ -887,13 +967,36 @@ fn parse_openai(v2: &Value, proxy: Option<&Value>) -> Result<ServiceStatus, Stri
         .collect();
     let mut incidents = summary.incidents;
     let mut maintenance = summary.scheduled_maintenances;
+    let mut codex_core_ids = HashSet::new();
     if let Some(proxy) = proxy {
-        match parse_openai_supplement(proxy) {
-            Ok((supplemental_components, supplemental_incidents, supplemental_maintenance)) => {
+        match parse_openai_supplement(proxy, &v2_names) {
+            Ok((
+                supplemental_components,
+                supplemental_incidents,
+                supplemental_maintenance,
+                proxy_core_ids,
+            )) => {
                 for component in supplemental_components {
                     watched_ids.insert(component.id.clone());
-                    components.push(component);
+                    if !components
+                        .iter()
+                        .any(|existing| existing.id == component.id)
+                    {
+                        components.push(component);
+                    }
                 }
+                codex_core_ids = proxy_core_ids;
+                let retained_proxy_ids: HashSet<_> = supplemental_incidents
+                    .iter()
+                    .filter(|event| {
+                        event
+                            .components
+                            .iter()
+                            .any(|component| watched_ids.contains(&component.id))
+                    })
+                    .map(|event| event.id.as_str())
+                    .collect();
+                incidents.retain(|event| !retained_proxy_ids.contains(event.id.as_str()));
                 incidents.extend(supplemental_incidents);
                 maintenance.extend(supplemental_maintenance);
             }
@@ -909,66 +1012,215 @@ fn parse_openai(v2: &Value, proxy: Option<&Value>) -> Result<ServiceStatus, Stri
         incidents,
         maintenance,
         &ids,
+        &codex_core_ids,
     ))
 }
 
 fn parse_openai_supplement(
     proxy: &Value,
-) -> Result<(Vec<Component>, Vec<RawEvent>, Vec<RawEvent>), String> {
-    let codex = proxy
+    v2_names: &HashMap<String, String>,
+) -> Result<
+    (
+        Vec<Component>,
+        Vec<RawEvent>,
+        Vec<RawEvent>,
+        HashSet<String>,
+    ),
+    String,
+> {
+    let items = proxy
         .pointer("/summary/structure/items")
         .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.pointer("/group/name").and_then(Value::as_str) == Some("Codex"))
-        })
-        .ok_or("missing Codex group")?;
-    let group_components = codex
-        .pointer("/group/components")
-        .and_then(Value::as_array)
-        .ok_or("missing Codex components")?;
+        .ok_or("missing structure items")?;
     let affected = proxy
         .pointer("/summary/affected_components")
         .and_then(Value::as_array)
         .ok_or("missing affected_components")?;
+    let mut names = v2_names.clone();
+    let mut core_ids = HashSet::new();
+    let mut watched_ids = HashSet::new();
+    for item in items {
+        let group = item.get("group");
+        let is_codex = group
+            .and_then(|group| group.get("name"))
+            .and_then(Value::as_str)
+            == Some("Codex");
+        let list = group
+            .and_then(|group| group.get("components"))
+            .and_then(Value::as_array)
+            .or_else(|| item.get("components").and_then(Value::as_array));
+        if let Some(list) = list {
+            for component in list {
+                insert_proxy_component(
+                    component,
+                    is_codex,
+                    &mut names,
+                    &mut core_ids,
+                    &mut watched_ids,
+                );
+            }
+        } else if let Some(component) = item.get("component") {
+            insert_proxy_component(
+                component,
+                false,
+                &mut names,
+                &mut core_ids,
+                &mut watched_ids,
+            );
+        }
+    }
+    if core_ids.is_empty() {
+        return Err("missing Codex group".into());
+    }
     let mut components = Vec::new();
-    for component in group_components {
-        let id = component
-            .get("component_id")
-            .and_then(Value::as_str)
-            .ok_or("malformed component id")?;
-        let name = component
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or("malformed component name")?;
+    let mut ordered_ids: Vec<&String> = watched_ids.iter().collect();
+    ordered_ids.sort();
+    for id in ordered_ids {
+        let name = names
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| "Unknown component".into());
         let matching = affected.iter().find(|item| component_matches(item, id));
-        let status = match matching {
-            Some(item) => status_from_value(item).ok_or("affected component missing status")?,
-            None => "operational",
-        };
+        let status = matching
+            .and_then(status_from_value)
+            .unwrap_or("operational");
         components.push(Component {
-            id: id.into(),
-            name: name.into(),
+            id: id.clone(),
+            name,
             status: status.into(),
         });
     }
-    let events = |key: &str| -> Result<Vec<RawEvent>, String> {
-        proxy
-            .pointer(&format!("/summary/{key}"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("missing {key}"))?
-            .iter()
-            .map(|item| {
-                serde_json::from_value(item.clone()).map_err(|_| format!("malformed {key} item"))
-            })
-            .collect()
+    let ongoing = proxy
+        .pointer("/summary/ongoing_incidents")
+        .and_then(Value::as_array)
+        .ok_or("missing ongoing_incidents")?;
+    let mut incidents = Vec::new();
+    for item in ongoing {
+        incidents.push(proxy_event(item, &names).ok_or("malformed ongoing_incidents item")?);
+    }
+    let mut maintenance = Vec::new();
+    for item in proxy
+        .pointer("/summary/scheduled_maintenances")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match proxy_event(item, &names) {
+            Some(event) => maintenance.push(event),
+            None => {
+                eprintln!("[ServiceStatus] OpenAI supplemental maintenance malformed; skipping")
+            }
+        }
+    }
+    Ok((components, incidents, maintenance, core_ids))
+}
+
+fn insert_proxy_component(
+    component: &Value,
+    is_codex: bool,
+    names: &mut HashMap<String, String>,
+    core_ids: &mut HashSet<String>,
+    watched_ids: &mut HashSet<String>,
+) {
+    let Some(id) = component
+        .get("component_id")
+        .or_else(|| component.get("id"))
+        .and_then(Value::as_str)
+    else {
+        return;
     };
-    Ok((
+    let name = component.get("name").and_then(Value::as_str);
+    if let Some(name) = name {
+        names.insert(id.to_string(), name.to_string());
+    }
+    if is_codex {
+        core_ids.insert(id.to_string());
+        watched_ids.insert(id.to_string());
+    }
+    if matches!(
+        name,
+        Some("Responses" | "Login" | "Codex in ChatGPT Desktop")
+    ) {
+        watched_ids.insert(id.to_string());
+    }
+}
+
+fn proxy_event(item: &Value, names: &HashMap<String, String>) -> Option<RawEvent> {
+    let id = item.get("id")?.as_str()?.to_string();
+    let name = item.get("name")?.as_str()?.to_string();
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ids: HashSet<String> = ["affected_components", "component_impacts"]
+        .into_iter()
+        .flat_map(|key| {
+            item.get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|part| {
+            part.get("component_id")
+                .or_else(|| part.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .collect();
+    let components = ids
+        .into_iter()
+        .map(|id| Component {
+            name: names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown component".into()),
+            id,
+            status: "operational".into(),
+        })
+        .collect();
+    let incident_updates = item
+        .get("updates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|update| {
+            Some(RawUpdate {
+                id: update.get("id")?.as_str()?.into(),
+                status: update
+                    .get("to_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+                body: update
+                    .get("message_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+                updated_at: update
+                    .get("published_at")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                created_at: None,
+                display_at: None,
+            })
+        })
+        .collect();
+    Some(RawEvent {
+        id: id.clone(),
+        name,
+        status,
+        impact: None,
+        shortlink: Some(format!("https://status.openai.com/incidents/{id}")),
+        scheduled_for: None,
+        started_at: item
+            .get("published_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        created_at: None,
         components,
-        events("ongoing_incidents")?,
-        events("scheduled_maintenances")?,
-    ))
+        incident_updates,
+    })
 }
 
 fn component_matches(value: &Value, id: &str) -> bool {
@@ -987,15 +1239,14 @@ fn build_status(
     incidents: Vec<RawEvent>,
     maintenance: Vec<RawEvent>,
     watched_ids: &HashSet<&str>,
+    codex_core_ids: &HashSet<String>,
 ) -> ServiceStatus {
-    let components: Vec<ServiceComponent> = components
-        .into_iter()
-        .map(|component| ServiceComponent {
-            name: component.name,
-            status: component.status,
-        })
+    let component_by_id: HashMap<String, Component> = components
+        .iter()
+        .cloned()
+        .map(|component| (component.id.clone(), component))
         .collect();
-    let relevant = |event: RawEvent, unresolved: bool| -> Option<ServiceEvent> {
+    let relevant = |event: RawEvent, unresolved: bool| -> Option<RelevantEvent> {
         if unresolved && matches!(event.status.as_str(), "resolved" | "postmortem") {
             return None;
         }
@@ -1006,23 +1257,76 @@ fn build_status(
         {
             return None;
         }
+        let affected_component_ids: HashSet<String> = event
+            .components
+            .iter()
+            .filter(|component| watched_ids.contains(component.id.as_str()))
+            .map(|component| component.id.clone())
+            .collect();
+        if affected_component_ids.is_empty() {
+            return None;
+        }
+        let mut affected: Vec<(bool, String)> = affected_component_ids
+            .iter()
+            .map(|id| {
+                let item = component_by_id.get(id);
+                (
+                    item.is_some_and(|item| {
+                        component_tier(provider, item, codex_core_ids) == "core"
+                    }),
+                    item.map(|item| item.name.clone())
+                        .unwrap_or_else(|| "Unknown component".into()),
+                )
+            })
+            .collect();
+        // Core services first, then by name, so titles and snapshots stay stable.
+        affected.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let affected_components: Vec<String> = affected.into_iter().map(|(_, name)| name).collect();
+        let core = affected_component_ids.iter().any(|id| {
+            component_by_id
+                .get(id)
+                .is_some_and(|item| component_tier(provider, item, codex_core_ids) == "core")
+        });
+        let alert = if !unresolved {
+            ServiceAlert::None
+        } else if core && event.status != "monitoring" {
+            ServiceAlert::Critical
+        } else {
+            ServiceAlert::Warning
+        };
         let latest_update = event
             .incident_updates
             .into_iter()
-            .max_by_key(|update| update.updated_at.clone())
+            .max_by(
+                |left, right| match (raw_update_instant(left), raw_update_instant(right)) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (None, None) => std::cmp::Ordering::Equal,
+                },
+            )
             .map(|update| ServiceUpdate {
                 id: update.id,
                 status: update.status,
                 body: truncate(&update.body, 140),
-                updated_at: update.updated_at,
+                updated_at: update
+                    .display_at
+                    .or(update.created_at)
+                    .or(update.updated_at),
             });
-        Some(ServiceEvent {
-            id: event.id,
-            name: event.name,
-            status: event.status,
-            impact: event.impact,
-            url: event.shortlink,
-            latest_update,
+        Some(RelevantEvent {
+            event: ServiceEvent {
+                id: event.id,
+                name: event.name,
+                status: event.status,
+                impact: event.impact,
+                url: event.shortlink,
+                latest_update,
+                started_at: event.started_at.or(event.created_at),
+                affected_components,
+                alert,
+            },
+            affected_component_ids,
         })
     };
     let incidents: Vec<_> = incidents
@@ -1044,15 +1348,68 @@ fn build_status(
     } else if !maintenances.is_empty() && level == ServiceLevel::Operational {
         level = ServiceLevel::Maintenance;
     }
+    let incident_alert = incidents
+        .iter()
+        .map(|event| event.event.alert)
+        .max()
+        .unwrap_or(ServiceAlert::None);
+    let component_alert = components
+        .iter()
+        .filter_map(|component| {
+            let abnormal = matches!(
+                component.status.as_str(),
+                "degraded_performance" | "partial_outage" | "major_outage" | "full_outage"
+            );
+            if !abnormal {
+                return None;
+            }
+            if component_tier(provider, component, codex_core_ids) == "other" {
+                return Some(ServiceAlert::Warning);
+            }
+            let covering: Vec<_> = incidents
+                .iter()
+                .filter(|event| event.affected_component_ids.contains(&component.id))
+                .collect();
+            Some(
+                if !covering.is_empty()
+                    && covering
+                        .iter()
+                        .all(|event| event.event.status == "monitoring")
+                {
+                    ServiceAlert::Warning
+                } else {
+                    ServiceAlert::Critical
+                },
+            )
+        })
+        .max()
+        .unwrap_or(ServiceAlert::None);
     ServiceStatus {
         provider: provider.into(),
         level,
-        components,
-        incidents,
-        maintenances,
+        components: components
+            .into_iter()
+            .map(|component| ServiceComponent {
+                tier: component_tier(provider, &component, codex_core_ids).into(),
+                name: component.name,
+                status: component.status,
+            })
+            .collect(),
+        incidents: incidents.into_iter().map(|event| event.event).collect(),
+        maintenances: maintenances.into_iter().map(|event| event.event).collect(),
         fetched_at: Some(Utc::now().to_rfc3339()),
         error: None,
+        alert: incident_alert.max(component_alert),
     }
+}
+fn raw_update_instant(update: &RawUpdate) -> Option<chrono::DateTime<Utc>> {
+    update
+        .display_at
+        .as_deref()
+        .or(update.created_at.as_deref())
+        .or(update.updated_at.as_deref())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|time| time.with_timezone(&Utc))
 }
 fn maintenance_is_in_progress(event: &RawEvent) -> bool {
     !matches!(event.status.as_str(), "completed" | "resolved")
@@ -1212,6 +1569,8 @@ mod tests {
             impact: None,
             shortlink: None,
             scheduled_for: (status == "scheduled").then(|| "2999-01-01T00:00:00Z".into()),
+            started_at: None,
+            created_at: None,
             components: vec![Component {
                 id: "api".into(),
                 name: "Claude API".into(),
@@ -1235,6 +1594,7 @@ mod tests {
                 event("in_progress"),
             ],
             &watched,
+            &HashSet::new(),
         );
         assert!(status.is_active());
         assert_eq!(status.maintenances.len(), 2);
@@ -1288,7 +1648,10 @@ mod tests {
         ));
         assert!(outcome.is_none());
         assert_eq!(state.snapshot().claude.level, ServiceLevel::Unknown);
-        assert_eq!(state.incident_flags(), [false, false]);
+        assert_eq!(
+            state.incident_flags(),
+            [ServiceAlert::None, ServiceAlert::None]
+        );
     }
 
     #[test]
@@ -1512,13 +1875,16 @@ mod tests {
         );
         assert_eq!(
             &tray_calls.borrow()[tray_calls.borrow().len() - 2..],
-            &[(0, false), (1, false)]
+            &[(0, ServiceAlert::None), (1, ServiceAlert::None)]
         );
         let last_snapshot = emitted.borrow().last().cloned().unwrap();
         assert_eq!(last_snapshot.claude.level, ServiceLevel::Unknown);
         assert_eq!(last_snapshot.codex.level, ServiceLevel::Unknown);
         assert_eq!(*notification_calls.borrow(), 0);
-        assert_eq!(state.incident_flags(), [false, false]);
+        assert_eq!(
+            state.incident_flags(),
+            [ServiceAlert::None, ServiceAlert::None]
+        );
     }
 
     #[test]
@@ -1624,6 +1990,7 @@ mod tests {
             maintenances: vec![],
             fetched_at: None,
             error: None,
+            alert: ServiceAlert::None,
         }
     }
 
@@ -1674,7 +2041,10 @@ mod tests {
         assert!(outcome.is_none());
         let snapshot = state.snapshot();
         assert_eq!(snapshot.claude.level, ServiceLevel::Unknown);
-        assert_eq!(state.incident_flags(), [false, false]);
+        assert_eq!(
+            state.incident_flags(),
+            [ServiceAlert::None, ServiceAlert::None]
+        );
         assert_eq!(openai_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -1751,7 +2121,10 @@ mod tests {
         ));
         assert!(outcome.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(state.incident_flags(), [false, false]);
+        assert_eq!(
+            state.incident_flags(),
+            [ServiceAlert::None, ServiceAlert::None]
+        );
     }
 
     #[test]
@@ -1765,6 +2138,9 @@ mod tests {
                 impact: None,
                 url: None,
                 latest_update: None,
+                started_at: None,
+                affected_components: vec![],
+                alert: ServiceAlert::None,
             }],
             ..operational_status("claude")
         };
@@ -1780,6 +2156,7 @@ mod tests {
             maintenances: vec![],
             fetched_at: None,
             error: None,
+            alert: ServiceAlert::None,
             incidents: vec![ServiceEvent {
                 id: "incident".into(),
                 name: "Affected service".into(),
@@ -1792,6 +2169,9 @@ mod tests {
                     body: "A public update".into(),
                     updated_at: None,
                 }),
+                started_at: None,
+                affected_components: vec![],
+                alert: ServiceAlert::Critical,
             }],
         }
     }
@@ -1869,6 +2249,9 @@ mod tests {
                 body: "The new event body".into(),
                 updated_at: None,
             }),
+            started_at: None,
+            affected_components: vec![],
+            alert: ServiceAlert::Critical,
         });
         let output = notification_decisions_at(
             &mut runtime,
@@ -2163,5 +2546,525 @@ mod tests {
         assert_eq!(snapshot.claude.level, ServiceLevel::Unknown);
         assert_eq!(snapshot.codex.level, ServiceLevel::Unknown);
         assert!(state.set_prefs(true, true));
+    }
+
+    #[test]
+    fn claude_monitoring_console_fixture_is_warning() {
+        let status = parse_statuspage("claude", &json(include_str!("../../tests/fixtures/service_status/claude_summary_2026-10-11_console_monitoring.json")), watched_claude).unwrap();
+        assert_eq!(status.alert, ServiceAlert::Warning);
+        assert_eq!(status.incidents.len(), 1);
+        assert_eq!(status.incidents[0].status, "monitoring");
+        assert!(status.incidents[0]
+            .started_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-10-07T13:25:04"));
+        assert!(status.incidents[0]
+            .latest_update
+            .as_ref()
+            .unwrap()
+            .updated_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-10-07T21:44:41"));
+    }
+
+    #[test]
+    fn claude_core_incident_investigating_is_critical() {
+        let mut value = json(include_str!(
+            "../../tests/fixtures/service_status/claude_summary_2026-10-11_console_monitoring.json"
+        ));
+        let code_id = value["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["name"] == "Claude Code")
+            .unwrap()["id"]
+            .clone();
+        let event = &mut value["incidents"][0];
+        event["status"] = Value::String("investigating".into());
+        event["components"][0]["id"] = code_id;
+        let critical = parse_statuspage("claude", &value, watched_claude).unwrap();
+        assert_eq!(critical.alert, ServiceAlert::Critical);
+        value["incidents"][0]["status"] = Value::String("monitoring".into());
+        assert_eq!(
+            parse_statuspage("claude", &value, watched_claude)
+                .unwrap()
+                .alert,
+            ServiceAlert::Warning
+        );
+    }
+
+    #[test]
+    fn codex_proxy_incident_real_shape_is_parsed_and_unwatched_is_ignored() {
+        let v2 = json(include_str!("../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"));
+        let proxy = json(include_str!("../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"));
+        let ignored = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert!(ignored.incidents.is_empty());
+        assert_eq!(ignored.alert, ServiceAlert::None);
+        let mut proxy = proxy;
+        let cli = proxy
+            .pointer("/summary/structure/items/2/group/components/2/component_id")
+            .unwrap()
+            .clone();
+        proxy["summary"]["ongoing_incidents"][0]["affected_components"][0]["component_id"] =
+            cli.clone();
+        proxy["summary"]["ongoing_incidents"][0]["component_impacts"][0]["component_id"] = cli;
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(status.incidents.len(), 1);
+        assert_eq!(status.incidents[0].status, "monitoring");
+        assert!(status.incidents[0]
+            .affected_components
+            .iter()
+            .any(|name| name == "CLI"));
+        assert_eq!(
+            status.incidents[0].url.as_deref(),
+            Some("https://status.openai.com/incidents/01M4GV1M2A3K38T73JCVCD9G0R")
+        );
+        assert!(status.incidents[0]
+            .latest_update
+            .as_ref()
+            .unwrap()
+            .updated_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-10-09T22:03:59"));
+        assert_eq!(status.alert, ServiceAlert::Warning);
+        proxy["summary"]["ongoing_incidents"][0]["status"] = Value::String("identified".into());
+        assert_eq!(
+            parse_openai(&v2, Some(&proxy)).unwrap().alert,
+            ServiceAlert::Critical
+        );
+    }
+
+    fn claude_component(id: &str, name: &str, status: &str) -> Component {
+        Component {
+            id: id.into(),
+            name: name.into(),
+            status: status.into(),
+        }
+    }
+
+    fn claude_event(id: &str, status: &str, component: &Component) -> RawEvent {
+        RawEvent {
+            id: id.into(),
+            name: id.into(),
+            status: status.into(),
+            impact: None,
+            shortlink: None,
+            scheduled_for: None,
+            started_at: None,
+            created_at: None,
+            components: vec![component.clone()],
+            incident_updates: vec![],
+        }
+    }
+
+    fn claude_status_with(
+        components: Vec<Component>,
+        incidents: Vec<RawEvent>,
+        maintenances: Vec<RawEvent>,
+    ) -> ServiceStatus {
+        let watched_ids: HashSet<String> = components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect();
+        let watched_refs = watched_ids.iter().map(String::as_str).collect();
+        build_status(
+            "claude",
+            components,
+            incidents,
+            maintenances,
+            &watched_refs,
+            &HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn claude_console_investigating_is_warning() {
+        let console = claude_component("console", "Claude Console", "operational");
+        let status = claude_status_with(
+            vec![console.clone()],
+            vec![claude_event("incident", "investigating", &console)],
+            vec![],
+        );
+        assert_eq!(status.alert, ServiceAlert::Warning);
+    }
+
+    #[test]
+    fn core_component_degraded_without_incident_is_critical() {
+        let status = claude_status_with(
+            vec![claude_component(
+                "code",
+                "Claude Code",
+                "degraded_performance",
+            )],
+            vec![],
+            vec![],
+        );
+        assert_eq!(status.alert, ServiceAlert::Critical);
+    }
+
+    #[test]
+    fn core_component_degraded_covered_only_by_monitoring_is_warning() {
+        let code = claude_component("code", "Claude Code", "degraded_performance");
+        let status = claude_status_with(
+            vec![code.clone()],
+            vec![claude_event("monitoring", "monitoring", &code)],
+            vec![],
+        );
+        assert_eq!(status.alert, ServiceAlert::Warning);
+    }
+
+    #[test]
+    fn core_component_degraded_with_one_identified_and_one_monitoring_is_critical() {
+        let code = claude_component("code", "Claude Code", "degraded_performance");
+        let status = claude_status_with(
+            vec![code.clone()],
+            vec![
+                claude_event("identified", "identified", &code),
+                claude_event("monitoring", "monitoring", &code),
+            ],
+            vec![],
+        );
+        assert_eq!(status.alert, ServiceAlert::Critical);
+    }
+
+    #[test]
+    fn unrecognized_phase_on_core_incident_is_critical() {
+        let code = claude_component("code", "Claude Code", "operational");
+        let status = claude_status_with(
+            vec![code.clone()],
+            vec![claude_event("future", "future_phase", &code)],
+            vec![],
+        );
+        assert_eq!(status.alert, ServiceAlert::Critical);
+    }
+
+    #[test]
+    fn codex_incident_in_both_endpoints_is_deduplicated() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        let cli = proxy
+            .pointer("/summary/structure/items/2/group/components/2/component_id")
+            .unwrap()
+            .clone();
+        v2["incidents"][0]["components"] =
+            serde_json::json!([{ "id": cli.clone(), "name": "CLI" }]);
+        proxy["summary"]["ongoing_incidents"][0]["affected_components"][0]["component_id"] =
+            cli.clone();
+        proxy["summary"]["ongoing_incidents"][0]["component_impacts"][0]["component_id"] = cli;
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(status.incidents.len(), 1);
+        assert_eq!(status.incidents[0].affected_components, vec!["CLI"]);
+    }
+
+    #[test]
+    fn codex_login_incident_is_warning_even_when_investigating() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let login_id = v2["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["name"] == "Login")
+            .unwrap()["id"]
+            .clone();
+        v2["incidents"][0]["status"] = Value::String("investigating".into());
+        v2["incidents"][0]["components"] = serde_json::json!([{ "id": login_id, "name": "Login" }]);
+        assert_eq!(
+            parse_openai(&v2, None).unwrap().alert,
+            ServiceAlert::Warning
+        );
+    }
+
+    #[test]
+    fn claude_cowork_incident_is_warning() {
+        let mut value = json(include_str!(
+            "../../tests/fixtures/service_status/claude_summary_2026-10-11_console_monitoring.json"
+        ));
+        let id = value["incidents"][0]["components"][0]["id"].clone();
+        let component = value["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["id"] == id)
+            .unwrap();
+        component["name"] = Value::String("Claude Cowork desktop".into());
+        value["incidents"][0]["status"] = Value::String("investigating".into());
+        let status = parse_statuspage("claude", &value, watched_claude).unwrap();
+        assert_eq!(status.alert, ServiceAlert::Warning);
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Claude Cowork desktop")
+                .unwrap()
+                .tier,
+            "other"
+        );
+    }
+
+    #[test]
+    fn finish_poll_side_effects_passes_warning_to_tray() {
+        use std::cell::RefCell;
+
+        let state = ServiceStatusState::default();
+        let outcome = tauri::async_runtime::block_on(poll_once_with_fetchers(
+            &state,
+            || async {
+                let mut status = active_status(ServiceLevel::Degraded, "warning");
+                status.alert = ServiceAlert::Warning;
+                status
+            },
+            || async { operational_status("codex") },
+        ))
+        .unwrap();
+        let calls = RefCell::new(Vec::new());
+        finish_poll_side_effects(
+            &state,
+            outcome,
+            |index, alert| calls.borrow_mut().push((index, alert)),
+            |_| {},
+            |_| Ok(()),
+        );
+        assert_eq!(
+            calls.into_inner(),
+            vec![(0, ServiceAlert::Warning), (1, ServiceAlert::None)]
+        );
+    }
+
+    #[test]
+    fn maintenance_and_unknown_do_not_contribute_alert() {
+        let code = claude_component("code", "Claude Code", "under_maintenance");
+        let maintenance = claude_status_with(
+            vec![code.clone()],
+            vec![],
+            vec![claude_event("maintenance", "verifying", &code)],
+        );
+        assert_eq!(maintenance.alert, ServiceAlert::None);
+        let unknown = claude_status_with(
+            vec![claude_component("code", "Claude Code", "unannounced")],
+            vec![],
+            vec![],
+        );
+        assert_eq!(unknown.alert, ServiceAlert::None);
+    }
+
+    #[test]
+    fn same_name_components_are_judged_by_id() {
+        let component_a = claude_component("a", "Claude Code", "degraded_performance");
+        let component_b = claude_component("b", "Claude Code", "operational");
+        let status = claude_status_with(
+            vec![component_a, component_b.clone()],
+            vec![claude_event("monitoring", "monitoring", &component_b)],
+            vec![],
+        );
+        assert_eq!(status.alert, ServiceAlert::Critical);
+    }
+
+    #[test]
+    fn standalone_proxy_component_is_mapped() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        proxy["summary"]["structure"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "component": { "component_id": "standalone-login", "name": "Login" } }));
+        proxy["summary"]["ongoing_incidents"][0]["affected_components"][0]["component_id"] =
+            Value::String("standalone-login".into());
+        proxy["summary"]["ongoing_incidents"][0]["component_impacts"][0]["component_id"] =
+            Value::String("standalone-login".into());
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(status.incidents.len(), 1);
+        assert_eq!(status.incidents[0].affected_components, vec!["Login"]);
+    }
+
+    #[test]
+    fn proxy_incident_with_unnamed_watched_id_is_kept() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let response_id = v2["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["name"] == "Responses")
+            .unwrap()["id"]
+            .clone();
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        proxy["summary"]["structure"]["items"][0]["group"]["components"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|component| component["component_id"] != response_id);
+        proxy["summary"]["ongoing_incidents"][0]["affected_components"][0]["component_id"] =
+            response_id.clone();
+        proxy["summary"]["ongoing_incidents"][0]["component_impacts"][0]["component_id"] =
+            response_id;
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(status.incidents.len(), 1);
+        assert_eq!(status.incidents[0].affected_components, vec!["Responses"]);
+    }
+
+    #[test]
+    fn v2_incident_kept_when_proxy_version_is_dropped() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let response_id = v2["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["name"] == "Responses")
+            .unwrap()["id"]
+            .clone();
+        v2["incidents"][0]["components"] =
+            serde_json::json!([{ "id": response_id, "name": "Responses" }]);
+        let proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(status.incidents.len(), 1);
+        assert_eq!(status.incidents[0].affected_components, vec!["Responses"]);
+    }
+
+    #[test]
+    fn latest_update_uses_instant_not_string() {
+        let code = claude_component("code", "Claude Code", "operational");
+        let mut incident = claude_event("incident", "identified", &code);
+        incident.incident_updates = vec![
+            RawUpdate {
+                id: "plus-ten".into(),
+                status: "identified".into(),
+                body: "earlier instant".into(),
+                updated_at: Some("2026-10-07T10:00:00+10:00".into()),
+                created_at: None,
+                display_at: None,
+            },
+            RawUpdate {
+                id: "utc".into(),
+                status: "identified".into(),
+                body: "later instant".into(),
+                updated_at: Some("2026-10-07T01:00:00Z".into()),
+                created_at: None,
+                display_at: None,
+            },
+        ];
+        let status = claude_status_with(vec![code], vec![incident], vec![]);
+        assert_eq!(
+            status.incidents[0].latest_update.as_ref().unwrap().id,
+            "utc"
+        );
+    }
+
+    #[test]
+    fn malformed_proxy_maintenance_is_skipped() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        proxy["summary"]["scheduled_maintenances"] = serde_json::json!([{}]);
+        assert!(parse_openai(&v2, Some(&proxy)).is_ok());
+    }
+    #[test]
+    fn unnamed_codex_group_component_is_core_and_shown_as_unknown() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        proxy["summary"]["structure"]["items"][2]["group"]["components"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "component_id": "core-x" }));
+        let incident = &mut proxy["summary"]["ongoing_incidents"][0];
+        incident["status"] = Value::String("investigating".into());
+        incident["affected_components"][0]["component_id"] = Value::String("core-x".into());
+        incident["component_impacts"][0]["component_id"] = Value::String("core-x".into());
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(status.incidents.len(), 1);
+        assert_eq!(
+            status.incidents[0].affected_components,
+            vec!["Unknown component"]
+        );
+        assert_eq!(status.alert, ServiceAlert::Critical);
+    }
+
+    #[test]
+    fn proxy_resolved_version_supersedes_v2_investigating() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        let response_id = v2["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["name"] == "Responses")
+            .unwrap()["id"]
+            .clone();
+        v2["incidents"][0]["status"] = Value::String("investigating".into());
+        v2["incidents"][0]["components"] =
+            serde_json::json!([{ "id": response_id.clone(), "name": "Responses" }]);
+        let incident = &mut proxy["summary"]["ongoing_incidents"][0];
+        incident["status"] = Value::String("resolved".into());
+        incident["affected_components"][0]["component_id"] = response_id.clone();
+        incident["component_impacts"][0]["component_id"] = response_id;
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert!(status.incidents.is_empty());
+        assert_eq!(status.alert, ServiceAlert::None);
+    }
+
+    #[test]
+    fn affected_component_names_are_ordered_core_first_then_by_name() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        let id_of = |name: &str| {
+            v2["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|component| component["name"] == name)
+                .unwrap()["id"]
+                .clone()
+        };
+        let cli = proxy
+            .pointer("/summary/structure/items/2/group/components/2/component_id")
+            .unwrap()
+            .clone();
+        let affected = serde_json::json!([
+            { "component_id": id_of("Responses"), "status": "degraded_performance" },
+            { "component_id": cli, "status": "degraded_performance" },
+            { "component_id": id_of("Codex in ChatGPT Desktop"), "status": "degraded_performance" }
+        ]);
+        proxy["summary"]["ongoing_incidents"][0]["affected_components"] = affected;
+        proxy["summary"]["ongoing_incidents"][0]["component_impacts"] = serde_json::json!([]);
+        for _ in 0..5 {
+            let status = parse_openai(&v2, Some(&proxy)).unwrap();
+            assert_eq!(
+                status.incidents[0].affected_components,
+                vec!["CLI", "Codex in ChatGPT Desktop", "Responses"]
+            );
+        }
     }
 }
