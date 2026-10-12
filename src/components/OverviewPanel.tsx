@@ -1,7 +1,7 @@
 import type { ProviderSummary, QuotaWindowSummary } from '../services/provider_summary';
 import type { TrayServiceName } from '../services/tray_visibility';
 import { clampProgressValue, getProgressStyle } from '../utils/quota_format';
-import CostSummarySection from './CostSummarySection';
+import CostSummarySection, { ALL_COST_DISPLAY_NAME } from './CostSummarySection';
 import ProviderDetailHeader from './ProviderDetailHeader';
 import ResetTimeline from './ResetTimeline';
 import { defaultPanelSections, type PanelSectionVisibility } from '../services/panel_sections';
@@ -40,7 +40,7 @@ export default function OverviewPanel({
         service="claude"
         label="Overview"
         status={`${connectedCount} of ${summaries.length} connected`}
-        plan="All providers"
+        plan={ALL_COST_DISPLAY_NAME}
         usedPercent={mostConstrained[0]?.usedPercent ?? null}
         usageLabel={mostConstrained[0] ? `${mostConstrained[0].providerLabel} · ${mostConstrained[0].label}` : undefined}
         tone={connectedCount > 0 ? 'online' : 'offline'}

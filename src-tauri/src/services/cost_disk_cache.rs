@@ -10,7 +10,7 @@ use std::{
 /// Snapshots older than this are ignored entirely.
 pub const STALE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-pub const COST_CACHE_SCHEMA_VERSION: u32 = 2;
+pub const COST_CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Identity of the compiled ccstats SDK, whose prices and parsers shape the payload.
 pub const CCSTATS_VERSION: &str = ccstats::VERSION;
@@ -248,6 +248,26 @@ mod tests {
         let result: Option<(Duration, Vec<i64>)> = read_snapshot_in(&base, "schema-mismatch");
         assert!(result.is_none());
         assert!(!path.exists(), "mismatched file should be deleted");
+        let _cleanup = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn schema_2_snapshot_is_discarded() {
+        let base = temp_base();
+        let path = write_raw_snapshot(
+            &base,
+            "schema-2",
+            serde_json::json!({
+                "schema_version": 2,
+                "app_version": env!("CARGO_PKG_VERSION"),
+                "ccstats_version": CCSTATS_VERSION,
+                "saved_at_unix_ms": now_unix_ms(),
+                "payload": [1, 2, 3],
+            }),
+        );
+        let result: Option<(Duration, Vec<i64>)> = read_snapshot_in(&base, "schema-2");
+        assert!(result.is_none());
+        assert!(!path.exists(), "schema 2 file should be deleted");
         let _cleanup = std::fs::remove_dir_all(&base);
     }
 

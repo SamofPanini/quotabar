@@ -51,6 +51,7 @@ pub struct CostOverview {
     pub currency: String,
     pub generated_at: String,
     pub cached: bool,
+    pub stale: bool,
     pub ranges: Vec<CostRangeSummary>,
 }
 
@@ -64,10 +65,16 @@ pub struct CostRangeSummary {
     pub currency: String,
     pub cost: Option<f64>,
     pub cost_usd: Option<f64>,
+    pub estimated_cost: Option<f64>,
+    pub estimated_cost_usd: Option<f64>,
+    pub cost_kind: String,
+    pub cost_is_lower_bound: bool,
+    pub unpriced_models: usize,
     pub tokens: CostTokenBreakdown,
     pub models: Vec<CostModelSummary>,
     pub valid_entries: i64,
     pub skipped_entries: i64,
+    pub parse_error_entries: usize,
     pub elapsed_ms: f64,
 }
 
@@ -98,6 +105,7 @@ pub struct CostDailySeries {
     pub currency: String,
     pub generated_at: String,
     pub cached: bool,
+    pub stale: bool,
     pub days: Vec<CostDailyPoint>,
 }
 
@@ -108,6 +116,7 @@ pub struct CostDailyPoint {
     pub cost: Option<f64>,
     pub cost_usd: Option<f64>,
     pub total_tokens: i64,
+    pub cost_is_lower_bound: bool,
 }
 
 pub async fn get_cost_daily(
@@ -227,6 +236,7 @@ fn build_daily_series_from_batch(
         currency: batch.currency,
         generated_at: batch.generated_at,
         cached: false,
+        stale: false,
         days: ranges
             .into_iter()
             .map(|range| CostDailyPoint {
@@ -234,6 +244,7 @@ fn build_daily_series_from_batch(
                 cost: range.cost,
                 cost_usd: range.cost_usd,
                 total_tokens: range.tokens.total_tokens,
+                cost_is_lower_bound: range.cost_is_lower_bound,
             })
             .collect(),
     };
@@ -252,6 +263,7 @@ fn get_cached_daily(cache_key: &str) -> Result<Option<CostDailySeries>, String> 
 
     let mut series = cached.series.clone();
     series.cached = true;
+    series.stale = false;
     Ok(Some(series))
 }
 
@@ -273,24 +285,31 @@ fn set_cached_daily(cache_key: String, series: CostDailySeries) -> Result<(), St
 /// paint immediately while the next poll triggers a real parse.
 fn load_daily_snapshot(cache_key: &str) -> Option<CostDailySeries> {
     let (age, mut series): (Duration, CostDailySeries) = disk::read_snapshot(cache_key)?;
-    match disk::classify_snapshot(age, CACHE_TTL, stale_already_served(cache_key)) {
+    let snapshot_use = disk::classify_snapshot(age, CACHE_TTL, stale_already_served(cache_key));
+    match snapshot_use {
         SnapshotUse::Fresh => {}
         SnapshotUse::ServeStaleOnce => mark_stale_served(cache_key),
         SnapshotUse::Ignore => return None,
     }
-    series.cached = true;
+    mark_snapshot_cached(&mut series.cached, &mut series.stale, snapshot_use);
     Some(series)
 }
 
 fn load_overview_snapshot(cache_key: &str) -> Option<CostOverview> {
     let (age, mut overview): (Duration, CostOverview) = disk::read_snapshot(cache_key)?;
-    match disk::classify_snapshot(age, CACHE_TTL, stale_already_served(cache_key)) {
+    let snapshot_use = disk::classify_snapshot(age, CACHE_TTL, stale_already_served(cache_key));
+    match snapshot_use {
         SnapshotUse::Fresh => {}
         SnapshotUse::ServeStaleOnce => mark_stale_served(cache_key),
         SnapshotUse::Ignore => return None,
     }
-    overview.cached = true;
+    mark_snapshot_cached(&mut overview.cached, &mut overview.stale, snapshot_use);
     Some(overview)
+}
+
+fn mark_snapshot_cached(cached: &mut bool, stale: &mut bool, snapshot_use: SnapshotUse) {
+    *cached = true;
+    *stale = matches!(snapshot_use, SnapshotUse::ServeStaleOnce);
 }
 
 fn stale_already_served(cache_key: &str) -> bool {
@@ -453,6 +472,7 @@ fn build_overview_from_batch(
         currency: batch.currency,
         generated_at: batch.generated_at,
         cached: false,
+        stale: false,
         ranges,
     })
 }
@@ -502,6 +522,7 @@ fn get_cached_overview(cache_key: &str) -> Result<Option<CostOverview>, String> 
 
     let mut overview = cached.overview.clone();
     overview.cached = true;
+    overview.stale = false;
     Ok(Some(overview))
 }
 
@@ -520,14 +541,33 @@ fn set_cached_overview(cache_key: String, overview: CostOverview) -> Result<(), 
 
 impl CostRangeSummary {
     fn from_summary(range: &str, label: &str, summary: CostSummary) -> Self {
+        let unpriced_models = summary
+            .models
+            .iter()
+            .filter(|model| {
+                model.tokens.total_tokens > 0
+                    && model.cost.is_none()
+                    && model.estimated_cost.is_none()
+            })
+            .count();
+        let cost_is_lower_bound = summary
+            .api_equivalent_cost_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.cost_is_lower_bound)
+            || unpriced_models > 0;
         Self {
             range: range.to_string(),
             label: label.to_string(),
             since: summary.since.map(|date| date.to_string()),
             until: summary.until.map(|date| date.to_string()),
             currency: summary.currency,
-            cost: summary.cost,
-            cost_usd: summary.cost_usd,
+            cost: summary.cost.or(summary.estimated_cost),
+            cost_usd: summary.cost_usd.or(summary.estimated_cost_usd),
+            estimated_cost: summary.estimated_cost,
+            estimated_cost_usd: summary.estimated_cost_usd,
+            cost_kind: summary.cost_kind,
+            cost_is_lower_bound,
+            unpriced_models,
             tokens: CostTokenBreakdown::from(summary.tokens),
             models: summary
                 .models
@@ -536,6 +576,7 @@ impl CostRangeSummary {
                 .collect(),
             valid_entries: summary.valid_entries,
             skipped_entries: summary.skipped_entries,
+            parse_error_entries: summary.parse_error_entries,
             elapsed_ms: summary.elapsed_ms,
         }
     }
@@ -605,6 +646,145 @@ mod tests {
             parse_error_entries: 0,
             elapsed_ms: 12.0,
         }
+    }
+
+    fn model(
+        name: &str,
+        total_tokens: i64,
+        cost: Option<f64>,
+        estimated_cost: Option<f64>,
+    ) -> ModelCostSummary {
+        ModelCostSummary {
+            model: name.to_string(),
+            cost,
+            cost_usd: cost,
+            estimated_cost,
+            estimated_cost_usd: estimated_cost,
+            cost_kind: "none".to_string(),
+            pricing_source: "unknown".to_string(),
+            tokens: TokenBreakdown {
+                total_tokens,
+                ..TokenBreakdown::default()
+            },
+        }
+    }
+
+    #[test]
+    fn range_copies_coverage_and_marks_lower_bound() {
+        let mut input = summary(UsageRange::Today, 1);
+        input.cost = Some(8.0);
+        input.cost_usd = Some(8.0);
+        input.estimated_cost = Some(10.0);
+        input.estimated_cost_usd = Some(10.0);
+        input.cost_kind = "mixed".to_string();
+        input.parse_error_entries = 2;
+        input.api_equivalent_cost_coverage = Some(ccstats::ApiEquivalentCostCoverage {
+            total_tokens: 100,
+            priced_tokens: 80,
+            percent: 80.0,
+            complete: false,
+            cost_is_lower_bound: true,
+        });
+
+        let range = CostRangeSummary::from_summary("today", "Today", input);
+
+        assert_eq!(range.cost, Some(8.0));
+        assert_eq!(range.estimated_cost, Some(10.0));
+        assert_eq!(range.cost_kind, "mixed");
+        assert_eq!(range.parse_error_entries, 2);
+        assert!(range.cost_is_lower_bound);
+    }
+
+    #[test]
+    fn unpriced_model_count_excludes_estimated_and_zero_usage() {
+        let mut input = summary(UsageRange::Today, 1);
+        input.models = vec![
+            model("zero", 0, None, None),
+            model("estimated", 10, None, Some(1.0)),
+            model("priced", 10, Some(1.0), None),
+            model("unpriced", 10, None, None),
+        ];
+
+        let range = CostRangeSummary::from_summary("today", "Today", input);
+
+        assert_eq!(range.unpriced_models, 1);
+        assert!(range.cost_is_lower_bound);
+    }
+
+    #[test]
+    fn estimated_cost_used_only_when_recorded_missing() {
+        let mut estimated_only = summary(UsageRange::Today, 1);
+        estimated_only.estimated_cost = Some(1.25);
+        estimated_only.estimated_cost_usd = Some(1.25);
+        let estimated_range = CostRangeSummary::from_summary("today", "Today", estimated_only);
+        assert_eq!(estimated_range.cost, Some(1.25));
+        assert_eq!(estimated_range.cost_usd, Some(1.25));
+
+        let mut recorded = summary(UsageRange::Today, 1);
+        recorded.cost = Some(2.5);
+        recorded.cost_usd = Some(2.5);
+        recorded.estimated_cost = Some(9.0);
+        recorded.estimated_cost_usd = Some(9.0);
+        let recorded_range = CostRangeSummary::from_summary("today", "Today", recorded);
+        assert_eq!(recorded_range.cost, Some(2.5));
+        assert_eq!(recorded_range.cost_usd, Some(2.5));
+    }
+
+    #[test]
+    fn daily_point_with_only_unpriced_usage_is_null_not_zero() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 16).expect("fixture date should be valid");
+        let mut input = summary(
+            UsageRange::DateRange {
+                since: Some(date),
+                until: Some(date),
+            },
+            1,
+        );
+        input.tokens.total_tokens = 10;
+        input.models = vec![model("unpriced", 10, None, None)];
+
+        let daily = build_daily_series_from_batch(&[date], batch(vec![input]))
+            .expect("daily response should build");
+
+        assert_eq!(daily.days[0].cost, None);
+        assert_eq!(daily.days[0].cost_usd, None);
+        assert!(daily.days[0].cost_is_lower_bound);
+    }
+
+    #[test]
+    fn daily_point_partially_priced_is_lower_bound() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 16).expect("fixture date should be valid");
+        let mut input = summary(
+            UsageRange::DateRange {
+                since: Some(date),
+                until: Some(date),
+            },
+            1,
+        );
+        input.cost = Some(3.0);
+        input.cost_usd = Some(3.0);
+        input.tokens.total_tokens = 10;
+        input.models = vec![
+            model("priced", 5, Some(3.0), None),
+            model("unpriced", 5, None, None),
+        ];
+
+        let daily = build_daily_series_from_batch(&[date], batch(vec![input]))
+            .expect("daily response should build");
+
+        assert_eq!(daily.days[0].cost, Some(3.0));
+        assert!(daily.days[0].cost_is_lower_bound);
+    }
+
+    #[test]
+    fn stale_snapshot_marked_stale_and_fresh_snapshot_not() {
+        let mut cached = false;
+        let mut stale = false;
+        mark_snapshot_cached(&mut cached, &mut stale, SnapshotUse::ServeStaleOnce);
+        assert_eq!((cached, stale), (true, true));
+
+        mark_snapshot_cached(&mut cached, &mut stale, SnapshotUse::Fresh);
+        assert_eq!((cached, stale), (true, false));
     }
 
     #[test]

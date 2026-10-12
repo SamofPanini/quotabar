@@ -854,6 +854,10 @@
   text-overflow: ellipsis;
 }
 
+.cost-range-value.warning {
+  color: var(--color-warning);
+}
+
 .budget-panel {
   margin-top: 8px;
   padding: 9px 12px;
@@ -920,6 +924,14 @@
   background: color-mix(in srgb, var(--acc) 12%, transparent);
 }
 
+.spark-bar-hit.gap::after {
+  width: 100%;
+  height: 1px;
+  border-radius: 1px;
+  background: var(--sub);
+  content: '';
+}
+
 .spark-bar {
   flex: 1;
   border-radius: 2px;
@@ -971,6 +983,15 @@
   padding: 0 2px;
   color: var(--sub);
   font-size: 10px;
+}
+
+.cost-panel > .cost-footer {
+  flex-wrap: wrap;
+}
+
+.cost-footer-details {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .footer-divider {
