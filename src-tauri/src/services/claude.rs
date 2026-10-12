@@ -587,7 +587,11 @@ async fn request_quota(access_token: &str) -> Result<reqwest::Response, String> 
     log_msg(&request_quota_diagnostic(access_token, count, gap));
 
     let start = Instant::now();
-    let response = shared_http_client()
+    let client = shared_http_client().map_err(|err| {
+        log_msg(&format!("[API] request_quota: network error: {err}"));
+        format!("Network error: {err}")
+    })?;
+    let response = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Accept", "application/json")
         .header("Authorization", format!("Bearer {access_token}"))
@@ -2124,6 +2128,29 @@ mod tests {
             || false,
         ));
         assert_eq!(probes.get(), 0);
+    }
+
+    #[test]
+    fn claude_http_client_unavailable_is_transient_not_auth() {
+        let probes = Cell::new(0);
+        let result = tauri::async_runtime::block_on(fetch_quota_with_signed_out_probe_core(
+            || {
+                Box::pin(std::future::ready(QuotaData::disconnected(
+                    "Network error: shared HTTP client unavailable: injected failure".to_string(),
+                )))
+            },
+            || {
+                probes.set(probes.get() + 1);
+                Box::pin(std::future::ready(ClaudeLoginRefreshResult::SignedOut))
+            },
+            || true,
+        ));
+        assert_eq!(probes.get(), 0);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Network error: shared HTTP client unavailable: injected failure")
+        );
+        assert_eq!(result.stale_reason, None);
     }
 
     #[test]

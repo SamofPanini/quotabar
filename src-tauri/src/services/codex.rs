@@ -411,7 +411,14 @@ async fn fetch_codex_rate_limits_from_auth(
     let account_key = account_id.as_deref().map(|id| profile.cache_key(id));
     let request_sequence = codex_cache::next_request_sequence();
 
-    let client = shared_http_client();
+    let client = match shared_http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            let error = format!("Network error: {error}");
+            log_msg(&format!("[RateLimits] request failed before send: {error}"));
+            return transient_failure_limits(account_key.as_ref(), error);
+        }
+    };
     let mut request = client
         .get("https://chatgpt.com/backend-api/wham/usage")
         .header("Authorization", format!("Bearer {access_token}"))
@@ -566,7 +573,10 @@ async fn fetch_codex_reset_credits_from_auth(
                 .map(ToString::to_string)
         });
 
-    let client = shared_http_client();
+    let client = match shared_http_client() {
+        Ok(client) => client,
+        Err(error) => return CodexResetCredits::disconnected(format!("Network error: {error}")),
+    };
     let mut request = client
         .get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
         .header("Authorization", format!("Bearer {access_token}"))

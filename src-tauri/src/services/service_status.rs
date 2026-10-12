@@ -22,6 +22,13 @@ const OPENAI_SUMMARY_URL: &str = "https://status.openai.com/api/v2/summary.json"
 const OPENAI_PROXY_URL: &str = "https://status.openai.com/proxy/status.openai.com";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOG_SENDER: std::cell::RefCell<Option<std::sync::mpsc::Sender<String>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceLevel {
@@ -785,7 +792,8 @@ async fn fetch_openai() -> ServiceStatus {
 }
 
 async fn fetch_json(url: &str) -> Result<Value, String> {
-    let response = shared_http_client()
+    let client = shared_http_client()?;
+    let response = client
         .get(url)
         .send()
         .await
@@ -804,6 +812,16 @@ async fn fetch_json(url: &str) -> Result<Value, String> {
         append_response_chunk(&mut body, &chunk)?;
     }
     parse_json_body(&body)
+}
+
+fn log_service_status(message: &str) {
+    eprintln!("{message}");
+    #[cfg(test)]
+    TEST_LOG_SENDER.with(|sender| {
+        if let Some(sender) = sender.borrow().as_ref() {
+            let _ = sender.send(message.to_string());
+        }
+    });
 }
 fn append_response_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
     if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
@@ -873,11 +891,21 @@ struct Summary {
 struct Component {
     id: String,
     name: String,
-    #[serde(default = "operational_status")]
+    #[serde(
+        default = "unknown_status",
+        deserialize_with = "deserialize_component_status"
+    )]
     status: String,
 }
-fn operational_status() -> String {
-    "operational".into()
+fn unknown_status() -> String {
+    "unknown".into()
+}
+fn deserialize_component_status<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_str().unwrap_or("unknown").to_string())
 }
 #[derive(Clone, Deserialize)]
 struct RawEvent {
@@ -978,10 +1006,13 @@ fn parse_openai(v2: &Value, proxy: Option<&Value>) -> Result<ServiceStatus, Stri
             )) => {
                 for component in supplemental_components {
                     watched_ids.insert(component.id.clone());
-                    if !components
-                        .iter()
-                        .any(|existing| existing.id == component.id)
+                    if let Some(existing) = components
+                        .iter_mut()
+                        .find(|existing| existing.id == component.id)
                     {
+                        existing.status =
+                            merge_supplemental_status(&existing.status, &component.status);
+                    } else {
                         components.push(component);
                     }
                 }
@@ -1081,9 +1112,10 @@ fn parse_openai_supplement(
             .cloned()
             .unwrap_or_else(|| "Unknown component".into());
         let matching = affected.iter().find(|item| component_matches(item, id));
-        let status = matching
-            .and_then(status_from_value)
-            .unwrap_or("operational");
+        let status = match matching {
+            Some(component) => status_from_value(component).unwrap_or("unknown"),
+            None => "operational",
+        };
         components.push(Component {
             id: id.clone(),
             name,
@@ -1107,9 +1139,9 @@ fn parse_openai_supplement(
     {
         match proxy_event(item, &names) {
             Some(event) => maintenance.push(event),
-            None => {
-                eprintln!("[ServiceStatus] OpenAI supplemental maintenance malformed; skipping")
-            }
+            None => log_service_status(
+                "[ServiceStatus] OpenAI supplemental maintenance malformed; skipping",
+            ),
         }
     }
     Ok((components, incidents, maintenance, core_ids))
@@ -1443,6 +1475,21 @@ fn level_for_status(status: &str) -> ServiceLevel {
         "major_outage" | "full_outage" => ServiceLevel::MajorOutage,
         _ => ServiceLevel::Unknown,
     }
+}
+/// Merge a proxy reading into the v2 status of the same component without ever
+/// lowering a known severity: "not listed as affected" (operational) and an
+/// unparseable reading (unknown) cannot mask a known v2 problem, and between two
+/// known problems the more severe one wins.
+fn merge_supplemental_status(v2: &str, proxy: &str) -> String {
+    let v2_level = level_for_status(v2);
+    let proxy_level = level_for_status(proxy);
+    let keep_v2 = match (&v2_level, &proxy_level) {
+        (ServiceLevel::Operational | ServiceLevel::Unknown, _) => false,
+        (_, ServiceLevel::Operational) => true,
+        (_, ServiceLevel::Unknown) => true,
+        _ => level_rank(&proxy_level) <= level_rank(&v2_level),
+    };
+    if keep_v2 { v2 } else { proxy }.to_string()
 }
 fn level_rank(level: &ServiceLevel) -> u8 {
     match level {
@@ -2969,15 +3016,255 @@ mod tests {
     }
 
     #[test]
-    fn malformed_proxy_maintenance_is_skipped() {
+    fn v2_component_without_status_is_unknown() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        v2["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["name"] == "Codex in ChatGPT Desktop")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        let status = parse_openai(&v2, None).unwrap();
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Codex in ChatGPT Desktop")
+                .unwrap()
+                .status,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn v2_component_with_non_string_status_is_unknown() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        v2["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["name"] == "Codex in ChatGPT Desktop")
+            .unwrap()["status"] = serde_json::json!(3);
+        let status = parse_openai(&v2, None).unwrap();
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Codex in ChatGPT Desktop")
+                .unwrap()
+                .status,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn proxy_unknown_replaces_v2_operational_for_same_component() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-09_operational.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-09_operational.json"
+        ));
+        proxy["summary"]["affected_components"] =
+            serde_json::json!([{ "component_id": "01KMKFAMWKQ81YWSE1Z18R6VHR" }]);
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Codex in ChatGPT Desktop")
+                .unwrap()
+                .status,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn proxy_affected_component_without_status_is_unknown() {
         let v2 = json(include_str!(
             "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
         ));
         let mut proxy = json(include_str!(
             "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
         ));
-        proxy["summary"]["scheduled_maintenances"] = serde_json::json!([{}]);
-        assert!(parse_openai(&v2, Some(&proxy)).is_ok());
+        let id = proxy["summary"]["structure"]["items"][2]["group"]["components"][0]
+            ["component_id"]
+            .clone();
+        proxy["summary"]["affected_components"] = serde_json::json!([{ "component_id": id }]);
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Codex Web")
+                .unwrap()
+                .status,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn supplemental_status_merge_never_lowers_known_severity() {
+        for (v2, proxy, expected) in [
+            ("operational", "operational", "operational"),
+            ("operational", "unknown", "unknown"),
+            (
+                "operational",
+                "degraded_performance",
+                "degraded_performance",
+            ),
+            ("unknown", "partial_outage", "partial_outage"),
+            ("unknown", "operational", "operational"),
+            ("unknown", "unknown", "unknown"),
+            (
+                "degraded_performance",
+                "operational",
+                "degraded_performance",
+            ),
+            ("major_outage", "unknown", "major_outage"),
+            ("major_outage", "degraded_performance", "major_outage"),
+            ("degraded_performance", "major_outage", "major_outage"),
+            ("under_maintenance", "partial_outage", "partial_outage"),
+        ] {
+            assert_eq!(
+                merge_supplemental_status(v2, proxy),
+                expected,
+                "v2={v2} proxy={proxy}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_unknown_does_not_mask_v2_major_outage() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-09_operational.json"
+        ));
+        v2["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["name"] == "Codex in ChatGPT Desktop")
+            .unwrap()["status"] = serde_json::json!("major_outage");
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-09_operational.json"
+        ));
+        proxy["summary"]["affected_components"] =
+            serde_json::json!([{ "component_id": "01KMKFAMWKQ81YWSE1Z18R6VHR" }]);
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Codex in ChatGPT Desktop")
+                .unwrap()
+                .status,
+            "major_outage"
+        );
+    }
+
+    #[test]
+    fn proxy_operational_does_not_mask_v2_degraded_component() {
+        let mut v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-09_operational.json"
+        ));
+        let responses = v2["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["name"] == "Responses")
+            .unwrap();
+        responses["status"] = serde_json::json!("degraded_performance");
+        let proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-09_operational.json"
+        ));
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Responses")
+                .unwrap()
+                .status,
+            "degraded_performance"
+        );
+    }
+
+    #[test]
+    fn proxy_component_not_affected_stays_operational() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-09_operational.json"
+        ));
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        assert_eq!(
+            status
+                .components
+                .iter()
+                .find(|component| component.name == "Codex Web")
+                .unwrap()
+                .status,
+            "operational"
+        );
+    }
+
+    #[test]
+    fn proxy_components_are_ordered_by_id() {
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-09_operational.json"
+        ));
+        proxy["summary"]["structure"]["items"][2]["group"]["components"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        let (components, _, _, _) = parse_openai_supplement(&proxy, &HashMap::new()).unwrap();
+        let ids: Vec<_> = components
+            .iter()
+            .map(|component| component.id.as_str())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    fn malformed_proxy_maintenance_is_logged_and_valid_sibling_kept() {
+        let v2 = json(include_str!(
+            "../../tests/fixtures/service_status/openai_v2_summary_2026-10-11_compliance_monitoring.json"
+        ));
+        let mut proxy = json(include_str!(
+            "../../tests/fixtures/service_status/openai_proxy_2026-10-11_compliance_monitoring.json"
+        ));
+        let id = proxy["summary"]["structure"]["items"][2]["group"]["components"][0]
+            ["component_id"]
+            .clone();
+        proxy["summary"]["scheduled_maintenances"] = serde_json::json!([
+            {},
+            {
+                "id": "valid-maintenance",
+                "name": "Valid maintenance",
+                "status": "in_progress",
+                "affected_components": [{ "component_id": id }]
+            }
+        ]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        TEST_LOG_SENDER.with(|slot| *slot.borrow_mut() = Some(sender));
+        let status = parse_openai(&v2, Some(&proxy)).unwrap();
+        TEST_LOG_SENDER.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(status.maintenances.len(), 1);
+        assert_eq!(status.maintenances[0].id, "valid-maintenance");
+        assert_eq!(
+            receiver.recv().unwrap(),
+            "[ServiceStatus] OpenAI supplemental maintenance malformed; skipping"
+        );
     }
     #[test]
     fn unnamed_codex_group_component_is_core_and_shown_as_unknown() {
