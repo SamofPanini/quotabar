@@ -109,6 +109,12 @@ impl FixedDeadline {
 fn monotonic_now() -> Instant {
     #[cfg(test)]
     {
+        if TEST_CLOCK_FROZEN.load(std::sync::atomic::Ordering::SeqCst) {
+            return *TEST_CLOCK_EPOCH.get_or_init(Instant::now)
+                + Duration::from_millis(
+                    TEST_CLOCK_OFFSET.load(std::sync::atomic::Ordering::SeqCst),
+                );
+        }
         return Instant::now()
             + Duration::from_millis(TEST_CLOCK_OFFSET.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -118,6 +124,10 @@ fn monotonic_now() -> Instant {
 
 #[cfg(test)]
 static TEST_CLOCK_OFFSET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static TEST_CLOCK_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+#[cfg(test)]
+static TEST_CLOCK_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static TEST_CLOCK_ADVANCE_ON_EXACT_WAIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -376,6 +386,8 @@ struct OwnedLaunchSpec {
     #[cfg(test)]
     frame_clock_step: Duration,
     #[cfg(test)]
+    freeze_clock: bool,
+    #[cfg(test)]
     cleanup_faults: CleanupFaultPlan,
     #[cfg(test)]
     audit: std::sync::Arc<TestLaunchAudit>,
@@ -478,6 +490,8 @@ impl OwnedLaunchSpec {
             #[cfg(test)]
             frame_clock_step: Duration::ZERO,
             #[cfg(test)]
+            freeze_clock: false,
+            #[cfg(test)]
             cleanup_faults: CleanupFaultPlan::NONE,
             #[cfg(test)]
             audit: std::sync::Arc::new(TestLaunchAudit::default()),
@@ -514,6 +528,7 @@ impl OwnedLaunchSpec {
             fault,
             exact_wait_clock_advance: None,
             frame_clock_step: Duration::ZERO,
+            freeze_clock: false,
             cleanup_faults: CleanupFaultPlan::NONE,
             audit: std::sync::Arc::new(TestLaunchAudit::default()),
         }
@@ -522,6 +537,11 @@ impl OwnedLaunchSpec {
     fn with_clock(mut self, exact_wait_advance: Option<Duration>, frame_step: Duration) -> Self {
         self.exact_wait_clock_advance = exact_wait_advance;
         self.frame_clock_step = frame_step;
+        self
+    }
+
+    fn with_frozen_clock(mut self) -> Self {
+        self.freeze_clock = true;
         self
     }
 
@@ -2354,6 +2374,7 @@ mod tests {
     ) -> Result<(), TransportError> {
         let exact_wait_advance = spec.exact_wait_clock_advance;
         let frame_step = spec.frame_clock_step;
+        let freeze_clock = spec.freeze_clock;
         let unregistered_cleanup_faults = spec.cleanup_faults;
         let audit = spec.audit.clone();
         TEST_TOP_LEVEL_LAUNCH.with(|slot| *slot.borrow_mut() = Some(spec));
@@ -2382,6 +2403,7 @@ mod tests {
             Ordering::SeqCst,
         );
         TEST_CLOCK_STEP_PER_FRAME.store(frame_step.as_millis() as u64, Ordering::SeqCst);
+        TEST_CLOCK_FROZEN.store(freeze_clock, Ordering::SeqCst);
         TEST_CLOCK_ARMED.store(false, Ordering::SeqCst);
         TEST_UNREGISTERED_CLEANUP_FAULTS.with(|faults| faults.set(unregistered_cleanup_faults));
         let result = run_owned_validation_session(store, pairing, plan, Utc::now());
@@ -2392,6 +2414,7 @@ mod tests {
         TEST_CLOCK_OFFSET.store(0, Ordering::SeqCst);
         TEST_CLOCK_ADVANCE_ON_EXACT_WAIT.store(0, Ordering::SeqCst);
         TEST_CLOCK_STEP_PER_FRAME.store(0, Ordering::SeqCst);
+        TEST_CLOCK_FROZEN.store(false, Ordering::SeqCst);
         TEST_CLOCK_ARMED.store(false, Ordering::SeqCst);
         TEST_UNREGISTERED_CLEANUP_FAULTS.with(|faults| faults.set(CleanupFaultPlan::NONE));
         // The top-level call owns the last parent data/revoke endpoints. This
@@ -2808,83 +2831,118 @@ mod tests {
         }
     }
 
+    fn assert_slow_drip_result(
+        label: &str,
+        advances: [u64; 2],
+        expected: SessionEnd,
+        persists: bool,
+        real_delay: Option<Duration>,
+    ) {
+        let (root, store) = fresh_store(label);
+        let pairing = PairingRegistry::new();
+        let spec = OwnedLaunchSpec::test(
+            OwnedChildMode::AuthenticatedSlowDrip,
+            OwnedLaunchFault::None,
+        )
+        .with_frozen_clock();
+        let audit = spec.audit.clone();
+        let store = std::sync::Arc::new(store);
+        let pairing = std::sync::Arc::new(pairing);
+        let worker_store = store.clone();
+        let worker_pairing = pairing.clone();
+        let worker = std::thread::spawn(move || {
+            run_top_level_owned_session_for_test(
+                &worker_store,
+                &worker_pairing,
+                PlanMetadata::Paid,
+                spec,
+            )
+        });
+        let mut ready = take_test_control_stream(&audit.ready_receiver, label);
+        let mut revoke = take_test_control_stream(&audit.revoke_receiver, label);
+        for (index, advance) in advances.into_iter().enumerate() {
+            let mut marker = [0u8; 1];
+            ready.read_exact(&mut marker).unwrap();
+            assert_eq!(marker, *b"D", "{label} chunk {index}");
+            revoke.write_all(b"G").unwrap();
+            ready.read_exact(&mut marker).unwrap();
+            assert_eq!(marker, *b"W", "{label} chunk {index}");
+            assert!(
+                take_frame_progress(&audit, label) > 0,
+                "{label} chunk {index}"
+            );
+            if let Some(delay) = real_delay {
+                std::thread::sleep(delay);
+            }
+            TEST_CLOCK_OFFSET.fetch_add(advance, Ordering::SeqCst);
+        }
+        let mut marker = [0u8; 1];
+        ready.read_exact(&mut marker).unwrap();
+        assert_eq!(marker, *b"D", "{label} final chunk");
+        revoke.write_all(b"G").unwrap();
+        ready.read_exact(&mut marker).unwrap();
+        assert_eq!(marker, *b"W", "{label} final chunk");
+        let result = worker.join().unwrap();
+        assert_eq!(result, Err(TransportError::Ended(expected)), "{label}");
+        if persists {
+            assert_eq!(take_persisted_event(&audit, label).sequence, 1, "{label}");
+        } else {
+            assert!(audit
+                .persisted_receiver
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_recv()
+                .is_err());
+        }
+        assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
+        assert_eq!(pairing.pending_count_for_test(), 0, "{label}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn slow_drip_near_budget_ignores_real_scheduling_delay() {
+        let _guard = owned_child_test_lock();
+        assert_slow_drip_result(
+            "authenticated-slow-drip-near-budget-delayed",
+            [2_499, 2_500],
+            SessionEnd::CleanEof,
+            true,
+            Some(Duration::from_millis(200)),
+        );
+    }
+
+    #[test]
+    fn slow_drip_over_budget_still_expires_with_real_delay() {
+        let _guard = owned_child_test_lock();
+        assert_slow_drip_result(
+            "authenticated-slow-drip-over-budget-delayed",
+            [2_500, 2_600],
+            SessionEnd::DeadlineExpired,
+            false,
+            Some(Duration::from_millis(200)),
+        );
+    }
+
     #[test]
     fn top_level_slow_drip_silence_burst_and_refill_use_real_child_seam() {
         let _guard = owned_child_test_lock();
-
-        for (label, advances, expected, persists) in [
-            (
-                "authenticated-slow-drip-near-budget",
-                [2_499, 2_500],
-                SessionEnd::CleanEof,
-                true,
-            ),
-            (
-                "authenticated-slow-drip-over-budget",
-                [2_500, 2_600],
-                SessionEnd::DeadlineExpired,
-                false,
-            ),
-        ] {
-            let (root, store) = fresh_store(label);
-            let pairing = PairingRegistry::new();
-            let spec = OwnedLaunchSpec::test(
-                OwnedChildMode::AuthenticatedSlowDrip,
-                OwnedLaunchFault::None,
-            );
-            let audit = spec.audit.clone();
-            let store = std::sync::Arc::new(store);
-            let pairing = std::sync::Arc::new(pairing);
-            let worker_store = store.clone();
-            let worker_pairing = pairing.clone();
-            let worker = std::thread::spawn(move || {
-                run_top_level_owned_session_for_test(
-                    &worker_store,
-                    &worker_pairing,
-                    PlanMetadata::Paid,
-                    spec,
-                )
-            });
-            let mut ready = take_test_control_stream(&audit.ready_receiver, label);
-            let mut revoke = take_test_control_stream(&audit.revoke_receiver, label);
-            for (index, advance) in advances.into_iter().enumerate() {
-                let mut marker = [0u8; 1];
-                ready.read_exact(&mut marker).unwrap();
-                assert_eq!(marker, *b"D", "{label} chunk {index}");
-                revoke.write_all(b"G").unwrap();
-                ready.read_exact(&mut marker).unwrap();
-                assert_eq!(marker, *b"W", "{label} chunk {index}");
-                assert!(
-                    take_frame_progress(&audit, label) > 0,
-                    "{label} chunk {index}"
-                );
-                TEST_CLOCK_OFFSET.fetch_add(advance, Ordering::SeqCst);
-            }
-            let mut marker = [0u8; 1];
-            ready.read_exact(&mut marker).unwrap();
-            assert_eq!(marker, *b"D", "{label} final chunk");
-            revoke.write_all(b"G").unwrap();
-            ready.read_exact(&mut marker).unwrap();
-            assert_eq!(marker, *b"W", "{label} final chunk");
-            let result = worker.join().unwrap();
-            assert_eq!(result, Err(TransportError::Ended(expected)), "{label}");
-            if persists {
-                assert_eq!(take_persisted_event(&audit, label).sequence, 1, "{label}");
-            } else {
-                assert!(audit
-                    .persisted_receiver
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .try_recv()
-                    .is_err());
-            }
-            assert!(audit.child_reaped.load(Ordering::SeqCst), "{label}");
-            assert_eq!(pairing.pending_count_for_test(), 0, "{label}");
-            drop(store);
-            let _ = std::fs::remove_dir_all(root);
-        }
+        assert_slow_drip_result(
+            "authenticated-slow-drip-near-budget",
+            [2_499, 2_500],
+            SessionEnd::CleanEof,
+            true,
+            None,
+        );
+        assert_slow_drip_result(
+            "authenticated-slow-drip-over-budget",
+            [2_500, 2_600],
+            SessionEnd::DeadlineExpired,
+            false,
+            None,
+        );
 
         let (root, store) = fresh_store("first-byte-silence");
         let store = std::sync::Arc::new(store);

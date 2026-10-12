@@ -465,7 +465,11 @@ pub async fn fetch_grok_info() -> GrokData {
         Err(error) => return fallback_or_disconnected(error),
     };
 
-    let mut request = shared_http_client()
+    let client = match shared_http_client() {
+        Ok(client) => client,
+        Err(error) => return fallback_or_disconnected(format!("Network error: {error}")),
+    };
+    let mut request = client
         .get(BILLING_URL)
         .header("Authorization", format!("Bearer {}", credential.key))
         .header("x-xai-token-auth", TOKEN_AUTH_HEADER)

@@ -275,7 +275,11 @@ pub async fn fetch_cursor_info() -> CursorData {
         Err(error) => return CursorData::disconnected(error),
     };
 
-    let response = shared_http_client()
+    let client = match shared_http_client() {
+        Ok(client) => client,
+        Err(error) => return fallback_or_disconnected(format!("Network error: {error}")),
+    };
+    let response = client
         .get(CURSOR_USAGE_SUMMARY_URL)
         .header("Cookie", format!("WorkosCursorSessionToken={cookie}"))
         .header("Accept", "application/json")

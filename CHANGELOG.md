@@ -4,6 +4,9 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- If QuotaBar cannot create its network client with time limits, it now reports a network error and tries again later instead of using a client without time limits.
+- A service status component that arrives without a status is now shown as unknown instead of operational.
+
 - When the Claude login expires while your 5-hour window is open, QuotaBar now renews it automatically with one short Haiku message. It never starts a new window. Turn this off under Settings.
 - While the Claude login is expired or signed out, the last readings stay visible in gray with the time they were taken.
 
