@@ -264,10 +264,16 @@ export interface CostRangeSummary {
   currency: string;
   cost?: number | null;
   costUsd?: number | null;
+  estimatedCost: number | null;
+  estimatedCostUsd: number | null;
+  costKind: string;
+  costIsLowerBound: boolean;
+  unpricedModels: number;
   tokens: CostTokenBreakdown;
   models: CostModelSummary[];
   validEntries: number;
   skippedEntries: number;
+  parseErrorEntries: number;
   elapsedMs: number;
 }
 
@@ -277,6 +283,7 @@ export interface CostOverview {
   currency: string;
   generatedAt: string;
   cached: boolean;
+  stale: boolean;
   ranges: CostRangeSummary[];
 }
 
@@ -285,6 +292,7 @@ export interface CostDailyPoint {
   cost?: number | null;
   costUsd?: number | null;
   totalTokens: number;
+  costIsLowerBound: boolean;
 }
 
 export interface CostDailySeries {
@@ -292,5 +300,6 @@ export interface CostDailySeries {
   currency: string;
   generatedAt: string;
   cached: boolean;
+  stale: boolean;
   days: CostDailyPoint[];
 }

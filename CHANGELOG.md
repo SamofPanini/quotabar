@@ -4,6 +4,9 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Cost totals no longer count unpriced usage as $0. When some usage has no price, the total is shown as a lower bound (for example `≥ $86.20`, in yellow); a day with no priced usage at all is a gap in the trend and reads n/a.
+- The cost footer now names unpriced models, parse errors, estimated pricing, and whether the numbers are cached or stale. The combined card on the All page is now labeled Claude, Codex, Cursor.
+
 - If QuotaBar cannot create its network client with time limits, it now reports a network error and tries again later instead of using a client without time limits.
 - A service status component that arrives without a status is now shown as unknown instead of operational.
 
