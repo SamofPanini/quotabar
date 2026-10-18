@@ -4,6 +4,9 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- When QuotaBar cannot read the local session files for a source, its cost now reads n/a with the footer note "usage files unreadable" instead of $0. On the combined card, the other sources' known amount is kept and shown as a lower bound (`≥`).
+- Updated the bundled usage parser (ccstats) to 0.11.0.
+
 - Cost totals no longer count unpriced usage as $0. When some usage has no price, the total is shown as a lower bound (for example `≥ $86.20`, in yellow); a day with no priced usage at all is a gap in the trend and reads n/a.
 - The cost footer now names unpriced models, parse errors, estimated pricing, and whether the numbers are cached or stale. The combined card on the All page is now labeled Claude, Codex, Cursor.
 
