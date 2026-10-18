@@ -268,6 +268,7 @@ export interface CostRangeSummary {
   estimatedCostUsd: number | null;
   costKind: string;
   costIsLowerBound: boolean;
+  sourceReadFailed?: boolean;
   unpricedModels: number;
   tokens: CostTokenBreakdown;
   models: CostModelSummary[];
@@ -293,6 +294,7 @@ export interface CostDailyPoint {
   costUsd?: number | null;
   totalTokens: number;
   costIsLowerBound: boolean;
+  sourceReadFailed?: boolean;
 }
 
 export interface CostDailySeries {

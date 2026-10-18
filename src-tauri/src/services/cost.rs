@@ -69,6 +69,8 @@ pub struct CostRangeSummary {
     pub estimated_cost_usd: Option<f64>,
     pub cost_kind: String,
     pub cost_is_lower_bound: bool,
+    #[serde(default)]
+    pub source_read_failed: bool,
     pub unpriced_models: usize,
     pub tokens: CostTokenBreakdown,
     pub models: Vec<CostModelSummary>,
@@ -117,6 +119,8 @@ pub struct CostDailyPoint {
     pub cost_usd: Option<f64>,
     pub total_tokens: i64,
     pub cost_is_lower_bound: bool,
+    #[serde(default)]
+    pub source_read_failed: bool,
 }
 
 pub async fn get_cost_daily(
@@ -245,6 +249,7 @@ fn build_daily_series_from_batch(
                 cost_usd: range.cost_usd,
                 total_tokens: range.tokens.total_tokens,
                 cost_is_lower_bound: range.cost_is_lower_bound,
+                source_read_failed: range.source_read_failed,
             })
             .collect(),
     };
@@ -541,6 +546,10 @@ fn set_cached_overview(cache_key: String, overview: CostOverview) -> Result<(), 
 
 impl CostRangeSummary {
     fn from_summary(range: &str, label: &str, summary: CostSummary) -> Self {
+        // ccstats 0.11 reports session-file discovery failures as parse errors
+        // for every requested range. With no valid entries, its zero cost is
+        // unknown rather than a real zero-usage result.
+        let source_read_failed = summary.valid_entries == 0 && summary.parse_error_entries > 0;
         let unpriced_models = summary
             .models
             .iter()
@@ -550,23 +559,33 @@ impl CostRangeSummary {
                     && model.estimated_cost.is_none()
             })
             .count();
-        let cost_is_lower_bound = summary
-            .api_equivalent_cost_coverage
-            .as_ref()
-            .is_some_and(|coverage| coverage.cost_is_lower_bound)
-            || unpriced_models > 0;
+        let cost_is_lower_bound = !source_read_failed
+            && (summary
+                .api_equivalent_cost_coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.cost_is_lower_bound)
+                || unpriced_models > 0);
         Self {
             range: range.to_string(),
             label: label.to_string(),
             since: summary.since.map(|date| date.to_string()),
             until: summary.until.map(|date| date.to_string()),
             currency: summary.currency,
-            cost: summary.cost.or(summary.estimated_cost),
-            cost_usd: summary.cost_usd.or(summary.estimated_cost_usd),
-            estimated_cost: summary.estimated_cost,
-            estimated_cost_usd: summary.estimated_cost_usd,
+            cost: (!source_read_failed)
+                .then(|| summary.cost.or(summary.estimated_cost))
+                .flatten(),
+            cost_usd: (!source_read_failed)
+                .then(|| summary.cost_usd.or(summary.estimated_cost_usd))
+                .flatten(),
+            estimated_cost: (!source_read_failed)
+                .then_some(summary.estimated_cost)
+                .flatten(),
+            estimated_cost_usd: (!source_read_failed)
+                .then_some(summary.estimated_cost_usd)
+                .flatten(),
             cost_kind: summary.cost_kind,
             cost_is_lower_bound,
+            source_read_failed,
             unpriced_models,
             tokens: CostTokenBreakdown::from(summary.tokens),
             models: summary
@@ -728,6 +747,141 @@ mod tests {
         let recorded_range = CostRangeSummary::from_summary("today", "Today", recorded);
         assert_eq!(recorded_range.cost, Some(2.5));
         assert_eq!(recorded_range.cost_usd, Some(2.5));
+    }
+
+    #[test]
+    fn discovery_failure_without_entries_is_unknown_not_zero() {
+        let mut input = summary(UsageRange::Today, 0);
+        input.parse_error_entries = 2;
+        input.cost = Some(0.0);
+        input.cost_usd = Some(0.0);
+        input.estimated_cost = Some(1.0);
+        input.estimated_cost_usd = Some(1.0);
+
+        let range = CostRangeSummary::from_summary("today", "Today", input);
+
+        assert_eq!(range.cost, None);
+        assert_eq!(range.cost_usd, None);
+        assert_eq!(range.estimated_cost, None);
+        assert_eq!(range.estimated_cost_usd, None);
+        assert!(range.source_read_failed);
+        assert!(!range.cost_is_lower_bound);
+    }
+
+    #[test]
+    fn discovery_failure_is_never_a_lower_bound() {
+        let mut input = summary(UsageRange::Today, 0);
+        input.parse_error_entries = 1;
+        input.models = vec![model("unpriced", 10, None, None)];
+        input.api_equivalent_cost_coverage = Some(ccstats::ApiEquivalentCostCoverage {
+            total_tokens: 10,
+            priced_tokens: 0,
+            percent: 0.0,
+            complete: false,
+            cost_is_lower_bound: true,
+        });
+
+        let range = CostRangeSummary::from_summary("today", "Today", input);
+
+        assert!(range.source_read_failed);
+        assert!(!range.cost_is_lower_bound);
+    }
+
+    #[test]
+    fn true_zero_usage_stays_zero() {
+        let mut input = summary(UsageRange::Today, 0);
+        input.cost = Some(0.0);
+        input.cost_usd = Some(0.0);
+
+        let range = CostRangeSummary::from_summary("today", "Today", input);
+
+        assert_eq!(range.cost, Some(0.0));
+        assert_eq!(range.cost_usd, Some(0.0));
+        assert!(!range.source_read_failed);
+    }
+
+    #[test]
+    fn partial_read_errors_keep_amount_without_lower_bound() {
+        let mut input = summary(UsageRange::Today, 5);
+        input.parse_error_entries = 3;
+        input.cost = Some(4.5);
+        input.cost_usd = Some(4.5);
+
+        let range = CostRangeSummary::from_summary("today", "Today", input);
+
+        assert_eq!(range.cost, Some(4.5));
+        assert_eq!(range.cost_usd, Some(4.5));
+        assert!(!range.cost_is_lower_bound);
+        assert!(!range.source_read_failed);
+    }
+
+    #[test]
+    fn daily_series_marks_unreadable_days() {
+        let dates = [
+            NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture date should be valid"),
+            NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixture date should be valid"),
+            NaiveDate::from_ymd_opt(2026, 7, 16).expect("fixture date should be valid"),
+        ];
+        let mut unreadable = summary(
+            UsageRange::DateRange {
+                since: Some(dates[0]),
+                until: Some(dates[0]),
+            },
+            0,
+        );
+        unreadable.parse_error_entries = 1;
+        unreadable.cost = Some(0.0);
+        unreadable.cost_usd = Some(0.0);
+        let mut zero = summary(
+            UsageRange::DateRange {
+                since: Some(dates[1]),
+                until: Some(dates[1]),
+            },
+            0,
+        );
+        zero.cost = Some(0.0);
+        zero.cost_usd = Some(0.0);
+        let mut priced = summary(
+            UsageRange::DateRange {
+                since: Some(dates[2]),
+                until: Some(dates[2]),
+            },
+            1,
+        );
+        priced.cost = Some(2.5);
+        priced.cost_usd = Some(2.5);
+
+        let daily = build_daily_series_from_batch(&dates, batch(vec![unreadable, zero, priced]))
+            .expect("daily response should build");
+
+        assert_eq!(daily.days[0].cost, None);
+        assert!(daily.days[0].source_read_failed);
+        assert_eq!(daily.days[1].cost, Some(0.0));
+        assert!(!daily.days[1].source_read_failed);
+        assert_eq!(daily.days[2].cost, Some(2.5));
+        assert!(!daily.days[2].source_read_failed);
+    }
+
+    #[test]
+    fn overview_ranges_mark_unreadable_ranges() {
+        let mut unreadable = summary(UsageRange::Today, 0);
+        unreadable.parse_error_entries = 1;
+        unreadable.cost = Some(0.0);
+        unreadable.cost_usd = Some(0.0);
+        let mut zero = summary(UsageRange::ThisWeek, 0);
+        zero.cost = Some(0.0);
+        zero.cost_usd = Some(0.0);
+        let mut priced = summary(UsageRange::ThisMonth, 1);
+        priced.cost = Some(2.5);
+        priced.cost_usd = Some(2.5);
+
+        let ranges = map_batch_ranges(&cost_range_specs(), vec![unreadable, zero, priced])
+            .expect("overview response should build");
+
+        assert!(ranges[0].source_read_failed);
+        assert_eq!(ranges[0].cost, None);
+        assert_eq!(ranges[1].cost, Some(0.0));
+        assert_eq!(ranges[2].cost, Some(2.5));
     }
 
     #[test]

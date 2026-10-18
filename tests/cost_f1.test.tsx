@@ -4,6 +4,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import CostSummarySection, {
   ALL_COST_DISPLAY_NAME,
   costFooterLabels,
+  formatRangeMoney,
   mergeCostKinds,
   mergeDailySeries,
   mergeCostOverviews,
@@ -185,6 +186,161 @@ describe('COST-F1 cost presentation', () => {
     expect(snapshot).not.toContain('500');
   });
 
+  it('renders an unreadable range as n/a without lower-bound warning and labels it', async () => {
+    vi.mocked(backend.getCostOverview).mockResolvedValue(overview({
+      ranges: [range({ cost: null, costUsd: null, costIsLowerBound: false, sourceReadFailed: true })],
+    }));
+    renderer = await renderCost();
+    const value = renderer.root.findByProps({ className: 'cost-range-value' });
+    expect(value.children).toEqual(['n/a']);
+    expect(JSON.stringify(renderer.toJSON())).toContain('usage files unreadable');
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('≥');
+  });
+
+  it('does not show the unreadable footer label for normal ranges', () => {
+    expect(costFooterLabels(range(), overview())).not.toContain('usage files unreadable');
+  });
+
+  it('renders unreadable daily points as gaps and counts them as n/a', async () => {
+    vi.mocked(backend.getCostDaily).mockResolvedValue(daily([
+      point({ cost: null, costUsd: null, sourceReadFailed: true }),
+    ]));
+    renderer = await renderCost();
+    const gap = renderer.root.findByProps({ className: 'spark-bar-hit gap' });
+    expect(JSON.stringify(renderer.toJSON())).toContain('1 day n/a');
+    await act(async () => gap.props.onMouseEnter());
+    const snapshot = JSON.stringify(renderer.toJSON());
+    expect(snapshot).toContain('2026-10-12 · n/a');
+  });
+
+  it('treats an unreadable day as a gap even if a zero amount and no tokens arrive', async () => {
+    vi.mocked(backend.getCostDaily).mockResolvedValue(daily([
+      point({ cost: 0, costUsd: 0, totalTokens: 0, sourceReadFailed: true }),
+    ]));
+    renderer = await renderCost();
+    const gap = renderer.root.findByProps({ className: 'spark-bar-hit gap' });
+    expect(JSON.stringify(renderer.toJSON())).toContain('1 day n/a');
+    await act(async () => gap.props.onMouseEnter());
+    expect(JSON.stringify(renderer.toJSON())).toContain('2026-10-12 · n/a');
+  });
+
+  it('renders a combined known cost as a warning and retains its monthly budget when another source is unreadable', async () => {
+    localStorage.setItem('claude-quota-monthly-budgets', JSON.stringify({ claude: 10, codex: 10 }));
+    const pricedRanges = [
+      range({ range: 'today', cost: 5, costUsd: 5 }),
+      range({ range: 'month', label: 'This Month', cost: 5, costUsd: 5 }),
+    ];
+    const unreadableRanges = pricedRanges.map((item) => ({
+      ...item,
+      cost: null,
+      costUsd: null,
+      costIsLowerBound: false,
+      sourceReadFailed: true,
+    }));
+    vi.mocked(backend.getCostOverview).mockImplementation(async (source) => (
+      source === 'codex'
+        ? overview({ source: 'codex', displayName: 'Codex', ranges: unreadableRanges })
+        : overview({ ranges: pricedRanges })
+    ));
+    await act(async () => {
+      renderer = create(createElement(CostSummarySection, {
+        source: ['claude', 'codex'] as const,
+        autoRefreshIntervalMs: 0,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const snapshot = JSON.stringify(renderer.toJSON());
+    expect(snapshot).toContain('≥ $5.00');
+    expect(snapshot).toContain('usage files unreadable');
+    expect(renderer.root.findAllByProps({ className: 'cost-range-value warning' })).toHaveLength(2);
+    expect(renderer.root.findAllByProps({ className: 'budget-panel' })).toHaveLength(1);
+  });
+
+  it('renders a combined all-unreadable cost as n/a without a monthly budget', async () => {
+    localStorage.setItem('claude-quota-monthly-budgets', JSON.stringify({ claude: 10, codex: 10 }));
+    const unreadableRanges = [
+      range({ range: 'today', cost: null, costUsd: null, sourceReadFailed: true }),
+      range({ range: 'month', label: 'This Month', cost: null, costUsd: null, sourceReadFailed: true }),
+    ];
+    vi.mocked(backend.getCostOverview).mockImplementation(async (source) => overview({
+      source,
+      displayName: source === 'codex' ? 'Codex' : 'Claude',
+      ranges: unreadableRanges,
+    }));
+    await act(async () => {
+      renderer = create(createElement(CostSummarySection, {
+        source: ['claude', 'codex'] as const,
+        autoRefreshIntervalMs: 0,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain('n/a');
+    expect(renderer.root.findAllByProps({ className: 'budget-panel' })).toHaveLength(0);
+  });
+
+  it('renders combined daily partial reads as a lower-bound bar and all failures as a gap', async () => {
+    vi.mocked(backend.getCostDaily).mockImplementation(async (source) => (
+      source === 'codex'
+        ? { ...daily([point({ cost: null, costUsd: null, sourceReadFailed: true })]), source: 'codex' }
+        : daily([point({ cost: 2, costUsd: 2 })])
+    ));
+    await act(async () => {
+      renderer = create(createElement(CostSummarySection, {
+        source: ['claude', 'codex'] as const,
+        autoRefreshIntervalMs: 0,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const knownBar = renderer.root.findByProps({ className: 'spark-bar-hit' });
+    await act(async () => knownBar.props.onMouseEnter());
+    expect(JSON.stringify(renderer.toJSON())).toContain('2026-10-12 · ≥ $2.00');
+    await act(async () => renderer?.unmount());
+    renderer = undefined;
+
+    vi.mocked(backend.getCostDaily).mockImplementation(async (source) => ({
+      ...daily([point({ cost: null, costUsd: null, sourceReadFailed: true })]),
+      source,
+    }));
+    await act(async () => {
+      renderer = create(createElement(CostSummarySection, {
+        source: ['claude', 'codex'] as const,
+        autoRefreshIntervalMs: 0,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const gap = renderer.root.findByProps({ className: 'spark-bar-hit gap' });
+    await act(async () => gap.props.onMouseEnter());
+    expect(JSON.stringify(renderer.toJSON())).toContain('2026-10-12 · n/a');
+  });
+
+  it('shows n/a for seven unreadable days and a lower-bound partial total', async () => {
+    const unreadableDays = Array.from({ length: 7 }, (_, index) => point({
+      date: `2026-10-${String(index + 1).padStart(2, '0')}`,
+      cost: null,
+      costUsd: null,
+      sourceReadFailed: true,
+    }));
+    vi.mocked(backend.getCostDaily).mockResolvedValue(daily(unreadableDays));
+    renderer = await renderCost();
+    let snapshot = JSON.stringify(renderer.toJSON());
+    expect(snapshot).toContain('Past 7 days · n/a · 7 days n/a');
+    expect(snapshot).not.toContain('Past 7 days · $0.00');
+    await act(async () => renderer?.unmount());
+    renderer = undefined;
+
+    vi.mocked(backend.getCostDaily).mockResolvedValue(daily([
+      point({ date: '2026-10-10', cost: 2, costUsd: 2 }),
+      point({ date: '2026-10-11', cost: null, costUsd: null, sourceReadFailed: true }),
+    ]));
+    renderer = await renderCost();
+    snapshot = JSON.stringify(renderer.toJSON());
+    expect(snapshot).toContain('Past 7 days · ≥ $2.00 · 1 day n/a');
+  });
+
   it('shows Stale instead of Cached when a snapshot is stale', async () => {
     vi.mocked(backend.getCostOverview).mockResolvedValue(overview({ stale: true, cached: true }));
     renderer = await renderCost();
@@ -250,6 +406,31 @@ describe('COST-F1 cost presentation', () => {
     expect(complete.ranges[0].costIsLowerBound).toBe(false);
   });
 
+  it('marks a combined range with one unreadable source as a lower bound and all failures as n/a', () => {
+    const partial = mergeCostOverviews([
+      overview({ ranges: [range({ cost: 5, costUsd: 5 })] }),
+      overview({ source: 'codex', ranges: [range({ cost: null, costUsd: null, sourceReadFailed: true })] }),
+    ]);
+    expect(partial.ranges[0]).toMatchObject({ cost: 5, sourceReadFailed: true, costIsLowerBound: true });
+    expect(formatRangeMoney(partial.ranges[0].cost, partial.ranges[0].currency, partial.ranges[0].costIsLowerBound)).toBe('≥ $5.00');
+    expect(costFooterLabels(partial.ranges[0], partial)).toContain('usage files unreadable');
+
+    const allUnreadable = mergeCostOverviews([
+      overview({ ranges: [range({ cost: null, costUsd: null, sourceReadFailed: true })] }),
+      overview({ source: 'codex', ranges: [range({ cost: null, costUsd: null, sourceReadFailed: true })] }),
+    ]);
+    expect(allUnreadable.ranges[0]).toMatchObject({ cost: null, sourceReadFailed: true, costIsLowerBound: false });
+    expect(formatRangeMoney(allUnreadable.ranges[0].cost, allUnreadable.ranges[0].currency)).toBe('n/a');
+  });
+
+  it('uses only the current overview range parse-error count when merging', () => {
+    const merged = mergeCostOverviews([
+      overview({ ranges: [range({ parseErrorEntries: 2 })] }),
+      overview({ source: 'codex', ranges: [range({ parseErrorEntries: 0 })] }),
+    ]);
+    expect(merged.ranges[0].parseErrorEntries).toBe(2);
+  });
+
   it('labels estimated-only pricing as Estimated', () => {
     expect(costFooterLabels(range({ costKind: 'estimated_proxy' }), overview())).toContain('Estimated');
     expect(costFooterLabels(range({ costKind: 'real' }), overview())).not.toContain('Estimated');
@@ -261,6 +442,40 @@ describe('COST-F1 cost presentation', () => {
       daily([point({ cost: null, costUsd: null, totalTokens: 5 })]),
     ]);
     expect(merged[0]).toMatchObject({ cost: 2, costIsLowerBound: true });
+  });
+
+  it('keeps a lower bound when the unreadable source has no tokens, in either merge order', async () => {
+    const failed = point({ cost: null, costUsd: null, totalTokens: 0, sourceReadFailed: true });
+    const known = point({ cost: 2, costUsd: 2, totalTokens: 10 });
+    for (const order of [[known, failed], [failed, known]]) {
+      const merged = mergeDailySeries(order.map((day) => daily([day])));
+      expect(merged[0]).toMatchObject({ cost: 2, costIsLowerBound: true, sourceReadFailed: true });
+    }
+    vi.mocked(backend.getCostDaily).mockImplementation(async (source) => (
+      source === 'codex' ? { ...daily([failed]), source: 'codex' } : daily([known])
+    ));
+    await act(async () => {
+      renderer = create(createElement(CostSummarySection, { source: ['claude', 'codex'] as const, autoRefreshIntervalMs: 0 }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const bar = renderer.root.findByProps({ className: 'spark-bar-hit' });
+    await act(async () => bar.props.onMouseEnter());
+    expect(JSON.stringify(renderer.toJSON())).toContain('2026-10-12 · ≥ $2.00');
+  });
+
+  it('ignores a zero amount carried by an unreadable source when merging days', () => {
+    const merged = mergeDailySeries([
+      daily([point({ cost: 2, costUsd: 2, totalTokens: 10 })]),
+      daily([point({ cost: 0, costUsd: 0, totalTokens: 0, sourceReadFailed: true })]),
+      daily([point({ cost: 3, costUsd: 3, totalTokens: 10 })]),
+    ]);
+    expect(merged[0]).toMatchObject({ cost: 5, costIsLowerBound: true });
+    const failedOnly = mergeDailySeries([
+      daily([point({ cost: 1, costUsd: 1, totalTokens: 10 })]),
+      daily([point({ cost: 7, costUsd: 7, totalTokens: 0, sourceReadFailed: true })]),
+    ]);
+    expect(failedOnly[0]).toMatchObject({ cost: 1, costIsLowerBound: true });
   });
 
   it('merges stale state for daily series', () => {

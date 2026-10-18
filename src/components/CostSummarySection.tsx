@@ -26,20 +26,30 @@ export function mergeDailySeries(seriesList: CostDailySeries[]): MergedDailyPoin
     for (const day of series.days) {
       const existing = byDate.get(day.date);
       if (!existing) {
-        byDate.set(day.date, { ...day });
+        // A source-read failure represents unknown cost even if a stale or
+        // malformed payload carries a zero amount. Once ranges are merged,
+        // known amounts from other sources remain available below.
+        byDate.set(day.date, day.sourceReadFailed
+          ? { ...day, cost: null, costUsd: null, costIsLowerBound: false }
+          : { ...day });
         continue;
       }
       const existingHasUnpricedUsage = hasUnpricedUsage(existing);
       const dayHasUnpricedUsage = hasUnpricedUsage(day);
-      existing.cost = sumNullable([existing.cost, day.cost]);
-      existing.costUsd = sumNullable([existing.costUsd, day.costUsd]);
+      existing.cost = sumNullable([existing.cost, day.sourceReadFailed ? null : day.cost]);
+      existing.costUsd = sumNullable([existing.costUsd, day.sourceReadFailed ? null : day.costUsd]);
       existing.totalTokens += day.totalTokens;
-      existing.costIsLowerBound = Boolean(
+      const sourceReadFailed = Boolean(existing.sourceReadFailed || day.sourceReadFailed);
+      // A partial total is a lower bound; an entirely unreadable date has no
+      // displayable amount and therefore must not carry a lower-bound marker.
+      existing.costIsLowerBound = dailyValue(existing) != null && Boolean(
         existing.costIsLowerBound
         || day.costIsLowerBound
+        || sourceReadFailed
         || existingHasUnpricedUsage
         || dayHasUnpricedUsage,
       );
+      existing.sourceReadFailed = sourceReadFailed;
     }
   }
   const days = Array.from(byDate.values()).sort((left, right) => left.date.localeCompare(right.date));
@@ -50,8 +60,8 @@ export function sliceSparkDays(days: CostDailyPoint[], range: SparkRange): CostD
   return range === '7d' ? days.slice(-7) : days.slice(-30);
 }
 
-export function sumDailyCost(days: CostDailyPoint[]): number {
-  return days.reduce((total, day) => total + (dailyValue(day) ?? 0), 0);
+export function sumDailyCost(days: CostDailyPoint[]): number | null {
+  return sumNullable(days.map(dailyValue));
 }
 
 function dailyValue(day: CostDailyPoint): number | null {
@@ -62,11 +72,19 @@ function hasUnpricedUsage(day: CostDailyPoint): boolean {
   return day.totalTokens > 0 && dailyValue(day) == null;
 }
 
+function isUnavailableDay(day: CostDailyPoint): boolean {
+  return dailyValue(day) == null && (Boolean(day.sourceReadFailed) || hasUnpricedUsage(day));
+}
+
 export function summarizeDailyCost(days: CostDailyPoint[]) {
+  const cost = sumDailyCost(days);
+  const unavailableDays = days.filter(isUnavailableDay);
   return {
-    cost: sumDailyCost(days),
-    costIsLowerBound: days.some((day) => Boolean(day.costIsLowerBound) || hasUnpricedUsage(day)),
-    unpricedDays: days.filter(hasUnpricedUsage).length,
+    cost,
+    costIsLowerBound: cost != null && (
+      days.some((day) => Boolean(day.costIsLowerBound)) || unavailableDays.length > 0
+    ),
+    unpricedDays: unavailableDays.length,
   };
 }
 
@@ -224,17 +242,22 @@ export function mergeCostOverviews(overviews: CostOverview[]): CostOverview {
       }
     }
 
+    const sourceReadFailed = matching.some((range) => Boolean(range.sourceReadFailed));
+    const cost = sumNullable(matching.map((range) => range.costUsd ?? range.cost));
+    const costIsLowerBound = matching.some((range) => Boolean(range.costIsLowerBound) || (
+      range.tokens.totalTokens > 0 && range.cost == null && range.costUsd == null
+    )) || (sourceReadFailed && cost != null);
+
     return {
       ...first,
       currency: 'USD',
-      cost: sumNullable(matching.map((range) => range.costUsd ?? range.cost)),
-      costUsd: sumNullable(matching.map((range) => range.costUsd ?? range.cost)),
+      cost,
+      costUsd: cost,
       estimatedCost: sumNullable(matching.map((range) => range.estimatedCost)),
       estimatedCostUsd: sumNullable(matching.map((range) => range.estimatedCostUsd)),
       costKind: mergeCostKinds(matching.map((range) => range.costKind)),
-      costIsLowerBound: matching.some((range) => Boolean(range.costIsLowerBound) || (
-        range.tokens.totalTokens > 0 && range.cost == null && range.costUsd == null
-      )),
+      costIsLowerBound,
+      sourceReadFailed,
       unpricedModels: matching.reduce((total, range) => total + (range.unpricedModels ?? 0), 0),
       tokens,
       models: Array.from(modelMap.values()).sort((left, right) => (right.costUsd ?? right.cost ?? 0) - (left.costUsd ?? left.cost ?? 0)),
@@ -266,6 +289,7 @@ export function costFooterLabels(
   const parseErrorEntries = range?.parseErrorEntries ?? 0;
   if (unpricedModels > 0) labels.push(`${unpricedModels} model${unpricedModels === 1 ? '' : 's'} unpriced`);
   if (parseErrorEntries > 0) labels.push(`${parseErrorEntries} parse error${parseErrorEntries === 1 ? '' : 's'}`);
+  if (range?.sourceReadFailed) labels.push('usage files unreadable');
   if (range?.costKind === 'estimated_proxy' || range?.costKind === 'mixed') labels.push('Estimated');
   // The trend may come from a stale daily snapshot even when the overview is fresh.
   if (overview.stale || dailyStale) labels.push('Stale');
@@ -403,7 +427,8 @@ export default function CostSummarySection({
         <div className="cost-panel">
           <div className="cost-range-grid">
             {overview.ranges.map((range) => {
-              const showsLowerBound = range.costIsLowerBound && formatMoney(range.cost, range.currency) !== 'n/a';
+              const displayedCost = range.cost;
+              const showsLowerBound = range.costIsLowerBound && formatMoney(displayedCost, range.currency) !== 'n/a';
               return (
                 <div
                   className={`cost-range ${range.range === primaryRange?.range ? 'active' : ''}`}
@@ -413,9 +438,9 @@ export default function CostSummarySection({
                   <strong
                     className={showsLowerBound ? 'cost-range-value warning' : 'cost-range-value'}
                     title={showsLowerBound ? 'Cost is at least the displayed amount' : undefined}
-                    aria-label={showsLowerBound ? `Cost is at least ${formatMoney(range.cost, range.currency)}` : undefined}
+                    aria-label={showsLowerBound ? `Cost is at least ${formatMoney(displayedCost, range.currency)}` : undefined}
                   >
-                    {formatRangeMoney(range.cost, range.currency, showsLowerBound)}
+                    {formatRangeMoney(displayedCost, range.currency, showsLowerBound)}
                   </strong>
                 </div>
               );
@@ -499,7 +524,7 @@ export default function CostSummarySection({
                       >
                         {sparkDays.map((day, index) => {
                           const value = dailyValue(day);
-                          const gap = hasUnpricedUsage(day);
+                          const gap = isUnavailableDay(day);
                           const height = maxCost > 0 && value != null ? Math.max(8, (value / maxCost) * 100) : 8;
                           const isHovered = inspectedDay?.date === day.date;
                           return (
