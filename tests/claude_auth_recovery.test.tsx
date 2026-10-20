@@ -31,6 +31,7 @@ function storage() {
 
 function installBackend(quota: QuotaData): void {
   vi.spyOn(backend, 'getQuota').mockResolvedValue(quota);
+  vi.spyOn(backend, 'claudeCredentialChanged').mockResolvedValue({ changed: false });
   vi.spyOn(backend, 'refreshClaudeLogin').mockResolvedValue('refreshed');
   vi.spyOn(backend, 'pingClaudeWindow').mockResolvedValue({ kind: 'sentUnconfirmed' });
   vi.spyOn(backend, 'getCodexInfo').mockResolvedValue({ connected: true });
@@ -236,5 +237,138 @@ describe('Claude login recovery', () => {
     expect(getClaudeRefreshIntervalMs(signedOut)).toBe(AUTO_REFRESH_INTERVAL_MS);
     expect(isClaudeSignedOutError(authError.error!)).toBe(false);
     expect(getClaudeRefreshIntervalMs(authError.error!)).toBe(AUTH_REFRESH_INTERVAL_MS);
+  });
+
+  it('auth_error_polls_local_credential_expiry_every_minute', async () => {
+    installBackend(authError);
+    const renderer = await renderApp();
+    expect(backend.getQuota).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(3 * AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.claudeCredentialChanged).toHaveBeenCalledTimes(3);
+    expect(backend.getQuota).toHaveBeenCalledTimes(1);
+    await act(async () => renderer.unmount());
+  });
+
+  it('changed_credential_triggers_immediate_fetch', async () => {
+    installBackend(authError);
+    vi.mocked(backend.claudeCredentialChanged).mockResolvedValue({ changed: true });
+    const renderer = await renderApp();
+    await act(async () => { await vi.advanceTimersByTimeAsync(AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.claudeCredentialChanged).toHaveBeenCalledTimes(1);
+    expect(backend.getQuota).toHaveBeenCalledTimes(2);
+    await act(async () => renderer.unmount());
+  });
+
+  it('unchanged_credential_waits_for_auth_backoff', async () => {
+    installBackend(authError);
+    const renderer = await renderApp();
+    await act(async () => { await vi.advanceTimersByTimeAsync(4 * AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.claudeCredentialChanged).toHaveBeenCalledTimes(4);
+    expect(backend.getQuota).toHaveBeenCalledTimes(1);
+    await act(async () => renderer.unmount());
+  });
+
+  it('credential_check_stops_after_success_and_on_unmount', async () => {
+    installBackend(authError);
+    vi.mocked(backend.claudeCredentialChanged).mockResolvedValue({ changed: true });
+    const renderer = await renderApp();
+    vi.mocked(backend.getQuota).mockResolvedValue({ connected: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.claudeCredentialChanged).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2 * AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.claudeCredentialChanged).toHaveBeenCalledTimes(1);
+    await act(async () => renderer.unmount());
+
+    vi.mocked(backend.getQuota).mockResolvedValue(authError);
+    vi.mocked(backend.claudeCredentialChanged).mockResolvedValue({ changed: false });
+    const secondRenderer = await renderApp();
+    const beforeUnmount = vi.mocked(backend.claudeCredentialChanged).mock.calls.length;
+    await act(async () => secondRenderer.unmount());
+    await act(async () => { await vi.advanceTimersByTimeAsync(AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.claudeCredentialChanged).toHaveBeenCalledTimes(beforeUnmount);
+  });
+
+  it('auth_error_then_ping_refresh_reschedules_to_one_minute', async () => {
+    installBackend(authError);
+    const renderer = await renderApp();
+    await act(async () => { pingButton(renderer).props.onClick(); await flush(); });
+    vi.mocked(backend.getQuota).mockResolvedValue({ connected: true });
+    await act(async () => {
+      renderer.root.find((node) => node.type === 'button' && node.children.join('') === 'Send').props.onClick();
+      await flush();
+    });
+    const before = vi.mocked(backend.getQuota).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(before + 1);
+    await act(async () => renderer.unmount());
+  });
+
+  it('manual_refresh_success_cancels_pending_backoff_timer', async () => {
+    installBackend({ connected: false, error: 'API error: 429 Too Many Requests' });
+    const renderer = await renderApp();
+    vi.mocked(backend.getQuota).mockResolvedValue({ connected: true });
+    await clickRefresh(renderer);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5 * AUTO_REFRESH_INTERVAL_MS); await flush(); });
+    // Initial request, manual request, then one exactly per new one-minute schedule.
+    expect(backend.getQuota).toHaveBeenCalledTimes(7);
+    await act(async () => renderer.unmount());
+  });
+
+  it('out_of_loop_error_reschedules_with_backoff', async () => {
+    installBackend({ connected: true });
+    const renderer = await renderApp();
+    vi.mocked(backend.getQuota).mockResolvedValue({ connected: false, error: 'API error: 429 Too Many Requests' });
+    await clickRefresh(renderer);
+    const before = vi.mocked(backend.getQuota).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(5 * 60 * 1000 - 1); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(before);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(before + 1);
+    await act(async () => renderer.unmount());
+  });
+
+  it('thrown_error_reschedules_with_its_interval', async () => {
+    installBackend({ connected: true });
+    vi.mocked(backend.getQuota)
+      .mockRejectedValueOnce(new Error('API error: 429 Too Many Requests'))
+      .mockResolvedValue({ connected: true });
+    const renderer = await renderApp();
+    const before = vi.mocked(backend.getQuota).mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(5 * 60 * 1000 - 1); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(before);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(before + 1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(before + 1);
+    await act(async () => renderer.unmount());
+  });
+
+  it('stale_generation_result_does_not_reschedule', async () => {
+    const stale = (() => { let resolve!: (value: QuotaData) => void; const promise = new Promise<QuotaData>((next) => { resolve = next; }); return { promise, resolve }; })();
+    const callTimes: number[] = [];
+    installBackend({ connected: true });
+    vi.mocked(backend.getQuota)
+      .mockImplementationOnce(() => { callTimes.push(Date.now()); return stale.promise; })
+      .mockImplementation(() => { callTimes.push(Date.now()); return Promise.resolve({ connected: true }); });
+    const renderer = await renderApp();
+    const start = Date.now();
+    await clickRefresh(renderer);
+    await act(async () => { await vi.advanceTimersByTimeAsync(50 * 1000); await flush(); });
+    await act(async () => { stale.resolve({ connected: false, error: 'Claude Code login expired. Press Ping to renew it.' }); await flush(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10 * 1000 - 1); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(3);
+    expect(callTimes).toEqual([start, start, start + AUTO_REFRESH_INTERVAL_MS]);
+    await act(async () => renderer.unmount());
+  });
+
+  it('unmount_clears_claude_poll_timer', async () => {
+    installBackend({ connected: true });
+    const renderer = await renderApp();
+    const before = vi.mocked(backend.getQuota).mock.calls.length;
+    await act(async () => renderer.unmount());
+    await act(async () => { await vi.advanceTimersByTimeAsync(AUTH_REFRESH_INTERVAL_MS); await flush(); });
+    expect(backend.getQuota).toHaveBeenCalledTimes(before);
   });
 });

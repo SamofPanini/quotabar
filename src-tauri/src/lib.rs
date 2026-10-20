@@ -48,6 +48,7 @@ pub fn run() {
         .manage(ServiceStatusState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_quota,
+            commands::claude_credential_changed,
             commands::refresh_claude_login,
             commands::set_claude_auto_renew,
             commands::get_claude_current_snapshots,
@@ -87,6 +88,7 @@ pub fn run() {
             }
 
             services::tray::setup_tray(app.handle())?;
+            services::quota_history::initialize();
             services::service_status::start(app.handle().clone());
             Ok(())
         })

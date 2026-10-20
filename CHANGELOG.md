@@ -4,6 +4,10 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Claude quota no longer stops refreshing after an out-of-cycle fetch. Previously a fetch triggered outside the polling loop (for example after re-authenticating while an auth error had set a 60-minute retry) left no next poll scheduled, so the numbers stayed stale until a manual refresh. Every fetch now reschedules the next poll, and after an auth error QuotaBar re-checks the local sign-in's expiry every few minutes, fetching again as soon as it changes.
+- Resolved Claude and Codex status-page incidents now stay visible for 24 hours with their resolution time ("Resolved by …" when only the time QuotaBar noticed it is known), in a neutral style, at most two per service. They survive restarts, failed status fetches, and turning status checks off and on.
+- QuotaBar now keeps a local Claude quota history (`quota-history.jsonl` in its state folder, owner-only permissions): one line per change in the 5-hour or weekly percentage from a real 200 response, plus a heartbeat every 30 minutes, pruned to 120 days. No tokens, cookies, or account identifiers are written.
+
 - When QuotaBar cannot read the local session files for a source, its cost now reads n/a with the footer note "usage files unreadable" instead of $0. On the combined card, the other sources' known amount is kept and shown as a lower bound (`≥`).
 - Updated the bundled usage parser (ccstats) to 0.11.0.
 

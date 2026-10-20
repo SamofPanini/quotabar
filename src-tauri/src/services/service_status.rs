@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
@@ -14,13 +14,17 @@ use tauri_plugin_notification::NotificationExt;
 
 use super::{
     http::shared_http_client,
+    state_location,
     tray::{self, TrayService, TrayState},
 };
 
 const CLAUDE_SUMMARY_URL: &str = "https://status.claude.com/api/v2/summary.json";
 const OPENAI_SUMMARY_URL: &str = "https://status.openai.com/api/v2/summary.json";
 const OPENAI_PROXY_URL: &str = "https://status.openai.com/proxy/status.openai.com";
+const CLAUDE_INCIDENTS_URL: &str = "https://status.claude.com/api/v2/incidents.json";
+const OPENAI_INCIDENTS_URL: &str = "https://status.openai.com/api/v2/incidents.json";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const RESOLVED_RETENTION: ChronoDuration = ChronoDuration::hours(24);
 
 #[cfg(test)]
 thread_local! {
@@ -94,12 +98,23 @@ pub struct ServiceEvent {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ResolvedServiceEvent {
+    #[serde(flatten)]
+    pub event: ServiceEvent,
+    pub resolved_at: String,
+    pub resolved_at_estimated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceStatus {
     pub provider: String,
     pub level: ServiceLevel,
     pub components: Vec<ServiceComponent>,
     pub incidents: Vec<ServiceEvent>,
     pub maintenances: Vec<ServiceEvent>,
+    #[serde(default)]
+    pub recently_resolved: Vec<ResolvedServiceEvent>,
     pub fetched_at: Option<String>,
     pub error: Option<String>,
     pub alert: ServiceAlert,
@@ -113,6 +128,7 @@ impl ServiceStatus {
             components: vec![],
             incidents: vec![],
             maintenances: vec![],
+            recently_resolved: vec![],
             fetched_at: None,
             error: Some(error.into()),
             alert: ServiceAlert::None,
@@ -151,6 +167,9 @@ struct Runtime {
     polling: bool,
     claude: ServiceStatus,
     codex: ServiceStatus,
+    // Only a successful response may replace these comparison baselines.
+    // Display snapshots may be unavailable during an outage.
+    successful_statuses: [Option<ServiceStatus>; 2],
     failures: [u8; 2],
     next_due: [std::time::Instant; 2],
     last_success: [Option<std::time::Instant>; 2],
@@ -184,6 +203,7 @@ impl Default for ServiceStatusState {
                 polling: false,
                 claude: ServiceStatus::unavailable("claude", "Status has not been fetched."),
                 codex: ServiceStatus::unavailable("codex", "Status has not been fetched."),
+                successful_statuses: [None, None],
                 failures: [0; 2],
                 next_due: [now; 2],
                 last_success: [None; 2],
@@ -204,6 +224,37 @@ impl ServiceStatusState {
             codex: runtime.codex.clone(),
         }
     }
+    fn restore_recently_resolved(&self) {
+        let Ok(directory) = state_location::primary_state_dir() else {
+            eprintln!("[ServiceStatus] resolved-event state directory is unavailable");
+            return;
+        };
+        let (claude, codex) =
+            load_resolved_store(&directory.join("service-status-resolved.json"), Utc::now());
+        let mut runtime = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.claude.recently_resolved = claude;
+        runtime.codex.recently_resolved = codex;
+    }
+    fn persist_recently_resolved(&self) {
+        let Ok(directory) = state_location::primary_state_dir() else {
+            eprintln!("[ServiceStatus] resolved-event state directory is unavailable");
+            return;
+        };
+        let runtime = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = save_resolved_store(
+            &directory.join("service-status-resolved.json"),
+            &runtime.claude.recently_resolved,
+            &runtime.codex.recently_resolved,
+        ) {
+            eprintln!("[ServiceStatus] resolved-event state write failed: {error}");
+        }
+    }
     pub fn set_prefs(&self, enabled: bool, notify: bool) -> bool {
         let mut runtime = self
             .inner
@@ -218,10 +269,14 @@ impl ServiceStatusState {
             memory.pending_in_flight = false;
         }
         if !enabled {
+            let claude_recently_resolved = std::mem::take(&mut runtime.claude.recently_resolved);
+            let codex_recently_resolved = std::mem::take(&mut runtime.codex.recently_resolved);
             runtime.claude =
                 ServiceStatus::unavailable("claude", "Service status checking is disabled.");
             runtime.codex =
                 ServiceStatus::unavailable("codex", "Service status checking is disabled.");
+            runtime.claude.recently_resolved = claude_recently_resolved;
+            runtime.codex.recently_resolved = codex_recently_resolved;
             runtime.failures = [0; 2];
         }
         became_enabled
@@ -283,6 +338,8 @@ impl ServiceStatusState {
 }
 
 pub fn start(app: AppHandle) {
+    app.state::<ServiceStatusState>()
+        .restore_recently_resolved();
     tauri::async_runtime::spawn(async move {
         sleep_without_blocking_runtime(Duration::from_secs(10)).await;
         loop {
@@ -301,6 +358,7 @@ pub async fn poll_once(app: &AppHandle) {
     let Some(outcome) = poll_once_with_fetchers(&state, fetch_claude, fetch_openai).await else {
         return;
     };
+    state.persist_recently_resolved();
     let tray_state = app.state::<TrayState>();
     finish_poll_side_effects(
         &state,
@@ -421,7 +479,15 @@ where
     ClaudeFuture: Future<Output = ServiceStatus>,
     OpenAiFuture: Future<Output = ServiceStatus>,
 {
-    poll_once_with_fetchers_at(state, fetch_claude, fetch_openai, std::time::Instant::now()).await
+    poll_once_with_fetchers_and_lookup_at(
+        state,
+        fetch_claude,
+        fetch_openai,
+        fetch_resolved_incident_times,
+        std::time::Instant::now(),
+        Utc::now(),
+    )
+    .await
 }
 
 async fn poll_once_with_fetchers_at<ClaudeFetcher, OpenAiFetcher, ClaudeFuture, OpenAiFuture>(
@@ -436,7 +502,41 @@ where
     ClaudeFuture: Future<Output = ServiceStatus>,
     OpenAiFuture: Future<Output = ServiceStatus>,
 {
-    let (epoch, due, mut claude, mut codex) = {
+    poll_once_with_fetchers_and_lookup_at(
+        state,
+        fetch_claude,
+        fetch_openai,
+        |_| async { Ok(HashMap::new()) },
+        now,
+        Utc::now(),
+    )
+    .await
+}
+
+async fn poll_once_with_fetchers_and_lookup_at<
+    ClaudeFetcher,
+    OpenAiFetcher,
+    Lookup,
+    ClaudeFuture,
+    OpenAiFuture,
+    LookupFuture,
+>(
+    state: &ServiceStatusState,
+    fetch_claude: ClaudeFetcher,
+    fetch_openai: OpenAiFetcher,
+    lookup: Lookup,
+    now: std::time::Instant,
+    observed_at: DateTime<Utc>,
+) -> Option<PollOutcome>
+where
+    ClaudeFetcher: FnOnce() -> ClaudeFuture,
+    OpenAiFetcher: FnOnce() -> OpenAiFuture,
+    Lookup: Fn(&'static str) -> LookupFuture,
+    ClaudeFuture: Future<Output = ServiceStatus>,
+    OpenAiFuture: Future<Output = ServiceStatus>,
+    LookupFuture: Future<Output = Result<HashMap<String, String>, String>>,
+{
+    let (epoch, due, previous_claude, previous_codex, successful_claude, successful_codex) = {
         let mut runtime = state
             .inner
             .lock()
@@ -454,8 +554,16 @@ where
             due,
             runtime.claude.clone(),
             runtime.codex.clone(),
+            runtime.successful_statuses[0]
+                .clone()
+                .unwrap_or_else(|| runtime.claude.clone()),
+            runtime.successful_statuses[1]
+                .clone()
+                .unwrap_or_else(|| runtime.codex.clone()),
         )
     };
+    let mut claude = previous_claude.clone();
+    let mut codex = previous_codex.clone();
     if due[0] {
         claude = fetch_claude().await;
     }
@@ -470,6 +578,37 @@ where
     }
     if due[1] {
         codex = fetch_openai().await;
+    }
+    let successful = [is_successful_status(&claude), is_successful_status(&codex)];
+    if due[0] && successful[0] {
+        let missing = missing_resolved_ids(&successful_claude, &claude);
+        let lookup_times = if missing
+            .iter()
+            .any(|id| !feed_resolved_times(&claude).contains_key(id))
+        {
+            lookup("claude").await.unwrap_or_else(|error| {
+                eprintln!("[ServiceStatus] Claude resolved incidents lookup unavailable: {error}");
+                HashMap::new()
+            })
+        } else {
+            HashMap::new()
+        };
+        reconcile_recently_resolved(&successful_claude, &mut claude, &lookup_times, observed_at);
+    }
+    if due[1] && successful[1] {
+        let missing = missing_resolved_ids(&successful_codex, &codex);
+        let lookup_times = if missing
+            .iter()
+            .any(|id| !feed_resolved_times(&codex).contains_key(id))
+        {
+            lookup("codex").await.unwrap_or_else(|error| {
+                eprintln!("[ServiceStatus] OpenAI resolved incidents lookup unavailable: {error}");
+                HashMap::new()
+            })
+        } else {
+            HashMap::new()
+        };
+        reconcile_recently_resolved(&successful_codex, &mut codex, &lookup_times, observed_at);
     }
     let mut runtime = state
         .inner
@@ -493,6 +632,18 @@ where
         runtime.next_due[index] = now + provider_delay(result, runtime.failures[index]);
     }
     mark_stale_failed_statuses(&runtime, &mut claude, &mut codex);
+    if due[0] && !successful[0] {
+        carry_recently_resolved(&previous_claude, &mut claude, observed_at);
+    }
+    if due[1] && !successful[1] {
+        carry_recently_resolved(&previous_codex, &mut codex, observed_at);
+    }
+    if due[0] && successful[0] {
+        runtime.successful_statuses[0] = Some(claude.clone());
+    }
+    if due[1] && successful[1] {
+        runtime.successful_statuses[1] = Some(codex.clone());
+    }
     let changed = runtime.claude != claude || runtime.codex != codex;
     runtime.claude = claude;
     runtime.codex = codex;
@@ -508,6 +659,10 @@ where
         notifications,
         epoch,
     })
+}
+
+fn is_successful_status(status: &ServiceStatus) -> bool {
+    status.error.is_none() && status.level != ServiceLevel::Unknown
 }
 
 fn provider_delay(status: &ServiceStatus, failures: u8) -> Duration {
@@ -791,6 +946,25 @@ async fn fetch_openai() -> ServiceStatus {
     }
 }
 
+async fn fetch_resolved_incident_times(
+    provider: &'static str,
+) -> Result<HashMap<String, String>, String> {
+    let url = match provider {
+        "claude" => CLAUDE_INCIDENTS_URL,
+        "codex" => OPENAI_INCIDENTS_URL,
+        _ => return Ok(HashMap::new()),
+    };
+    let value = fetch_json(url).await?;
+    let summary: Summary = serde_json::from_value(value)
+        .map_err(|error| format!("Invalid incidents shape: {error}"))?;
+    Ok(summary
+        .incidents
+        .into_iter()
+        .filter(|event| matches!(event.status.as_str(), "resolved" | "postmortem"))
+        .filter_map(|event| event.resolved_at.map(|time| (event.id, time)))
+        .collect())
+}
+
 async fn fetch_json(url: &str) -> Result<Value, String> {
     let client = shared_http_client()?;
     let response = client
@@ -922,6 +1096,8 @@ struct RawEvent {
     started_at: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
+    #[serde(default)]
+    resolved_at: Option<String>,
     #[serde(default)]
     components: Vec<Component>,
     #[serde(default)]
@@ -1250,6 +1426,7 @@ fn proxy_event(item: &Value, names: &HashMap<String, String>) -> Option<RawEvent
             .and_then(Value::as_str)
             .map(str::to_string),
         created_at: None,
+        resolved_at: None,
         components,
         incident_updates,
     })
@@ -1361,8 +1538,23 @@ fn build_status(
             affected_component_ids,
         })
     };
+    let recently_resolved: Vec<_> = incidents
+        .iter()
+        .filter(|event| matches!(event.status.as_str(), "resolved" | "postmortem"))
+        .cloned()
+        .filter_map(|event| {
+            let resolved_at = event.resolved_at.clone()?;
+            relevant(event, false).map(|event| ResolvedServiceEvent {
+                event: event.event,
+                resolved_at,
+                resolved_at_estimated: false,
+            })
+        })
+        .collect();
     let incidents: Vec<_> = incidents
-        .into_iter()
+        .iter()
+        .filter(|event| !matches!(event.status.as_str(), "resolved" | "postmortem"))
+        .cloned()
         .filter_map(|event| relevant(event, true))
         .collect();
     let maintenances: Vec<_> = maintenance
@@ -1429,6 +1621,7 @@ fn build_status(
             .collect(),
         incidents: incidents.into_iter().map(|event| event.event).collect(),
         maintenances: maintenances.into_iter().map(|event| event.event).collect(),
+        recently_resolved,
         fetched_at: Some(Utc::now().to_rfc3339()),
         error: None,
         alert: incident_alert.max(component_alert),
@@ -1442,6 +1635,181 @@ fn raw_update_instant(update: &RawUpdate) -> Option<chrono::DateTime<Utc>> {
         .or(update.updated_at.as_deref())
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
         .map(|time| time.with_timezone(&Utc))
+}
+
+fn feed_resolved_times(status: &ServiceStatus) -> HashMap<String, String> {
+    status
+        .recently_resolved
+        .iter()
+        .map(|event| (event.event.id.clone(), event.resolved_at.clone()))
+        .collect()
+}
+
+fn missing_resolved_ids(previous: &ServiceStatus, current: &ServiceStatus) -> Vec<String> {
+    let active: HashSet<&str> = current
+        .incidents
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect();
+    previous
+        .incidents
+        .iter()
+        .filter(|event| !active.contains(event.id.as_str()))
+        .map(|event| event.id.clone())
+        .collect()
+}
+
+fn reconcile_recently_resolved(
+    previous: &ServiceStatus,
+    current: &mut ServiceStatus,
+    lookup_times: &HashMap<String, String>,
+    observed_at: DateTime<Utc>,
+) {
+    let feed_times = feed_resolved_times(current);
+    let active: HashSet<&str> = current
+        .incidents
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect();
+    let cutoff = observed_at - RESOLVED_RETENTION;
+    let mut resolved: Vec<ResolvedServiceEvent> = previous
+        .recently_resolved
+        .iter()
+        .filter(|event| !active.contains(event.event.id.as_str()))
+        .filter(|event| {
+            DateTime::parse_from_rfc3339(&event.resolved_at)
+                .map(|time| time.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    for event in &previous.incidents {
+        if active.contains(event.id.as_str())
+            || resolved.iter().any(|item| item.event.id == event.id)
+        {
+            continue;
+        }
+        let (resolved_at, resolved_at_estimated) = if let Some(time) = feed_times.get(&event.id) {
+            (time.clone(), false)
+        } else if let Some(time) = lookup_times.get(&event.id) {
+            (time.clone(), false)
+        } else {
+            (observed_at.to_rfc3339(), true)
+        };
+        let mut event = event.clone();
+        event.alert = ServiceAlert::None;
+        resolved.push(ResolvedServiceEvent {
+            event,
+            resolved_at,
+            resolved_at_estimated,
+        });
+    }
+    sort_recently_resolved(&mut resolved);
+    current.recently_resolved = resolved;
+}
+
+/// Newest first by parsed instant; unparseable timestamps sort last.
+fn sort_recently_resolved(resolved: &mut [ResolvedServiceEvent]) {
+    resolved.sort_by(|left, right| {
+        match (
+            DateTime::parse_from_rfc3339(&left.resolved_at),
+            DateTime::parse_from_rfc3339(&right.resolved_at),
+        ) {
+            (Ok(left), Ok(right)) => right.cmp(&left),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => std::cmp::Ordering::Equal,
+        }
+    });
+}
+
+fn carry_recently_resolved(
+    previous: &ServiceStatus,
+    current: &mut ServiceStatus,
+    observed_at: DateTime<Utc>,
+) {
+    let cutoff = observed_at - RESOLVED_RETENTION;
+    current.recently_resolved = previous
+        .recently_resolved
+        .iter()
+        .filter(|event| {
+            DateTime::parse_from_rfc3339(&event.resolved_at)
+                .map(|time| time.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    // Entries restored from a file written before instant ordering may still be
+    // in string order; re-sort here so a failure right after startup shows them
+    // in the same order as the success path.
+    sort_recently_resolved(&mut current.recently_resolved);
+}
+
+#[derive(Deserialize, Serialize)]
+struct ResolvedStore {
+    claude: Vec<ResolvedServiceEvent>,
+    codex: Vec<ResolvedServiceEvent>,
+}
+
+fn load_resolved_store(
+    path: &std::path::Path,
+    now: DateTime<Utc>,
+) -> (Vec<ResolvedServiceEvent>, Vec<ResolvedServiceEvent>) {
+    let source = match std::fs::read(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (vec![], vec![]),
+        Err(error) => {
+            eprintln!("[ServiceStatus] resolved-event state read failed: {error}");
+            return (vec![], vec![]);
+        }
+    };
+    let Ok(store) = serde_json::from_slice::<ResolvedStore>(&source) else {
+        eprintln!("[ServiceStatus] resolved-event state is corrupt");
+        return (vec![], vec![]);
+    };
+    let cutoff = now - RESOLVED_RETENTION;
+    let keep = |events: Vec<ResolvedServiceEvent>| {
+        events
+            .into_iter()
+            .filter(|event| {
+                DateTime::parse_from_rfc3339(&event.resolved_at)
+                    .map(|time| time.with_timezone(&Utc) >= cutoff)
+                    .unwrap_or(false)
+            })
+            .collect()
+    };
+    (keep(store.claude), keep(store.codex))
+}
+
+fn save_resolved_store(
+    path: &std::path::Path,
+    claude: &[ResolvedServiceEvent],
+    codex: &[ResolvedServiceEvent],
+) -> Result<(), String> {
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(&ResolvedStore {
+        claude: claude.to_vec(),
+        codex: codex.to_vec(),
+    })
+    .map_err(|error| error.to_string())?;
+    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    set_private_file_permissions(&temporary)?;
+    std::fs::rename(temporary, path).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
 }
 fn maintenance_is_in_progress(event: &RawEvent) -> bool {
     !matches!(event.status.as_str(), "completed" | "resolved")
@@ -1618,6 +1986,7 @@ mod tests {
             scheduled_for: (status == "scheduled").then(|| "2999-01-01T00:00:00Z".into()),
             started_at: None,
             created_at: None,
+            resolved_at: None,
             components: vec![Component {
                 id: "api".into(),
                 name: "Claude API".into(),
@@ -2038,6 +2407,7 @@ mod tests {
             fetched_at: None,
             error: None,
             alert: ServiceAlert::None,
+            recently_resolved: vec![],
         }
     }
 
@@ -2204,6 +2574,7 @@ mod tests {
             fetched_at: None,
             error: None,
             alert: ServiceAlert::None,
+            recently_resolved: vec![],
             incidents: vec![ServiceEvent {
                 id: "incident".into(),
                 name: "Affected service".into(),
@@ -2702,6 +3073,7 @@ mod tests {
             scheduled_for: None,
             started_at: None,
             created_at: None,
+            resolved_at: None,
             components: vec![component.clone()],
             incident_updates: vec![],
         }
@@ -3353,5 +3725,454 @@ mod tests {
                 vec!["CLI", "Codex in ChatGPT Desktop", "Responses"]
             );
         }
+    }
+
+    fn resolved_event(id: &str, at: &str) -> ResolvedServiceEvent {
+        ResolvedServiceEvent {
+            event: ServiceEvent {
+                id: id.into(),
+                name: id.into(),
+                status: "resolved".into(),
+                impact: None,
+                url: None,
+                latest_update: None,
+                started_at: Some("2026-10-19T00:00:00Z".into()),
+                affected_components: vec![],
+                alert: ServiceAlert::None,
+            },
+            resolved_at: at.into(),
+            resolved_at_estimated: false,
+        }
+    }
+
+    fn poll_claude_for_resolved_test(
+        state: &ServiceStatusState,
+        claude: ServiceStatus,
+        now: std::time::Instant,
+        observed_at: DateTime<Utc>,
+    ) {
+        state.inner.lock().unwrap().next_due = [now, now + Duration::from_secs(60 * 60)];
+        let outcome = tauri::async_runtime::block_on(poll_once_with_fetchers_and_lookup_at(
+            state,
+            || async move { claude },
+            || async { operational_status("codex") },
+            |_| async { Ok(HashMap::new()) },
+            now,
+            observed_at,
+        ));
+        assert!(outcome.is_some());
+    }
+
+    #[test]
+    fn incident_disappearing_on_success_moves_to_recently_resolved() {
+        let previous = active_status(ServiceLevel::Degraded, "update");
+        let mut current = operational_status("claude");
+        reconcile_recently_resolved(
+            &previous,
+            &mut current,
+            &HashMap::from([("incident".into(), "2026-10-20T01:00:00Z".into())]),
+            DateTime::parse_from_rfc3339("2026-10-20T01:01:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert_eq!(current.recently_resolved.len(), 1);
+        assert_eq!(
+            current.recently_resolved[0].resolved_at,
+            "2026-10-20T01:00:00Z"
+        );
+        assert_eq!(current.recently_resolved[0].event.alert, ServiceAlert::None);
+    }
+
+    #[test]
+    fn failed_fetch_does_not_resolve_incidents() {
+        let previous = active_status(ServiceLevel::Degraded, "update");
+        let state = ServiceStatusState::default();
+        let now = std::time::Instant::now();
+        state.inner.lock().unwrap().claude = previous;
+        let _ = tauri::async_runtime::block_on(poll_once_with_fetchers_at(
+            &state,
+            || async { ServiceStatus::unavailable("claude", "offline") },
+            || async { operational_status("codex") },
+            now,
+        ));
+        assert!(state.snapshot().claude.recently_resolved.is_empty());
+    }
+
+    #[test]
+    fn failure_keeps_recently_resolved_until_expiry() {
+        let state = ServiceStatusState::default();
+        let now = std::time::Instant::now();
+        let observed = DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        poll_claude_for_resolved_test(
+            &state,
+            active_status(ServiceLevel::Degraded, "open"),
+            now,
+            observed,
+        );
+        poll_claude_for_resolved_test(
+            &state,
+            operational_status("claude"),
+            now + Duration::from_secs(1),
+            observed + chrono::Duration::minutes(1),
+        );
+        poll_claude_for_resolved_test(
+            &state,
+            ServiceStatus::unavailable("claude", "offline"),
+            now + Duration::from_secs(2),
+            observed + chrono::Duration::minutes(2),
+        );
+        assert_eq!(state.snapshot().claude.recently_resolved.len(), 1);
+    }
+
+    #[test]
+    fn disable_reenable_then_failure_keeps_recently_resolved() {
+        let state = ServiceStatusState::default();
+        let now = std::time::Instant::now();
+        let observed = DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        poll_claude_for_resolved_test(
+            &state,
+            active_status(ServiceLevel::Degraded, "open"),
+            now,
+            observed,
+        );
+        poll_claude_for_resolved_test(
+            &state,
+            operational_status("claude"),
+            now + Duration::from_secs(1),
+            observed + chrono::Duration::minutes(1),
+        );
+        state.set_prefs(false, true);
+        state.set_prefs(true, true);
+        poll_claude_for_resolved_test(
+            &state,
+            ServiceStatus::unavailable("claude", "offline"),
+            now + Duration::from_secs(2),
+            observed + chrono::Duration::minutes(2),
+        );
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.claude.recently_resolved[0].event.id, "incident");
+        let directory = std::env::temp_dir().join(format!(
+            "quotabar-disable-reenable-resolved-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let path = directory.join("service-status-resolved.json");
+        save_resolved_store(&path, &snapshot.claude.recently_resolved, &[]).unwrap();
+        assert_eq!(
+            load_resolved_store(&path, observed + chrono::Duration::minutes(2)).0[0]
+                .event
+                .id,
+            "incident"
+        );
+    }
+
+    #[test]
+    fn failure_carry_drops_entries_older_than_24h() {
+        let state = ServiceStatusState::default();
+        let now = std::time::Instant::now();
+        let observed = DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        state.inner.lock().unwrap().claude = ServiceStatus {
+            recently_resolved: vec![
+                resolved_event("expired", "2026-10-19T02:00:00Z"),
+                resolved_event("retained", "2026-10-19T04:00:00Z"),
+            ],
+            ..operational_status("claude")
+        };
+        poll_claude_for_resolved_test(
+            &state,
+            ServiceStatus::unavailable("claude", "offline"),
+            now,
+            observed,
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .claude
+                .recently_resolved
+                .iter()
+                .map(|event| event.event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["retained"]
+        );
+    }
+
+    #[test]
+    fn failure_carry_resorts_restored_entries_by_instant() {
+        let state = ServiceStatusState::default();
+        let now = std::time::Instant::now();
+        let observed = DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // String order from a pre-instant-sort file: "01:00+01:00" > "00:30Z".
+        state.inner.lock().unwrap().claude = ServiceStatus {
+            recently_resolved: vec![
+                resolved_event("earlier", "2026-10-20T01:00:00+01:00"),
+                resolved_event("later", "2026-10-20T00:30:00Z"),
+            ],
+            ..operational_status("claude")
+        };
+        poll_claude_for_resolved_test(
+            &state,
+            ServiceStatus::unavailable("claude", "offline"),
+            now,
+            observed,
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .claude
+                .recently_resolved
+                .iter()
+                .map(|event| event.event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["later", "earlier"]
+        );
+    }
+
+    #[test]
+    fn incident_resolved_during_outage_is_detected_after_recovery() {
+        let state = ServiceStatusState::default();
+        let now = std::time::Instant::now();
+        let observed = DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        poll_claude_for_resolved_test(
+            &state,
+            active_status(ServiceLevel::Degraded, "open"),
+            now,
+            observed,
+        );
+        poll_claude_for_resolved_test(
+            &state,
+            ServiceStatus::unavailable("claude", "offline"),
+            now + Duration::from_secs(1),
+            observed + chrono::Duration::minutes(1),
+        );
+        poll_claude_for_resolved_test(
+            &state,
+            operational_status("claude"),
+            now + Duration::from_secs(2),
+            observed + chrono::Duration::minutes(2),
+        );
+        assert_eq!(
+            state.snapshot().claude.recently_resolved[0].event.id,
+            "incident"
+        );
+    }
+
+    #[test]
+    fn stale_failure_replacement_keeps_recently_resolved() {
+        let state = ServiceStatusState::default();
+        let now = std::time::Instant::now();
+        let observed = DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        poll_claude_for_resolved_test(
+            &state,
+            active_status(ServiceLevel::Degraded, "open"),
+            now,
+            observed,
+        );
+        poll_claude_for_resolved_test(
+            &state,
+            operational_status("claude"),
+            now + Duration::from_secs(1),
+            observed + chrono::Duration::minutes(1),
+        );
+        state.inner.lock().unwrap().last_success[0] =
+            Some(std::time::Instant::now() - Duration::from_secs(30 * 60 + 1));
+        poll_claude_for_resolved_test(
+            &state,
+            ServiceStatus::unavailable("claude", "offline"),
+            now + Duration::from_secs(2),
+            observed + chrono::Duration::minutes(2),
+        );
+        let snapshot = state.snapshot().claude;
+        assert_eq!(snapshot.level, ServiceLevel::Unknown);
+        assert_eq!(snapshot.recently_resolved.len(), 1);
+    }
+
+    #[test]
+    fn resolved_at_prefers_feed_then_incidents_lookup_then_observed() {
+        let previous = active_status(ServiceLevel::Degraded, "update");
+        let observed = DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut feed = operational_status("claude");
+        feed.recently_resolved = vec![resolved_event("incident", "2026-10-20T01:00:00Z")];
+        reconcile_recently_resolved(
+            &previous,
+            &mut feed,
+            &HashMap::from([("incident".into(), "2026-10-20T02:00:00Z".into())]),
+            observed,
+        );
+        assert_eq!(
+            feed.recently_resolved[0].resolved_at,
+            "2026-10-20T01:00:00Z"
+        );
+        let mut lookup = operational_status("claude");
+        reconcile_recently_resolved(
+            &previous,
+            &mut lookup,
+            &HashMap::from([("incident".into(), "2026-10-20T02:00:00Z".into())]),
+            observed,
+        );
+        assert_eq!(
+            lookup.recently_resolved[0].resolved_at,
+            "2026-10-20T02:00:00Z"
+        );
+        let mut fallback = operational_status("claude");
+        reconcile_recently_resolved(&previous, &mut fallback, &HashMap::new(), observed);
+        assert_eq!(
+            fallback.recently_resolved[0].resolved_at,
+            observed.to_rfc3339()
+        );
+        assert!(fallback.recently_resolved[0].resolved_at_estimated);
+    }
+
+    #[test]
+    fn resolved_entries_expire_after_24h() {
+        let mut previous = operational_status("claude");
+        previous.recently_resolved = vec![resolved_event("old", "2026-10-19T00:00:00Z")];
+        let mut current = operational_status("claude");
+        reconcile_recently_resolved(
+            &previous,
+            &mut current,
+            &HashMap::new(),
+            DateTime::parse_from_rfc3339("2026-10-20T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert!(current.recently_resolved.is_empty());
+    }
+
+    #[test]
+    fn reopened_incident_leaves_recently_resolved() {
+        let mut previous = operational_status("claude");
+        previous.recently_resolved = vec![resolved_event("incident", "2026-10-20T00:00:00Z")];
+        let mut current = active_status(ServiceLevel::Degraded, "new");
+        reconcile_recently_resolved(
+            &previous,
+            &mut current,
+            &HashMap::new(),
+            DateTime::parse_from_rfc3339("2026-10-20T01:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert!(current.recently_resolved.is_empty());
+    }
+
+    #[test]
+    fn recently_resolved_is_sorted_newest_first() {
+        let mut previous = operational_status("claude");
+        previous.recently_resolved = vec![
+            resolved_event("older", "2026-10-20T01:00:00Z"),
+            resolved_event("newer", "2026-10-20T02:00:00Z"),
+        ];
+        let mut current = operational_status("claude");
+        reconcile_recently_resolved(
+            &previous,
+            &mut current,
+            &HashMap::new(),
+            DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert_eq!(
+            current
+                .recently_resolved
+                .iter()
+                .map(|event| event.event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+    }
+
+    #[test]
+    fn recently_resolved_sorts_by_instant_across_offsets() {
+        let mut previous = active_status(ServiceLevel::Degraded, "update");
+        previous.incidents[0].id = "earlier".into();
+        let mut later = previous.incidents[0].clone();
+        later.id = "later".into();
+        let mut invalid = previous.incidents[0].clone();
+        invalid.id = "invalid".into();
+        previous.incidents.extend([later, invalid]);
+        let mut current = operational_status("claude");
+        reconcile_recently_resolved(
+            &previous,
+            &mut current,
+            &HashMap::from([
+                ("earlier".into(), "2026-10-20T01:00:00+01:00".into()),
+                ("later".into(), "2026-10-20T00:30:00Z".into()),
+                ("invalid".into(), "not-a-time".into()),
+            ]),
+            DateTime::parse_from_rfc3339("2026-10-20T03:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert_eq!(
+            current
+                .recently_resolved
+                .iter()
+                .map(|event| event.event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["later", "earlier", "invalid"]
+        );
+    }
+
+    #[test]
+    fn recently_resolved_does_not_change_alert_level_or_notifications() {
+        let baseline = operational_status("claude");
+        let mut with_resolved = baseline.clone();
+        with_resolved.recently_resolved = vec![resolved_event("incident", "2026-10-20T00:00:00Z")];
+        assert_eq!(baseline.alert, with_resolved.alert);
+        assert_eq!(
+            notification_fingerprint(&baseline),
+            notification_fingerprint(&with_resolved)
+        );
+        let first_state = ServiceStatusState::default();
+        let second_state = ServiceStatusState::default();
+        let first = notification_decisions(
+            &mut first_state.inner.lock().unwrap(),
+            &notification_snapshot(baseline),
+        );
+        let second = notification_decisions(
+            &mut second_state.inner.lock().unwrap(),
+            &notification_snapshot(with_resolved),
+        );
+        assert_eq!(first.len(), second.len());
+    }
+
+    #[test]
+    fn resolved_store_round_trips_and_ignores_corrupt_file() {
+        let directory =
+            std::env::temp_dir().join(format!("quotabar-resolved-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let path = directory.join("service-status-resolved.json");
+        save_resolved_store(&path, &[resolved_event("one", "2026-10-20T00:00:00Z")], &[]).unwrap();
+        assert_eq!(
+            load_resolved_store(
+                &path,
+                DateTime::parse_from_rfc3339("2026-10-20T01:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+            .0
+            .len(),
+            1
+        );
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(load_resolved_store(&path, Utc::now()).0.is_empty());
     }
 }

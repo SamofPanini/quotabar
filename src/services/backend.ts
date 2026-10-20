@@ -74,6 +74,10 @@ export const backend = {
     return invokeBackend<QuotaData>('get_quota');
   },
 
+  claudeCredentialChanged() {
+    return invokeBackend<{ changed: boolean }>('claude_credential_changed');
+  },
+
   refreshClaudeLogin() {
     return invokeBackend<ClaudeLoginRefreshResult>('refresh_claude_login');
   },

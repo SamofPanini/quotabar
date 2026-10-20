@@ -197,6 +197,12 @@ export default function App() {
   const pingResultTimers = useRef(new Map<string, { timer: ReturnType<typeof setTimeout>; generation: number }>());
   const pingResultGenerations = useRef(new Map<string, number>());
   const claudeIntervalRef = useRef(AUTO_REFRESH_INTERVAL_MS);
+  const claudePollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleClaudePollRef = useRef<(delay: number) => void>(() => {});
+  const claudeCredentialCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const claudeCredentialCheckGenerationRef = useRef(0);
+  const startClaudeCredentialCheckRef = useRef<() => void>(() => {});
+  const stopClaudeCredentialCheckRef = useRef<() => void>(() => {});
   const claude_request_generation = useLatestRequestGeneration();
 
   // Per-service connection + usage state (set via Panel callbacks)
@@ -422,19 +428,32 @@ export default function App() {
           setQuota(null);
         }
         claudeIntervalRef.current = getClaudeRefreshIntervalMs(data.error);
+        if (isClaudeAuthError(data.error)) {
+          startClaudeCredentialCheckRef.current();
+        } else {
+          stopClaudeCredentialCheckRef.current();
+        }
       } else {
         setQuota(data);
         setClaudeError(null);
         setClaudeLoginRefreshMessage(null);
         claudeIntervalRef.current = AUTO_REFRESH_INTERVAL_MS;
+        stopClaudeCredentialCheckRef.current();
       }
       setServiceConnected('claude', data.connected);
+      scheduleClaudePollRef.current(claudeIntervalRef.current);
     } catch (err) {
       if (!claude_request_generation.isCurrent(generation)) return;
       const message = err instanceof Error ? err.message : 'Unknown error';
       setClaudeError(message);
       claudeIntervalRef.current = getClaudeRefreshIntervalMs(message);
+      if (isClaudeAuthError(message)) {
+        startClaudeCredentialCheckRef.current();
+      } else {
+        stopClaudeCredentialCheckRef.current();
+      }
       setServiceConnected('claude', false);
+      scheduleClaudePollRef.current(claudeIntervalRef.current);
     } finally {
       if (claude_request_generation.isCurrent(generation)) {
         setClaudeLoading(false);
@@ -443,23 +462,61 @@ export default function App() {
   }, [claude_request_generation, setServiceConnected]);
 
   useEffect(() => {
-    if (!claudeAutoRenewSynced) return;
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (!claudeAutoRenewSynced) {
+      if (claudePollTimerRef.current) clearTimeout(claudePollTimerRef.current);
+      claudePollTimerRef.current = null;
+      scheduleClaudePollRef.current = () => {};
+      stopClaudeCredentialCheckRef.current();
+      startClaudeCredentialCheckRef.current = () => {};
+      stopClaudeCredentialCheckRef.current = () => {};
+      return;
+    }
     let cancelled = false;
-
-    const run = async () => {
-      await fetchClaudeQuota();
-      if (!cancelled) {
-        timer = setTimeout(run, claudeIntervalRef.current);
-      }
+    const schedule = (delay: number) => {
+      if (claudePollTimerRef.current) clearTimeout(claudePollTimerRef.current);
+      if (cancelled) return;
+      claudePollTimerRef.current = setTimeout(() => {
+        claudePollTimerRef.current = null;
+        void fetchClaudeQuota();
+      }, delay);
     };
-
-    run();
+    const stopCredentialCheck = () => {
+      claudeCredentialCheckGenerationRef.current += 1;
+      if (claudeCredentialCheckTimerRef.current) clearTimeout(claudeCredentialCheckTimerRef.current);
+      claudeCredentialCheckTimerRef.current = null;
+    };
+    const startCredentialCheck = () => {
+      stopCredentialCheck();
+      if (cancelled) return;
+      const checkGeneration = claudeCredentialCheckGenerationRef.current;
+      claudeCredentialCheckTimerRef.current = setTimeout(() => {
+        claudeCredentialCheckTimerRef.current = null;
+        void backend.claudeCredentialChanged().then(({ changed }) => {
+          if (cancelled || checkGeneration !== claudeCredentialCheckGenerationRef.current) return;
+          if (changed) {
+            void fetchClaudeQuota();
+          } else {
+            startClaudeCredentialCheckRef.current();
+          }
+        }).catch(() => {
+          if (!cancelled && checkGeneration === claudeCredentialCheckGenerationRef.current) {
+            startClaudeCredentialCheckRef.current();
+          }
+        });
+      }, AUTO_REFRESH_INTERVAL_MS);
+    };
+    scheduleClaudePollRef.current = schedule;
+    startClaudeCredentialCheckRef.current = startCredentialCheck;
+    stopClaudeCredentialCheckRef.current = stopCredentialCheck;
+    void fetchClaudeQuota();
     return () => {
       cancelled = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
+      scheduleClaudePollRef.current = () => {};
+      if (claudePollTimerRef.current) clearTimeout(claudePollTimerRef.current);
+      claudePollTimerRef.current = null;
+      stopCredentialCheck();
+      startClaudeCredentialCheckRef.current = () => {};
+      stopClaudeCredentialCheckRef.current = () => {};
     };
   }, [claudeAutoRenewSynced, fetchClaudeQuota]);
 
