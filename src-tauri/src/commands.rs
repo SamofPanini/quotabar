@@ -18,6 +18,11 @@ pub async fn get_quota() -> Result<QuotaData, String> {
 }
 
 #[tauri::command]
+pub async fn claude_credential_changed() -> Result<claude::ClaudeCredentialChanged, String> {
+    Ok(claude::claude_credential_changed().await)
+}
+
+#[tauri::command]
 pub async fn refresh_claude_login() -> Result<claude::ClaudeLoginRefreshResult, String> {
     Ok(claude::refresh_claude_login().await)
 }

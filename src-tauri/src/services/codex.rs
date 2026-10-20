@@ -10,7 +10,10 @@ use crate::services::codex_cache::{self, AuthFileStamp};
 use crate::services::http::{error_is_transient, is_transient_os_error, shared_http_client};
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(test))]
+use std::fs::OpenOptions;
+#[cfg(not(test))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -29,6 +32,7 @@ fn last_good_info() -> &'static Mutex<HashMap<RouteKey, LastGoodInfo>> {
     LAST_GOOD_INFO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(not(test))]
 fn log_msg(msg: &str) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
     let line = format!("[{timestamp}] {msg}\n");
@@ -59,6 +63,27 @@ fn log_msg(msg: &str) {
             }
         }
         Err(error) => eprintln!("[CodexLog] failed to open log file: {error}"),
+    }
+}
+
+#[cfg(test)]
+const TEST_LOG_DESTINATION: &str = "memory";
+
+#[cfg(test)]
+static TEST_LOG_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_log_messages() -> &'static Mutex<Vec<String>> {
+    TEST_LOG_MESSAGES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn log_msg(msg: &str) {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let line = format!("[{timestamp}] {msg}\n");
+    print!("{line}");
+    if let Ok(mut messages) = test_log_messages().lock() {
+        messages.push(line);
     }
 }
 
@@ -814,11 +839,12 @@ pub(crate) async fn fetch_codex_profile_inputs(
 mod tests {
     use super::{
         aliases_default_home, fetch_codex_info_for, fetch_codex_profile_inputs,
-        fetch_codex_profiles, parse_codex_rate_limits_response, parse_ordinary_usage_allowed,
-        parse_rate_limit_window, parse_reset_credit, public_profile_from_quota,
-        read_auth_json_with_stamp, retain_last_good_info, should_preserve_for_status,
-        should_preserve_transport_failure, window_minutes_from_seconds, AuthFileStamp,
-        BatchSnapshotProbe, CodexData, LastGoodInfo, BATCH_SNAPSHOT_PROBE,
+        fetch_codex_profiles, log_msg, parse_codex_rate_limits_response,
+        parse_ordinary_usage_allowed, parse_rate_limit_window, parse_reset_credit,
+        public_profile_from_quota, read_auth_json_with_stamp, retain_last_good_info,
+        should_preserve_for_status, should_preserve_transport_failure, test_log_messages,
+        window_minutes_from_seconds, AuthFileStamp, BatchSnapshotProbe, CodexData, LastGoodInfo,
+        BATCH_SNAPSHOT_PROBE, TEST_LOG_DESTINATION,
     };
     use crate::domain::account::{CodexProfile, CodexProfileInput, CodexProfileQuota};
     use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits, CodexResetCredits};
@@ -827,6 +853,17 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn test_logging_does_not_touch_user_log_dir() {
+        log_msg("[test] codex log destination");
+        assert_eq!(TEST_LOG_DESTINATION, "memory");
+        assert!(test_log_messages()
+            .lock()
+            .expect("test log buffer lock")
+            .iter()
+            .any(|line| line.contains("[test] codex log destination")));
+    }
 
     #[test]
     fn only_rate_limiting_is_a_preservable_http_failure() {

@@ -1,8 +1,10 @@
 use crate::domain::models::{ClaudeAutoRenewStatus, ClaudeStaleReason, QuotaData, UsageInfo};
 use crate::services::http::{is_transient_os_error, shared_http_client};
 use serde::Serialize;
+#[cfg(not(test))]
 use std::fs::OpenOptions;
 use std::future::Future;
+#[cfg(not(test))]
 use std::io::Write as IoWrite;
 use std::path::Path;
 use std::pin::Pin;
@@ -23,6 +25,7 @@ const CLAUDE_TOKEN_ENV_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const CLAUDE_AUTH_RELOGIN_MESSAGE: &str = "Claude Code login expired. Press Ping to renew it.";
 const CLAUDE_SIGNED_OUT_MESSAGE: &str =
     "Claude Code is signed out. Run claude auth login in Terminal.";
+#[cfg(not(test))]
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 const CREDENTIAL_NAMES: [&str; 4] = [
@@ -77,6 +80,7 @@ pub(crate) fn set_auto_renew_enabled(enabled: bool) {
     CLAUDE_AUTO_RENEW_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+#[cfg(not(test))]
 fn rotate_log_if_needed(path: &Path) {
     rotate_log_if_needed_with_limit(path, MAX_LOG_BYTES);
 }
@@ -94,6 +98,7 @@ fn rotate_log_if_needed_with_limit(path: &Path, max_bytes: u64) {
     }
 }
 
+#[cfg(not(test))]
 fn log_msg(msg: &str) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
     let line = format!("[{timestamp}] {msg}\n");
@@ -118,6 +123,27 @@ fn log_msg(msg: &str) {
             }
         }
         Err(e) => eprintln!("[log] failed to open log file: {e}"),
+    }
+}
+
+#[cfg(test)]
+const TEST_LOG_DESTINATION: &str = "memory";
+
+#[cfg(test)]
+static TEST_LOG_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_log_messages() -> &'static Mutex<Vec<String>> {
+    TEST_LOG_MESSAGES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn log_msg(msg: &str) {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let line = format!("[{timestamp}] {msg}\n");
+    print!("{line}");
+    if let Ok(mut messages) = test_log_messages().lock() {
+        messages.push(line);
     }
 }
 
@@ -272,6 +298,15 @@ pub enum ClaudeLoginRefreshResult {
     Unchanged,
     Failed,
     SignedOut,
+}
+
+/// The frontend only needs to know whether the local Claude Code credential
+/// differs from the credential that most recently failed authentication.
+/// Deliberately keep the credential itself out of this IPC projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeCredentialChanged {
+    pub changed: bool,
 }
 
 pub(crate) fn parse_auth_status_logged_in(stdout: &[u8]) -> Option<bool> {
@@ -785,6 +820,7 @@ fn fallback_or_disconnected(error: String) -> QuotaData {
 fn gate_error(gate: QuotaRequestGate, expires_at_ms: Option<u64>) -> QuotaData {
     match gate {
         QuotaRequestGate::AuthBlocked => {
+            remember_auth_failure(expires_at_ms);
             let message = login_blocked_message_for(expires_at_ms);
             let reason = if message == CLAUDE_SIGNED_OUT_MESSAGE {
                 ClaudeStaleReason::SignedOut
@@ -811,6 +847,7 @@ fn with_auto_renew_status(mut quota: QuotaData, status: ClaudeAutoRenewStatus) -
 
 fn credential_error_or_disconnected(error: String) -> QuotaData {
     if error.starts_with("OAuth token not found") {
+        remember_auth_failure(None);
         log_msg("[Auth] credentials missing; treating Claude as signed out");
         return stale_login_quota(
             ClaudeStaleReason::SignedOut,
@@ -994,6 +1031,37 @@ fn read_credentials(force_refresh: bool) -> Result<CachedCredentials, String> {
     let credentials = get_oauth_credentials(force_refresh)?;
     clear_signed_out_mark_if_changed(credentials.expires_at_ms);
     Ok(credentials)
+}
+
+fn credential_changed_since_auth_failure(
+    auth_failure: Option<AuthFailure>,
+    current_expiry: Result<Option<u64>, ()>,
+) -> ClaudeCredentialChanged {
+    ClaudeCredentialChanged {
+        changed: auth_failure.is_some_and(|failure| {
+            current_expiry
+                .ok()
+                .is_some_and(|expiry| expiry != failure.expires_at_ms)
+        }),
+    }
+}
+
+/// Reads only the expiration metadata from the Claude Code keychain entry.
+/// This deliberately bypasses the environment-token path because an external
+/// Claude Code renewal changes the keychain credential, not that override.
+pub(crate) async fn claude_credential_changed() -> ClaudeCredentialChanged {
+    let auth_failure = gate_snapshot().0;
+    let current_expiry = match tauri::async_runtime::spawn_blocking(|| {
+        read_credentials_from_system()
+            .map(|credentials| credentials.expires_at_ms)
+            .map_err(|_| ())
+    })
+    .await
+    {
+        Ok(expiry) => expiry,
+        Err(_) => Err(()),
+    };
+    credential_changed_since_auth_failure(auth_failure, current_expiry)
 }
 
 fn clear_credentials_cache() {
@@ -1455,8 +1523,8 @@ async fn fetch_quota_once() -> QuotaData {
         }
     }
 
-    if !response.status().is_success() {
-        let final_status = response.status();
+    let final_status = response.status();
+    if !final_status.is_success() {
         log_msg(&format!("[Quota] non-success response: {final_status}"));
         return stale_or_disconnected(format!("API error: {final_status}"));
     }
@@ -1513,6 +1581,7 @@ async fn fetch_quota_once() -> QuotaData {
         weekly_fable5,
     );
 
+    crate::services::quota_history::record_success(&data, final_status, chrono::Utc::now());
     save_quota_cache(&result);
     result
 }
@@ -1520,17 +1589,18 @@ async fn fetch_quota_once() -> QuotaData {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_renew_due, auto_renew_expired_quota_core, credential_error_or_disconnected,
-        fetch_quota_with_signed_out_probe_core, login_blocked_message, login_refresh_result,
-        manual_renew_due, mark_quota_fetch_error, oauth_cache_hit_diagnostic,
-        oauth_env_source_diagnostic, oauth_keychain_source_diagnostic, parse_auth_status_logged_in,
-        parse_first_quota_window, parse_quota_window, parse_weekly_scoped_model_quota,
-        quota_request_gate, rate_limited_until, refresh_claude_login_core, request_gate_active,
-        request_quota_diagnostic, retry_after_secs, signed_out_outcome,
-        stale_login_quota_from_last, stale_quota_usable, AuthFailure, AutoPingAttempt,
-        ClaudeLoginRefreshResult, LastSuccessfulQuota, QuotaRequestGate,
-        CLAUDE_AUTH_RELOGIN_MESSAGE, CLAUDE_SIGNED_OUT_MESSAGE, DEFAULT_RETRY_AFTER_SECS,
-        EXPIRY_SAFETY_WINDOW_MS, FABLE5_QUOTA_KEYS, MAX_STALE_QUOTA_AGE,
+        auto_renew_due, auto_renew_expired_quota_core, credential_changed_since_auth_failure,
+        credential_error_or_disconnected, fetch_quota_with_signed_out_probe_core, log_msg,
+        login_blocked_message, login_refresh_result, manual_renew_due, mark_quota_fetch_error,
+        oauth_cache_hit_diagnostic, oauth_env_source_diagnostic, oauth_keychain_source_diagnostic,
+        parse_auth_status_logged_in, parse_first_quota_window, parse_quota_window,
+        parse_weekly_scoped_model_quota, quota_request_gate, rate_limited_until,
+        refresh_claude_login_core, request_gate_active, request_quota_diagnostic, retry_after_secs,
+        signed_out_outcome, stale_login_quota_from_last, stale_quota_usable, test_log_messages,
+        AuthFailure, AutoPingAttempt, ClaudeCredentialChanged, ClaudeLoginRefreshResult,
+        LastSuccessfulQuota, QuotaRequestGate, CLAUDE_AUTH_RELOGIN_MESSAGE,
+        CLAUDE_SIGNED_OUT_MESSAGE, DEFAULT_RETRY_AFTER_SECS, EXPIRY_SAFETY_WINDOW_MS,
+        FABLE5_QUOTA_KEYS, MAX_STALE_QUOTA_AGE, TEST_LOG_DESTINATION,
     };
     use crate::domain::models::{ClaudeAutoRenewStatus, ClaudeStaleReason, QuotaData, UsageInfo};
     use serde_json::{json, Value};
@@ -1587,6 +1657,48 @@ mod tests {
         let diagnostic = request_quota_diagnostic(SENTINEL_TOKEN, 7, Some(1.5));
 
         assert_excludes_token_fragments(&diagnostic);
+    }
+
+    #[test]
+    fn credential_changed_projection_handles_same_different_and_missing_credentials() {
+        let failed = Some(AuthFailure {
+            expires_at_ms: Some(10),
+        });
+        assert_eq!(
+            credential_changed_since_auth_failure(failed, Ok(Some(10))),
+            ClaudeCredentialChanged { changed: false }
+        );
+        let changed = credential_changed_since_auth_failure(failed, Ok(Some(11)));
+        assert_eq!(changed, ClaudeCredentialChanged { changed: true });
+        assert_eq!(
+            credential_changed_since_auth_failure(failed, Err(())),
+            ClaudeCredentialChanged { changed: false }
+        );
+        assert_eq!(
+            credential_changed_since_auth_failure(
+                Some(AuthFailure {
+                    expires_at_ms: None
+                }),
+                Ok(Some(11)),
+            ),
+            ClaudeCredentialChanged { changed: true }
+        );
+
+        let serialized = serde_json::to_value(changed).expect("projection serializes");
+        assert_eq!(serialized, json!({ "changed": true }));
+        assert!(serialized.get("accessToken").is_none());
+        assert!(serialized.get("token").is_none());
+    }
+
+    #[test]
+    fn test_logging_does_not_touch_user_log_dir() {
+        log_msg("[test] claude log destination");
+        assert_eq!(TEST_LOG_DESTINATION, "memory");
+        assert!(test_log_messages()
+            .lock()
+            .expect("test log buffer lock")
+            .iter()
+            .any(|line| line.contains("[test] claude log destination")));
     }
 
     #[test]

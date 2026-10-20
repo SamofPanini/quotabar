@@ -6,7 +6,8 @@ export type ServiceStatusLevel = 'operational' | 'maintenance' | 'degraded' | 'p
 export type ServiceAlert = 'none' | 'warning' | 'critical';
 export interface ServiceStatusUpdate { id: string; status: string; body: string; updatedAt?: string }
 export interface ServiceStatusEvent { id: string; name: string; status: string; impact?: string; url?: string; latestUpdate?: ServiceStatusUpdate; startedAt?: string; affectedComponents?: string[]; alert?: ServiceAlert }
-export interface ProviderServiceStatus { provider: 'claude' | 'codex'; level: ServiceStatusLevel; components: Array<{ name: string; status: string; tier?: string }>; incidents: ServiceStatusEvent[]; maintenances: ServiceStatusEvent[]; fetchedAt?: string; error?: string; alert?: ServiceAlert }
+export interface ResolvedServiceEvent extends ServiceStatusEvent { resolvedAt: string; resolvedAtEstimated: boolean }
+export interface ProviderServiceStatus { provider: 'claude' | 'codex'; level: ServiceStatusLevel; components: Array<{ name: string; status: string; tier?: string }>; incidents: ServiceStatusEvent[]; maintenances: ServiceStatusEvent[]; recentlyResolved?: ResolvedServiceEvent[]; fetchedAt?: string; error?: string; alert?: ServiceAlert }
 export interface ServiceStatusSnapshot { claude: ProviderServiceStatus; codex: ProviderServiceStatus }
 
 const ENABLED_KEY = 'quotabar-service-status-enabled';

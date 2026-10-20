@@ -22,10 +22,62 @@ const base = (level: ProviderServiceStatus['level']): ProviderServiceStatus => (
 });
 const event = { id: 'incident', name: 'Claude Console incident', status: 'monitoring', alert: 'warning' as const, url: 'https://status.example', latestUpdate: { id: 'update', status: 'monitoring', body: 'Working on it', updatedAt: '2026-10-10T12:34:00Z' } };
 const hidden = { timeline: false, cost: false, trend: false, tips: false };
+const freshResolvedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
 function text(renderer: ReactTestRenderer) { return JSON.stringify(renderer.toJSON()); }
 
 describe('service status UI', () => {
+  it('resolved_only_renders_neutral_notice_with_resolved_time', () => {
+    const rendered = renderToStaticMarkup(createElement(ServiceStatusNotice, {
+      provider: 'claude', timeZone: 'UTC', status: {
+        ...base('operational'), recentlyResolved: [{ ...event, alert: 'none', startedAt: '2026-10-07T13:25:04Z', resolvedAt: freshResolvedAt, resolvedAtEstimated: false }],
+      },
+    }));
+    expect(rendered).toContain('service-status-notice resolved');
+    expect(rendered).toContain('[Resolved]');
+    expect(rendered).toContain(`Resolved ${formatServiceStatusDate(freshResolvedAt, new Date(), 'UTC')}`);
+    expect(rendered).not.toContain('service-status-notice warning');
+    expect(rendered).not.toContain('service-status-notice critical');
+  });
+
+  it('estimated_resolution_says_resolved_by', () => {
+    const rendered = renderToStaticMarkup(createElement(ServiceStatusNotice, {
+      provider: 'claude', timeZone: 'UTC', status: {
+        ...base('operational'), recentlyResolved: [{ ...event, alert: 'none', resolvedAt: freshResolvedAt, resolvedAtEstimated: true }],
+      },
+    }));
+    expect(rendered).toContain(`Resolved by ${formatServiceStatusDate(freshResolvedAt, new Date(), 'UTC')}`);
+  });
+
+  it('active_and_resolved_render_active_first_and_cap_two_each', () => {
+    const rendered = renderToStaticMarkup(createElement(ServiceStatusNotice, {
+      provider: 'claude', status: {
+        ...base('degraded'), alert: 'warning', incidents: [{ ...event, id: 'active-one', name: 'Active one' }, { ...event, id: 'active-two', name: 'Active two' }, { ...event, id: 'active-three', name: 'Active three' }],
+        recentlyResolved: [{ ...event, id: 'resolved-one', name: 'Resolved one', alert: 'none', resolvedAt: freshResolvedAt, resolvedAtEstimated: false }, { ...event, id: 'resolved-two', name: 'Resolved two', alert: 'none', resolvedAt: freshResolvedAt, resolvedAtEstimated: false }, { ...event, id: 'resolved-three', name: 'Resolved three', alert: 'none', resolvedAt: freshResolvedAt, resolvedAtEstimated: false }],
+      },
+    }));
+    expect(rendered.indexOf('Active one')).toBeLessThan(rendered.indexOf('Resolved one'));
+    expect(rendered).not.toContain('Active three');
+    expect(rendered).not.toContain('Resolved three');
+    expect(rendered).toContain('+2 more on the status page');
+  });
+
+  it('no_resolved_and_operational_still_renders_nothing', () => {
+    expect(renderToStaticMarkup(createElement(ServiceStatusNotice, { provider: 'claude', status: base('operational') }))).toBe('');
+  });
+
+  it('resolved_older_than_24h_is_not_rendered', () => {
+    const rendered = renderToStaticMarkup(createElement(ServiceStatusNotice, {
+      provider: 'claude', status: {
+        ...base('operational'), recentlyResolved: [
+          { ...event, alert: 'none', resolvedAt: new Date(Date.now() - 24 * 60 * 60 * 1000 - 1).toISOString(), resolvedAtEstimated: false },
+          { ...event, id: 'bad-time', alert: 'none', resolvedAt: 'not-a-time', resolvedAtEstimated: false },
+        ],
+      },
+    }));
+    expect(rendered).toBe('');
+  });
+
   it('renders all alert levels, hides operational, and marks Console renewal impact', () => {
     for (const level of ['degraded', 'partial_outage', 'major_outage', 'maintenance'] as const) {
       const status = { ...base(level), incidents: level === 'maintenance' ? [] : [event], maintenances: level === 'maintenance' ? [event] : [] };
