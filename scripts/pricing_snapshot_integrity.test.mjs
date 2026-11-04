@@ -21,7 +21,22 @@ test('bundled LiteLLM pricing snapshot metadata matches its bytes', async () => 
   assert.equal(source.snapshot_sha256, createHash('sha256').update(snapshot).digest('hex'));
   assert.equal(source.snapshot_bytes, snapshot.length);
   assert.equal(source.entries, Object.keys(pricing).length);
-  for (const model of ['claude-haiku-5-5', 'gpt-5.6-luna', 'gpt-5.6-sol']) {
+  for (const model of ['claude-haiku-5-5', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-6.1-terra']) {
     assert.ok(Object.hasOwn(pricing, model), `missing ${model}`);
+  }
+});
+
+test('bundled gpt-6.1-terra prices match the expected rates', async () => {
+  const pricing = JSON.parse(await readFile(path.join(pricingDirectory, 'litellm_model_prices.json'), 'utf8'));
+  const terra = pricing['gpt-6.1-terra'];
+  for (const [field, expected] of Object.entries({
+    input_cost_per_token: 1e-6,
+    cache_read_input_token_cost: 5e-8,
+    output_cost_per_token: 5e-6,
+    input_cost_per_token_above_272k_tokens: 2e-6,
+    cache_read_input_token_cost_above_272k_tokens: 1e-7,
+    output_cost_per_token_above_272k_tokens: 7.5e-6,
+  })) {
+    assert.equal(terra[field], expected, field);
   }
 });

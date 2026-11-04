@@ -330,7 +330,12 @@ mod tests {
             serde_json::from_slice(SNAPSHOT).expect("parse bundled pricing snapshot");
         let pricing = pricing.as_object().expect("snapshot top level object");
         assert_eq!(source["entries"].as_u64(), Some(pricing.len() as u64));
-        for model in ["claude-haiku-5-5", "gpt-5.6-luna", "gpt-5.6-sol"] {
+        for model in [
+            "claude-haiku-5-5",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-6.1-terra",
+        ] {
             assert!(pricing.contains_key(model), "missing {model}");
         }
     }
