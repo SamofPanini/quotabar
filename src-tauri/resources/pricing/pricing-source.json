@@ -1,13 +1,13 @@
 {
   "source_repo": "BerriAI/litellm",
   "source_path": "model_prices_and_context_window.json",
-  "commit_sha": "63a4f3f2f3334bbd239c4c3e4c3302b63b02f71d",
-  "committed_at": "2026-10-09T11:56:18.000Z",
-  "generated_at": "2026-10-09T13:34:56.780Z",
-  "upstream_sha256": "a65058b2de843c3613b6d4946afc26e651972aff7a8c990ef65885a2aa04bb05",
-  "upstream_bytes": 3136328,
-  "snapshot_sha256": "b9de1a2c62b60c0eb6fe7ec099ee4aeab3fa3ea6a81fc597e2e904a124c3e3b8",
-  "snapshot_bytes": 2338570,
-  "entries": 4507,
+  "commit_sha": "570f41daad63e1b728981f36ee4d28b6ebd3acb3",
+  "committed_at": "2026-11-04T00:26:23.000Z",
+  "generated_at": "2026-11-04T08:15:32.347Z",
+  "upstream_sha256": "363799541e3cf722b0a5c9317bebb070b417fc4a932313aeedc6d37f26af23c9",
+  "upstream_bytes": 3281413,
+  "snapshot_sha256": "3e21d4243d2d8e75c5c8213d931bbbff09b37c5796f19df1f78f8bdc4a2c6b78",
+  "snapshot_bytes": 2469524,
+  "entries": 4526,
   "license": "MIT"
 }
