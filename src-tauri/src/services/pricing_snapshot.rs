@@ -331,6 +331,7 @@ mod tests {
         let pricing = pricing.as_object().expect("snapshot top level object");
         assert_eq!(source["entries"].as_u64(), Some(pricing.len() as u64));
         for model in [
+            "claude-fable-5-2",
             "claude-haiku-5-5",
             "gpt-5.6-luna",
             "gpt-5.6-sol",

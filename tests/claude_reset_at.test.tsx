@@ -118,7 +118,7 @@ describe('Claude reset-at display', () => {
   });
 
   it('keeps all six Claude reset times on their own cards', async () => {
-    const labels = ['5-hour window', 'All models', 'Opus', 'Sonnet', 'Claude Design', 'Fable 5'];
+    const labels = ['5-hour window', 'All models', 'Opus', 'Sonnet', 'Claude Design', 'Fable'];
     const resets = labels.map((_, index) => new Date(FUTURE.getTime() + index * 60 * 60 * 1000).toISOString());
     let renderer!: ReactTestRenderer;
     await act(async () => {

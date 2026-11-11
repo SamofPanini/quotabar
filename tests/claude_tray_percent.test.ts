@@ -35,7 +35,7 @@ describe('getClaudeTrayUsedPercent', () => {
     })).toBe(84);
   });
 
-  test('includes Fable 5 in weekly bucket fallback', () => {
+  test('includes the shared Fable quota in weekly bucket fallback', () => {
     expect(getClaudeTrayUsedPercent({
       connected: true,
       session: usage(12),
