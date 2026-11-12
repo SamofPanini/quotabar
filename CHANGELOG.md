@@ -4,6 +4,9 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Updated the bundled pricing snapshot (LiteLLM, 2026-11-11) so `claude-fable-5-2` usage is priced in local cost summaries ($8 input, $40 output, $0.20 cache read, $10 / $16 for 5-minute / 1-hour cache writes per million tokens). Prices for every model QuotaBar already priced are unchanged; the snapshot is still bundled and nothing is fetched at runtime.
+- The shared Fable weekly quota is now labelled "Fable" (and "Fable 7-day" in the overview) instead of "Fable 5": Anthropic reports one Fable limit that also covers Fable 5.2. The quota itself, its parsing and stored fields are unchanged.
+- Updated ccstats to 0.11.1: Claude Haiku 5.5 requests with more than 100K input tokens are now priced at the long-context rate instead of the standard rate. Also picks up patched `rustls-webpki` 0.103.16, `webpki-roots` 1.0.12 and `zstd` 0.14.3 (RUSTSEC-2026-0382, -0381, -0391).
 - Updated the bundled pricing snapshot (LiteLLM, 2026-11-04) so `gpt-6.1-terra` usage is priced in local cost summaries.
 - Claude quota no longer stops refreshing after an out-of-cycle fetch. Previously a fetch triggered outside the polling loop (for example after re-authenticating while an auth error had set a 60-minute retry) left no next poll scheduled, so the numbers stayed stale until a manual refresh. Every fetch now reschedules the next poll, and after an auth error QuotaBar re-checks the local sign-in's expiry every few minutes, fetching again as soon as it changes.
 - Resolved Claude and Codex status-page incidents now stay visible for 24 hours with their resolution time ("Resolved by …" when only the time QuotaBar noticed it is known), in a neutral style, at most two per service. They survive restarts, failed status fetches, and turning status checks off and on.
