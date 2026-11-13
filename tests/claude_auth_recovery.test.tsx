@@ -222,6 +222,7 @@ describe('Claude login recovery', () => {
       unchanged: 'Claude Code login is still expired. Press Ping to renew it.',
       failed: "Couldn't read the Claude Code login. Try again.",
       signedOut: 'Claude Code is signed out. Run claude auth login in Terminal.',
+      profileUnavailable: 'Claude profile unavailable.',
     };
     expect(claudeLoginRefreshMessageFor('refreshed')).toBeNull();
     for (const [result, message] of Object.entries(expected) as Array<[keyof typeof expected, string]>) {

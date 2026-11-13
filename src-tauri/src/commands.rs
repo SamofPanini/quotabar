@@ -26,12 +26,29 @@ pub async fn claude_credential_changed() -> Result<claude::ClaudeCredentialChang
 pub async fn refresh_claude_login(
     alias: String,
 ) -> Result<claude::ClaudeLoginRefreshResult, String> {
-    if alias == "default" {
-        return Ok(claude::refresh_claude_login().await);
-    }
-    match claude_profiles::resolve(&alias) {
-        Some(profile) => Ok(claude::refresh_profile_login(&profile).await),
-        None => Ok(claude::ClaudeLoginRefreshResult::Failed),
+    Ok(
+        resolve_and_refresh_claude(&alias, claude_profiles::resolve, |profile| async move {
+            match profile {
+                None => claude::refresh_claude_login().await,
+                Some(profile) => claude::refresh_profile_login(&profile).await,
+            }
+        })
+        .await,
+    )
+}
+
+async fn resolve_and_refresh_claude<F, Fut>(
+    alias: &str,
+    resolve: impl FnOnce(&str) -> Option<claude_profiles::Profile>,
+    refresh: F,
+) -> claude::ClaudeLoginRefreshResult
+where
+    F: FnOnce(Option<claude_profiles::Profile>) -> Fut,
+    Fut: std::future::Future<Output = claude::ClaudeLoginRefreshResult>,
+{
+    match claude_profile_for_ping(alias, resolve) {
+        Ok(profile) => refresh(profile).await,
+        Err(_) => claude::ClaudeLoginRefreshResult::ProfileUnavailable,
     }
 }
 
@@ -201,6 +218,22 @@ mod tests {
             claude_profile_for_ping("default", |_| panic!("default must not use registry")),
             Ok(None)
         ));
+    }
+
+    #[test]
+    fn claude_refresh_unavailable_alias_never_falls_back_to_default() {
+        for alias in ["unknown", "registry-error", "disabled"] {
+            let result = tauri::async_runtime::block_on(resolve_and_refresh_claude(
+                alias,
+                |_| None,
+                |_| async { panic!("unavailable profile must not refresh") },
+            ));
+            assert_eq!(result, claude::ClaudeLoginRefreshResult::ProfileUnavailable);
+            assert_eq!(
+                serde_json::to_string(&result).unwrap(),
+                "\"profileUnavailable\""
+            );
+        }
     }
 
     #[test]

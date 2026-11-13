@@ -174,6 +174,7 @@ export function claudeLoginRefreshMessageFor(result: ClaudeLoginRefreshResult): 
     case 'unchanged': return 'Claude Code login is still expired. Press Ping to renew it.';
     case 'failed': return "Couldn't read the Claude Code login. Try again.";
     case 'signedOut': return 'Claude Code is signed out. Run claude auth login in Terminal.';
+    case 'profileUnavailable': return 'Claude profile unavailable.';
   }
 }
 
@@ -187,6 +188,7 @@ export default function App() {
   const [claudeLoading, setClaudeLoading] = useState(false);
   const [claudeError, setClaudeError] = useState<string | null>(null);
   const [claudeLoginRefreshMessage, setClaudeLoginRefreshMessage] = useState<string | null>(null);
+  const [claudeProfileRefreshError, setClaudeProfileRefreshError] = useState<{ alias: string; message: string } | null>(null);
   const [claudeAutoRenew, setClaudeAutoRenew] = useState<boolean>(getClaudeAutoRenewEnabled);
   const [claudeAutoRenewSynced, setClaudeAutoRenewSynced] = useState(false);
   const [claudeCostRefreshNonce, setClaudeCostRefreshNonce] = useState(0);
@@ -807,7 +809,10 @@ export default function App() {
   const refreshClaudeQuota = useCallback(async () => {
     if (activeView === 'claude' && claudeAlias !== 'default') {
       if (claudeProfiles.profiles.find((profile) => profile.alias === claudeAlias)?.status === 'disabled') return;
-      try { await backend.refreshClaudeLogin(claudeAlias); } catch { /* refresh below reports registry errors */ }
+      try {
+        const result = await backend.refreshClaudeLogin(claudeAlias);
+        setClaudeProfileRefreshError(result === 'profileUnavailable' ? { alias: claudeAlias, message: claudeLoginRefreshMessageFor(result)! } : null);
+      } catch { setClaudeProfileRefreshError({ alias: claudeAlias, message: claudeLoginRefreshMessageFor('failed')! }); }
       await fetchClaudeProfiles();
       return;
     }
@@ -1209,6 +1214,7 @@ export default function App() {
                     claudeLoginRefreshMessage,
                     serviceStatus?.claude,
                   )}
+                  profileRefreshError={claudeProfileRefreshError?.alias === claudeAlias ? claudeProfileRefreshError.message : null}
                   windowVisible={windowVisible}
                   costRefreshKey={claudeCostRefreshNonce}
                   onRetry={handleRefresh}

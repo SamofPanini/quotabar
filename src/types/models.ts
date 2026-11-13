@@ -34,7 +34,7 @@ export interface ClaudeProfile {
 }
 export interface ClaudeProfilesResponse { profiles: ClaudeProfile[]; registryError?: string }
 
-export type ClaudeLoginRefreshResult = 'refreshed' | 'unchanged' | 'failed' | 'signedOut';
+export type ClaudeLoginRefreshResult = 'refreshed' | 'unchanged' | 'failed' | 'signedOut' | 'profileUnavailable';
 
 /** Read-only C3-A projection. It intentionally omits binding, sequence, source, and path data. */
 export type ClaudeBindingState = 'unbound' | 'bound' | 'unverified' | 'error';

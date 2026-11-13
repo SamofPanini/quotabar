@@ -70,6 +70,19 @@ describe('Claude account tabs', () => {
     expect(JSON.stringify(view.toJSON())).toContain('Lucky');
     await act(async () => view.unmount());
   });
+  it('shows an unavailable refresh result on the selected profile', async () => {
+    let view!: ReactTestRenderer;
+    await act(async () => {
+      view = create(createElement(ClaudePanel, {
+        quota, loading: false, error: null, profileRefreshError: 'Claude profile unavailable.',
+        windowVisible: false, costRefreshKey: 0, onRetry: () => {}, selectedAlias: 'lucky',
+        profiles: { profiles: [profile('ok')] },
+        sections: { timeline: false, cost: false, trend: false, tips: false },
+      }));
+    });
+    expect(JSON.stringify(view.toJSON())).toContain('Claude profile unavailable.');
+    await act(async () => view.unmount());
+  });
   it('sends Ping to the selected profile alias', async () => {
     const values = new Map([['claude-quota-tab', 'claude']]);
     (globalThis as Record<string, unknown>).localStorage = {

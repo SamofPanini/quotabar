@@ -19,6 +19,7 @@ interface ClaudePanelProps {
   quota: QuotaData | null;
   loading: boolean;
   error: string | null;
+  profileRefreshError?: string | null;
   windowVisible: boolean;
   costRefreshKey: number;
   onRetry: () => void;
@@ -63,6 +64,7 @@ export default function ClaudePanel({
   onSelectAlias,
   loading,
   error: defaultError,
+  profileRefreshError,
   windowVisible,
   costRefreshKey,
   onRetry,
@@ -71,7 +73,7 @@ export default function ClaudePanel({
 }: ClaudePanelProps) {
   const selected = profiles.profiles.find((profile) => profile.alias === selectedAlias);
   const quota = selectedAlias === 'default' ? defaultQuota : selected?.status === 'mismatch' ? null : selected?.quota ?? null;
-  const error = selectedAlias === 'default' ? defaultError : null;
+  const error = selectedAlias === 'default' ? defaultError : profileRefreshError ?? null;
   const statusLabels = {
     disabled: 'Not enabled (directory missing)',
     signedOut: 'Signed out',
