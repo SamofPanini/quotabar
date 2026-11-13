@@ -25,8 +25,31 @@ pub struct UsageInfo {
     pub reset_time: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ClaudeAccount {
+    pub tail: String,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum ClaudeAppAccount {
+    Same,
+    Different {
+        #[serde(rename = "appLabel")]
+        app_label: String,
+    },
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QuotaData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<ClaudeAccount>,
+    #[serde(rename = "accountLabel", skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(rename = "appAccount", skip_serializing_if = "Option::is_none")]
+    pub app_account: Option<ClaudeAppAccount>,
     pub connected: bool,
     pub session: Option<UsageInfo>,
     #[serde(rename = "weeklyTotal")]
@@ -51,6 +74,9 @@ pub struct QuotaData {
 impl QuotaData {
     pub fn disconnected(error: impl Into<String>) -> Self {
         Self {
+            account: None,
+            account_label: None,
+            app_account: None,
             connected: false,
             session: None,
             weekly_total: None,
@@ -74,6 +100,9 @@ impl QuotaData {
         weekly_fable5: Option<UsageInfo>,
     ) -> Self {
         Self {
+            account: None,
+            account_label: None,
+            app_account: None,
             connected: true,
             session,
             weekly_total,

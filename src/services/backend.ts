@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AntigravityData,
   ClaudeLoginRefreshResult,
+  ClaudeProfilesResponse,
   ClaudeCurrentSnapshots,
   CodexData,
   CodexProfilesResponse,
@@ -78,8 +79,16 @@ export const backend = {
     return invokeBackend<{ changed: boolean }>('claude_credential_changed');
   },
 
-  refreshClaudeLogin() {
-    return invokeBackend<ClaudeLoginRefreshResult>('refresh_claude_login');
+  refreshClaudeLogin(alias: string) {
+    return invokeBackend<ClaudeLoginRefreshResult>('refresh_claude_login', { alias });
+  },
+
+  refreshClaudeProfileLogin(alias: string) {
+    return invokeBackend<ClaudeLoginRefreshResult>('refresh_claude_login', { alias });
+  },
+
+  getClaudeProfiles() {
+    return invokeBackend<ClaudeProfilesResponse>('get_claude_profiles');
   },
 
   getClaudeCurrentSnapshots() {
@@ -110,8 +119,8 @@ export const backend = {
     return invokeBackend<PingOutcome>('ping_codex_window', { alias, force });
   },
 
-  pingClaudeWindow(force: boolean) {
-    return invokeBackend<PingOutcome>('ping_claude_window', { force });
+  pingClaudeWindow(alias: string, force: boolean) {
+    return invokeBackend<PingOutcome>('ping_claude_window', { alias, force });
   },
 
   getCursorInfo() {

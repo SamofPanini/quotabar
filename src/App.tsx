@@ -61,7 +61,7 @@ import {
   saveMenuBarQuotaWindow,
   type MenuBarQuotaWindow,
 } from './services/codex_tray_window';
-import type { ClaudeLoginRefreshResult, PingOutcome, QuotaData } from './types/models';
+import type { ClaudeLoginRefreshResult, ClaudeProfilesResponse, PingOutcome, QuotaData } from './types/models';
 import {
   claudePingWindowState,
   codexPingWindowState,
@@ -174,6 +174,7 @@ export function claudeLoginRefreshMessageFor(result: ClaudeLoginRefreshResult): 
     case 'unchanged': return 'Claude Code login is still expired. Press Ping to renew it.';
     case 'failed': return "Couldn't read the Claude Code login. Try again.";
     case 'signedOut': return 'Claude Code is signed out. Run claude auth login in Terminal.';
+    case 'profileUnavailable': return 'Claude profile unavailable.';
   }
 }
 
@@ -182,9 +183,12 @@ export default function App() {
 
   // Claude state (still owned by App because of adaptive backoff)
   const [quota, setQuota] = useState<QuotaData | null>(null);
+  const [claudeProfiles, setClaudeProfiles] = useState<ClaudeProfilesResponse>({ profiles: [] });
+  const [claudeAlias, setClaudeAlias] = useState('default');
   const [claudeLoading, setClaudeLoading] = useState(false);
   const [claudeError, setClaudeError] = useState<string | null>(null);
   const [claudeLoginRefreshMessage, setClaudeLoginRefreshMessage] = useState<string | null>(null);
+  const [claudeProfileRefreshError, setClaudeProfileRefreshError] = useState<{ alias: string; message: string } | null>(null);
   const [claudeAutoRenew, setClaudeAutoRenew] = useState<boolean>(getClaudeAutoRenewEnabled);
   const [claudeAutoRenewSynced, setClaudeAutoRenewSynced] = useState(false);
   const [claudeCostRefreshNonce, setClaudeCostRefreshNonce] = useState(0);
@@ -204,6 +208,8 @@ export default function App() {
   const startClaudeCredentialCheckRef = useRef<() => void>(() => {});
   const stopClaudeCredentialCheckRef = useRef<() => void>(() => {});
   const claude_request_generation = useLatestRequestGeneration();
+  const claude_profiles_request_generation = useLatestRequestGeneration();
+  const claude_profile_refresh_generation = useLatestRequestGeneration();
 
   // Per-service connection + usage state (set via Panel callbacks)
   const [connected, setConnected] = useState<ServiceMap<boolean>>(() => defaultServiceMap(false));
@@ -408,6 +414,25 @@ export default function App() {
       console.error(`Failed to update ${service} tray icon:`, err);
     }
   }, []);
+
+  const fetchClaudeProfiles = useCallback(async () => {
+    const generation = claude_profiles_request_generation.begin();
+    try {
+      const data = await backend.getClaudeProfiles();
+      if (!claude_profiles_request_generation.isCurrent(generation)) return;
+      setClaudeProfiles(data);
+    } catch {
+      if (!claude_profiles_request_generation.isCurrent(generation)) return;
+      setClaudeProfiles({ profiles: [], registryError: 'Claude profiles unavailable' });
+    }
+  }, [claude_profiles_request_generation]);
+
+  useEffect(() => {
+    if (!claudeAutoRenewSynced) return;
+    void fetchClaudeProfiles();
+    const timer = setInterval(() => { void fetchClaudeProfiles(); }, AUTO_REFRESH_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [claudeAutoRenewSynced, fetchClaudeProfiles]);
 
   // Fetch Claude quota for startup/manual/background refresh.
   const fetchClaudeQuota = useCallback(async () => {
@@ -782,10 +807,28 @@ export default function App() {
   const activeProvider = isProviderTab(activeView) ? activeView : lastProviderTab;
   const activeTab: TabName = activeView === 'all' ? 'all' : activeProvider;
 
+  const refreshClaudeProfileLogin = useCallback(async (alias: string) => {
+    const generation = claude_profile_refresh_generation.begin();
+    try {
+      const result = await backend.refreshClaudeProfileLogin(alias);
+      if (!claude_profile_refresh_generation.isCurrent(generation)) return;
+      setClaudeProfileRefreshError(result === 'profileUnavailable' ? { alias, message: claudeLoginRefreshMessageFor(result)! } : null);
+    } catch {
+      if (!claude_profile_refresh_generation.isCurrent(generation)) return;
+      setClaudeProfileRefreshError({ alias, message: claudeLoginRefreshMessageFor('failed')! });
+    }
+  }, [claude_profile_refresh_generation]);
+
   const refreshClaudeQuota = useCallback(async () => {
+    if (activeView === 'claude' && claudeAlias !== 'default') {
+      if (claudeProfiles.profiles.find((profile) => profile.alias === claudeAlias)?.status === 'disabled') return;
+      await refreshClaudeProfileLogin(claudeAlias);
+      await fetchClaudeProfiles();
+      return;
+    }
     if (claudeError && isClaudeAuthError(claudeError)) {
       try {
-        const result = await backend.refreshClaudeLogin();
+        const result = await backend.refreshClaudeLogin('default');
         setClaudeLoginRefreshMessage(claudeLoginRefreshMessageFor(result));
       } catch {
         setClaudeLoginRefreshMessage(claudeLoginRefreshMessageFor('failed'));
@@ -794,7 +837,8 @@ export default function App() {
       setClaudeLoginRefreshMessage(null);
     }
     await fetchClaudeQuota();
-  }, [claudeError, fetchClaudeQuota]);
+    await fetchClaudeProfiles();
+  }, [activeView, claudeAlias, claudeError, claudeProfiles, fetchClaudeQuota, fetchClaudeProfiles, refreshClaudeProfileLogin]);
 
   const handleRefresh = useCallback(() => {
     if (activeView === 'all') {
@@ -871,26 +915,30 @@ export default function App() {
   }, []);
 
   const pingProvider = activeView === 'codex' || activeView === 'claude' ? activeView : null;
-  const pingAlias = pingProvider === 'codex' ? codexPingContext?.alias ?? 'default' : 'default';
+  const selectedClaudeProfile = claudeProfiles.profiles.find((profile) => profile.alias === claudeAlias);
+  const selectedClaudeQuota = claudeAlias === 'default' ? quota : selectedClaudeProfile?.quota ?? null;
+  const pingAlias = pingProvider === 'codex' ? codexPingContext?.alias ?? 'default' : claudeAlias;
   const pingTarget = pingProvider == null ? null : { provider: pingProvider, alias: pingAlias };
   const currentPingKey = pingTarget ? pingTargetKey(pingTarget) : null;
   const pingWindowState: PingWindowState = pingProvider === 'codex'
     ? codexPingWindowState(codexPingContext?.limits?.primary, Math.floor(Date.now() / 1000))
     : pingProvider === 'claude'
-      ? claudePingWindowState(quota?.session, Math.floor(Date.now() / 1000))
+      ? claudePingWindowState(selectedClaudeQuota?.session, Math.floor(Date.now() / 1000))
       : 'unknown';
   const pingDisabledReason = pingProvider === 'codex'
     ? codexPingContext?.limits?.ordinaryUsageAllowed === false
       ? 'Ordinary usage blocked — ping would not open a window'
       : !codexPingContext?.available ? (codexPingContext?.unavailableReason ?? 'Quota unavailable') : undefined
-    : pingProvider === 'claude' && claudeError && isClaudeSignedOutError(claudeError)
+    : pingProvider === 'claude' && claudeAlias !== 'default' && (!selectedClaudeProfile || selectedClaudeProfile.status === 'disabled' || selectedClaudeProfile.status === 'signedOut' || selectedClaudeProfile.status === 'mismatch')
+      ? 'Claude profile unavailable'
+    : pingProvider === 'claude' && claudeAlias === 'default' && claudeError && isClaudeSignedOutError(claudeError)
       ? 'Sign in to Claude Code in Terminal first'
-    : pingProvider === 'claude' && (!quota?.connected || Boolean(claudeError))
+    : pingProvider === 'claude' && claudeAlias === 'default' && (!quota?.connected || Boolean(claudeError))
       && !(claudeError && isClaudeAuthError(claudeError))
       ? (claudeError ?? 'Claude quota unavailable') : undefined;
   const pingCurrentInFlight = currentPingKey != null && Boolean(pingInFlight[currentPingKey]);
   const pingCurrentConfirming = currentPingKey != null && Boolean(pingConfirming[currentPingKey]);
-  const claudeSignedOut = Boolean(claudeError && isClaudeSignedOutError(claudeError));
+  const claudeSignedOut = claudeAlias === 'default' && Boolean(claudeError && isClaudeSignedOutError(claudeError));
 
   useEffect(() => {
     pingConfirmationGeneration.current += 1;
@@ -910,9 +958,10 @@ export default function App() {
       setRefreshNonces((prev) => ({ ...prev, codex: prev.codex + 1 }));
     } else {
       fetchClaudeQuota();
+      void fetchClaudeProfiles();
       setClaudeCostRefreshNonce((value) => value + 1);
     }
-  }, [fetchClaudeQuota]);
+  }, [fetchClaudeQuota, fetchClaudeProfiles]);
 
   const runPing = useCallback(async (target: PingTarget, force: boolean) => {
     const key = pingTargetKey(target);
@@ -926,7 +975,7 @@ export default function App() {
     try {
       const outcome = target.provider === 'codex'
         ? await backend.pingCodexWindow(target.alias, force)
-        : await backend.pingClaudeWindow(force);
+        : await backend.pingClaudeWindow(target.alias, force);
       if (outcome.kind === 'confirmationRequired') {
         if (pingConfirmationGeneration.current !== confirmationGeneration) return;
         setPingConfirmations((previous) => ({
@@ -977,7 +1026,7 @@ export default function App() {
 
   const handlePing = useCallback(() => {
     if (pingDisabledReason || pingTarget == null) return;
-    if (pingTarget.provider === 'claude' && claudeError && isClaudeAuthError(claudeError)) {
+    if (pingTarget.provider === 'claude' && ((pingTarget.alias === 'default' && claudeError && isClaudeAuthError(claudeError)) || (pingTarget.alias !== 'default' && selectedClaudeProfile?.status === 'expired'))) {
       const key = pingTargetKey(pingTarget);
       setPingConfirmations((previous) => ({
         ...previous,
@@ -994,13 +1043,13 @@ export default function App() {
     }
     const reset = pingTarget.provider === 'codex'
       ? codexPingContext?.limits?.primary?.resetsAt
-      : parseRfc3339EpochSeconds(quota?.session?.resetTime);
+      : parseRfc3339EpochSeconds(selectedClaudeQuota?.session?.resetTime);
     const message = pingWindowState === 'open'
       ? `5h window is already active and resets at ${formatPingReset(reset)}. Send a ping anyway?`
       : "Couldn't confirm window state. Send a ping anyway?";
     const key = pingTargetKey(pingTarget);
     setPingConfirmations((previous) => ({ ...previous, [key]: { ...pingTarget, message } }));
-  }, [claudeError, codexPingContext?.limits?.primary?.resetsAt, pingDisabledReason, pingTarget, pingWindowState, quota?.session?.resetTime, runPing]);
+  }, [claudeError, codexPingContext?.limits?.primary?.resetsAt, pingDisabledReason, pingTarget, pingWindowState, selectedClaudeProfile?.status, selectedClaudeQuota?.session?.resetTime, runPing]);
 
   const handleOpenDashboard = useCallback(async () => {
     try {
@@ -1164,6 +1213,9 @@ export default function App() {
             <div className="panel-scroll">
               {providerViewActive && activeView === 'claude' && (
                 <ClaudePanel
+                  profiles={claudeProfiles}
+                  selectedAlias={claudeAlias}
+                  onSelectAlias={setClaudeAlias}
                   quota={quota}
                   loading={claudeLoading}
                   error={claudePanelErrorWithServiceIncident(
@@ -1172,6 +1224,7 @@ export default function App() {
                     claudeLoginRefreshMessage,
                     serviceStatus?.claude,
                   )}
+                  profileRefreshError={claudeProfileRefreshError?.alias === claudeAlias ? claudeProfileRefreshError.message : null}
                   windowVisible={windowVisible}
                   costRefreshKey={claudeCostRefreshNonce}
                   onRetry={handleRefresh}
@@ -1260,7 +1313,7 @@ export default function App() {
               onPing={handlePing}
               pingState={pingCurrentConfirming ? 'confirming' : pingCurrentInFlight ? 'inFlight' : 'idle'}
               pingDisabledReason={pingDisabledReason}
-              pingTitle={pingProvider === 'claude' && claudeError && isClaudeAuthError(claudeError)
+              pingTitle={pingProvider === 'claude' && claudeAlias === 'default' && claudeError && isClaudeAuthError(claudeError)
                 && !isClaudeSignedOutError(claudeError)
                 ? 'Renew Claude Code login — sends a ping (starts a 5-hour window)'
                 : `Ping ${pingAlias} — start 5-hour window`}

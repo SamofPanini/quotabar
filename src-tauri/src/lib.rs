@@ -48,6 +48,7 @@ pub fn run() {
         .manage(ServiceStatusState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_quota,
+            commands::get_claude_profiles,
             commands::claude_credential_changed,
             commands::refresh_claude_login,
             commands::set_claude_auto_renew,
