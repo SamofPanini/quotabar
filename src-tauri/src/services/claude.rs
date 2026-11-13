@@ -2031,7 +2031,7 @@ pub(crate) fn invalidate_profile_login_state(profile: &crate::services::claude_p
     }
     if let Ok(mut value) = state.request_gate_state.lock() {
         value.auth_failure = None;
-    }
+    };
 }
 
 pub(crate) async fn profile_login_renewal_needed(
