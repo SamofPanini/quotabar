@@ -1985,8 +1985,9 @@ fn custom_credentials(
     profile: &crate::services::claude_profiles::Profile,
     state: &ProfileState,
     force: bool,
+    read: impl FnOnce(Option<&str>) -> Result<KeychainCredentials, String>,
 ) -> Result<CachedCredentials, String> {
-    custom_credentials_with(profile, state, force, read_credentials_for_system)
+    custom_credentials_with(profile, state, force, read)
 }
 
 fn custom_credentials_with(
@@ -2076,7 +2077,7 @@ pub(crate) async fn profile_login_renewal_needed(
     let state = profile_state(&profile.config_dir);
     let input = profile.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        custom_credentials(&input, &state, true)
+        custom_credentials(&input, &state, true, read_credentials_for_system)
             .ok()
             .is_some_and(|c| {
                 let signed_out = profile_signed_out_matches(&state, c.expires_at_ms);
@@ -2102,7 +2103,12 @@ pub(crate) async fn refresh_profile_login(
     let input_before = profile.clone();
     let before_state = Arc::clone(&state);
     let before = match tauri::async_runtime::spawn_blocking(move || {
-        custom_credentials(&input_before, &before_state, false)
+        custom_credentials(
+            &input_before,
+            &before_state,
+            false,
+            read_credentials_for_system,
+        )
     })
     .await
     {
@@ -2112,7 +2118,7 @@ pub(crate) async fn refresh_profile_login(
     let input = profile.clone();
     let refreshed_state = Arc::clone(&state);
     let after = match tauri::async_runtime::spawn_blocking(move || {
-        custom_credentials(&input, &refreshed_state, true)
+        custom_credentials(&input, &refreshed_state, true, read_credentials_for_system)
     })
     .await
     {
@@ -2372,7 +2378,7 @@ impl ProfileIo for SystemProfileIo {
         let profile = profile.clone();
         Box::pin(async move {
             tauri::async_runtime::spawn_blocking(move || {
-                custom_credentials(&profile, &state, force)
+                custom_credentials(&profile, &state, force, read_credentials_for_system)
             })
             .await
             .ok()
@@ -2932,19 +2938,19 @@ mod tests {
         let a_state = super::profile_state(&a.config_dir);
         let b_state = super::profile_state(&b.config_dir);
         assert_eq!(
-            super::custom_credentials_with(&a, &a_state, false, read("a"))
+            super::custom_credentials(&a, &a_state, false, read("a"))
                 .unwrap()
                 .access_token,
             "a"
         );
         assert_eq!(
-            super::custom_credentials_with(&b, &b_state, false, read("b"))
+            super::custom_credentials(&b, &b_state, false, read("b"))
                 .unwrap()
                 .access_token,
             "b"
         );
         assert_eq!(
-            super::custom_credentials_with(&a, &a_state, false, |_| panic!("cache missed"))
+            super::custom_credentials(&a, &a_state, false, |_| panic!("cache missed"))
                 .unwrap()
                 .access_token,
             "a"
@@ -2962,6 +2968,14 @@ mod tests {
         tauri::async_runtime::block_on(super::fetch_profile_with(&a, &labels, &io_a));
         let result = tauri::async_runtime::block_on(super::fetch_profile_with(&b, &labels, &io_b));
         assert_eq!(result.quota.unwrap().session.unwrap().percentage, 82.0);
+        assert_eq!(io_b.usages.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let cached_a =
+            tauri::async_runtime::block_on(super::fetch_profile_with(&a, &labels, &io_a));
+        let cached_b =
+            tauri::async_runtime::block_on(super::fetch_profile_with(&b, &labels, &io_b));
+        assert_eq!(cached_a.quota.unwrap().session.unwrap().percentage, 37.0);
+        assert_eq!(cached_b.quota.unwrap().session.unwrap().percentage, 82.0);
+        assert_eq!(io_a.usages.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(io_b.usages.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

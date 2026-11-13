@@ -108,6 +108,42 @@ describe('Claude account tabs', () => {
     vi.restoreAllMocks();
     delete (globalThis as Record<string, unknown>).localStorage;
   });
+  it('keeps the latest profile refresh result when responses finish out of order', async () => {
+    const values = new Map([['claude-quota-tab', 'claude']]);
+    (globalThis as Record<string, unknown>).localStorage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+      clear: () => values.clear(), key: (index: number) => [...values.keys()][index] ?? null,
+      get length() { return values.size; },
+    };
+    vi.spyOn(backend, 'setClaudeAutoRenew').mockResolvedValue(undefined);
+    vi.spyOn(backend, 'getQuota').mockResolvedValue(quota);
+    vi.spyOn(backend, 'getClaudeProfiles').mockResolvedValue({ profiles: [profile('ok')] });
+    let resolveOld!: (result: 'profileUnavailable') => void;
+    let resolveNew!: (result: 'refreshed') => void;
+    const oldRequest = new Promise<'profileUnavailable'>((resolve) => { resolveOld = resolve; });
+    const newRequest = new Promise<'refreshed'>((resolve) => { resolveNew = resolve; });
+    const refresh = vi.spyOn(backend, 'refreshClaudeProfileLogin').mockReturnValueOnce(oldRequest).mockReturnValueOnce(newRequest);
+    let view!: ReactTestRenderer;
+    await act(async () => { view = create(createElement(App)); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { view.root.find((node) => node.props.role === 'tab' && node.children.join('') === 'Lucky').props.onClick(); });
+    await act(async () => {
+      const button = view.root.findByProps({ 'aria-label': 'Refresh current provider' });
+      button.props.onClick();
+      button.props.onClick();
+      await Promise.resolve();
+    });
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(refresh).toHaveBeenNthCalledWith(1, 'lucky');
+    expect(refresh).toHaveBeenNthCalledWith(2, 'lucky');
+    await act(async () => { resolveNew('refreshed'); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { resolveOld('profileUnavailable'); await Promise.resolve(); await Promise.resolve(); });
+    expect(JSON.stringify(view.toJSON())).not.toContain('Claude profile unavailable.');
+    await act(async () => view.unmount());
+    vi.restoreAllMocks();
+    delete (globalThis as Record<string, unknown>).localStorage;
+  });
   it('keeps the latest Claude profile response when requests finish out of order', async () => {
     const values = new Map([['claude-quota-tab', 'claude']]);
     (globalThis as Record<string, unknown>).localStorage = {

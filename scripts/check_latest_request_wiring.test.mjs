@@ -44,6 +44,15 @@ test('rejects a missing Claude profiles request generation guard', () => {
     '      const data = await backend.getClaudeProfiles();\n      if (false) return;', /success guard/);
 });
 
+test('rejects missing Claude profile refresh success and catch guards', () => {
+  rejects_change(paths.app,
+    '      const result = await backend.refreshClaudeProfileLogin(alias);\n      if (!claude_profile_refresh_generation.isCurrent(generation)) return;',
+    '      const result = await backend.refreshClaudeProfileLogin(alias);\n      if (false) return;', /success guard/);
+  rejects_change(paths.app,
+    "      if (!claude_profile_refresh_generation.isCurrent(generation)) return;\n      setClaudeProfileRefreshError({ alias, message: claudeLoginRefreshMessageFor('failed')! });",
+    "      if (false) return;\n      setClaudeProfileRefreshError({ alias, message: claudeLoginRefreshMessageFor('failed')! });", /catch guard/);
+});
+
 test('rejects a missing owner source', () => {
   const sources = read_owner_sources();
   sources.delete(paths.app);

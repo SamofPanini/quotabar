@@ -83,6 +83,10 @@ export const backend = {
     return invokeBackend<ClaudeLoginRefreshResult>('refresh_claude_login', { alias });
   },
 
+  refreshClaudeProfileLogin(alias: string) {
+    return invokeBackend<ClaudeLoginRefreshResult>('refresh_claude_login', { alias });
+  },
+
   getClaudeProfiles() {
     return invokeBackend<ClaudeProfilesResponse>('get_claude_profiles');
   },

@@ -209,6 +209,7 @@ export default function App() {
   const stopClaudeCredentialCheckRef = useRef<() => void>(() => {});
   const claude_request_generation = useLatestRequestGeneration();
   const claude_profiles_request_generation = useLatestRequestGeneration();
+  const claude_profile_refresh_generation = useLatestRequestGeneration();
 
   // Per-service connection + usage state (set via Panel callbacks)
   const [connected, setConnected] = useState<ServiceMap<boolean>>(() => defaultServiceMap(false));
@@ -806,13 +807,22 @@ export default function App() {
   const activeProvider = isProviderTab(activeView) ? activeView : lastProviderTab;
   const activeTab: TabName = activeView === 'all' ? 'all' : activeProvider;
 
+  const refreshClaudeProfileLogin = useCallback(async (alias: string) => {
+    const generation = claude_profile_refresh_generation.begin();
+    try {
+      const result = await backend.refreshClaudeProfileLogin(alias);
+      if (!claude_profile_refresh_generation.isCurrent(generation)) return;
+      setClaudeProfileRefreshError(result === 'profileUnavailable' ? { alias, message: claudeLoginRefreshMessageFor(result)! } : null);
+    } catch {
+      if (!claude_profile_refresh_generation.isCurrent(generation)) return;
+      setClaudeProfileRefreshError({ alias, message: claudeLoginRefreshMessageFor('failed')! });
+    }
+  }, [claude_profile_refresh_generation]);
+
   const refreshClaudeQuota = useCallback(async () => {
     if (activeView === 'claude' && claudeAlias !== 'default') {
       if (claudeProfiles.profiles.find((profile) => profile.alias === claudeAlias)?.status === 'disabled') return;
-      try {
-        const result = await backend.refreshClaudeLogin(claudeAlias);
-        setClaudeProfileRefreshError(result === 'profileUnavailable' ? { alias: claudeAlias, message: claudeLoginRefreshMessageFor(result)! } : null);
-      } catch { setClaudeProfileRefreshError({ alias: claudeAlias, message: claudeLoginRefreshMessageFor('failed')! }); }
+      await refreshClaudeProfileLogin(claudeAlias);
       await fetchClaudeProfiles();
       return;
     }
@@ -828,7 +838,7 @@ export default function App() {
     }
     await fetchClaudeQuota();
     await fetchClaudeProfiles();
-  }, [activeView, claudeAlias, claudeError, claudeProfiles, fetchClaudeQuota, fetchClaudeProfiles]);
+  }, [activeView, claudeAlias, claudeError, claudeProfiles, fetchClaudeQuota, fetchClaudeProfiles, refreshClaudeProfileLogin]);
 
   const handleRefresh = useCallback(() => {
     if (activeView === 'all') {
