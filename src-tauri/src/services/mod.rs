@@ -2,6 +2,7 @@ pub mod antigravity;
 pub mod claude;
 #[cfg(test)]
 mod claude_bridge;
+pub(crate) mod claude_profiles;
 pub(crate) mod claude_snapshot;
 pub(crate) mod claude_synthetic_adapter;
 #[cfg(target_os = "macos")]

@@ -30,7 +30,24 @@ struct Record {
     v: u8,
     t: String,
     provider: String,
+    #[serde(default)]
+    acct: Option<String>,
+    #[serde(default)]
+    acct_src: Option<AccountSource>,
+    #[serde(default = "default_cfg")]
+    cfg: String,
     windows: BTreeMap<String, Window>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AccountSource {
+    Credential,
+    ProfileApi,
+}
+
+fn default_cfg() -> String {
+    "default".into()
 }
 
 #[derive(Default)]
@@ -40,7 +57,7 @@ struct HistoryState {
 
 #[derive(Default)]
 struct PathHistory {
-    last: Option<Record>,
+    last: HashMap<String, Record>,
     last_pruned_at: Option<DateTime<Utc>>,
 }
 
@@ -90,11 +107,31 @@ async fn sleep_until_next_prune() {
 /// Record a successfully parsed, real 200 response. Callers deliberately pass
 /// the raw API value so the on-disk key names remain independent of UI aliases.
 pub(crate) fn record_success(data: &Value, status: reqwest::StatusCode, now: DateTime<Utc>) {
+    record_profile_success(data, status, now, "default", None, None);
+}
+
+pub(crate) fn record_profile_success(
+    data: &Value,
+    status: reqwest::StatusCode,
+    now: DateTime<Utc>,
+    cfg: &str,
+    acct: Option<&str>,
+    acct_src: Option<AccountSource>,
+) {
     let Ok(directory) = state_location::primary_state_dir() else {
         eprintln!("[QuotaHistory] state directory is unavailable");
         return;
     };
-    record_success_at_status(&directory.join(HISTORY_FILE), data, status, now);
+    if status == reqwest::StatusCode::OK {
+        record_profile_at(
+            &directory.join(HISTORY_FILE),
+            data,
+            now,
+            cfg,
+            acct,
+            acct_src,
+        );
+    }
 }
 
 fn record_success_at_status(
@@ -119,13 +156,24 @@ fn initialize_at(path: &Path) {
     state.entries.insert(
         path.to_path_buf(),
         PathHistory {
-            last: read_last_record(path),
+            last: read_last_records(path),
             last_pruned_at: None,
         },
     );
 }
 
 fn record_success_at(path: &Path, data: &Value, now: DateTime<Utc>) {
+    record_profile_at(path, data, now, "default", None, None);
+}
+
+fn record_profile_at(
+    path: &Path,
+    data: &Value,
+    now: DateTime<Utc>,
+    cfg: &str,
+    acct: Option<&str>,
+    acct_src: Option<AccountSource>,
+) {
     // This is intentionally only a tail read on first use.  Full-file prune
     // work belongs to the startup/background task above.
     initialize_at(path);
@@ -133,6 +181,9 @@ fn record_success_at(path: &Path, data: &Value, now: DateTime<Utc>) {
         v: 1,
         t: now.to_rfc3339_opts(SecondsFormat::Secs, true),
         provider: "claude".into(),
+        acct: acct.map(str::to_owned),
+        acct_src,
+        cfg: cfg.into(),
         windows: windows_from_response(data),
     };
     if record.windows.is_empty() {
@@ -142,8 +193,11 @@ fn record_success_at(path: &Path, data: &Value, now: DateTime<Utc>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = state.entries.get_mut(path).expect("history initialized");
-    let should_write = match entry.last.as_ref() {
+    let should_write = match entry.last.get(cfg) {
         None => true,
+        Some(previous) if previous.acct != record.acct || previous.acct_src != record.acct_src => {
+            true
+        }
         Some(previous) if !windows_match_for_change(&previous.windows, &record.windows) => true,
         Some(previous) => DateTime::parse_from_rfc3339(&previous.t)
             .map(|time| now - time.with_timezone(&Utc) >= HEARTBEAT_INTERVAL)
@@ -153,7 +207,9 @@ fn record_success_at(path: &Path, data: &Value, now: DateTime<Utc>) {
         return;
     }
     match append_record(path, &record) {
-        Ok(()) => entry.last = Some(record),
+        Ok(()) => {
+            entry.last.insert(cfg.into(), record);
+        }
         Err(error) => eprintln!("[QuotaHistory] append failed: {error}"),
     }
 }
@@ -270,19 +326,23 @@ fn append_record(path: &Path, record: &Record) -> Result<(), String> {
     file.flush().map_err(|error| error.to_string())
 }
 
-fn read_last_record(path: &Path) -> Option<Record> {
-    let mut file = File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    let start = length.saturating_sub(TAIL_LIMIT);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut tail = Vec::new();
-    file.read_to_end(&mut tail).ok()?;
-    let line = std::str::from_utf8(&tail)
-        .ok()?
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())?;
-    serde_json::from_str(line).ok()
+fn read_last_records(path: &Path) -> HashMap<String, Record> {
+    fn read(path: &Path) -> Option<HashMap<String, Record>> {
+        let mut file = File::open(path).ok()?;
+        let length = file.metadata().ok()?.len();
+        let start = length.saturating_sub(TAIL_LIMIT);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).ok()?;
+        let mut records = HashMap::new();
+        for line in std::str::from_utf8(&tail).ok()?.lines().rev() {
+            if let Ok(record) = serde_json::from_str::<Record>(line) {
+                records.entry(record.cfg.clone()).or_insert(record);
+            }
+        }
+        Some(records)
+    }
+    read(path).unwrap_or_default()
 }
 
 fn prune_if_due_at(path: &Path, now: DateTime<Utc>) {
@@ -390,11 +450,102 @@ mod tests {
     use std::thread;
 
     fn temporary_directory(name: &str) -> PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("quotabar-{name}-{}", std::process::id()));
+        let directory = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("quotabar-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         directory.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn profile_history_deduplicates_each_cfg_independently() {
+        let directory = temporary_directory("quota-history-profile-isolation");
+        let path = directory.join(HISTORY_FILE);
+        let now = Utc::now();
+        let data = json!({"five_hour":{"utilization":12.0}});
+        record_profile_at(
+            &path,
+            &data,
+            now,
+            "default",
+            Some("d5fb0b"),
+            Some(AccountSource::Credential),
+        );
+        record_profile_at(
+            &path,
+            &data,
+            now,
+            "lucky",
+            Some("8c6913"),
+            Some(AccountSource::ProfileApi),
+        );
+        record_profile_at(
+            &path,
+            &data,
+            now,
+            "default",
+            Some("d5fb0b"),
+            Some(AccountSource::Credential),
+        );
+        record_profile_at(
+            &path,
+            &data,
+            now,
+            "lucky",
+            Some("8c6913"),
+            Some(AccountSource::ProfileApi),
+        );
+        let contents = fs::read_to_string(path).unwrap();
+        let rows: Vec<Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["cfg"], "default");
+        assert_eq!(rows[1]["cfg"], "lucky");
+        assert_eq!(rows[0]["acct_src"], "credential");
+        assert_eq!(rows[1]["acct_src"], "profile_api");
+        assert!(serde_json::from_str::<AccountSource>("\"claude_json\"").is_err());
+    }
+
+    #[test]
+    fn legacy_history_without_cfg_is_default_baseline() {
+        let directory = temporary_directory("quota-history-legacy-profile");
+        let path = directory.join(HISTORY_FILE);
+        let now = Utc::now();
+        let data = json!({"five_hour":{"utilization":12.0}});
+        let old = json!({"v":1,"t":now.to_rfc3339(),"provider":"claude","windows":{"five_hour":{"pct":12.0,"resets_at":null}}});
+        fs::write(&path, format!("{old}\n")).unwrap();
+        record_profile_at(&path, &data, now, "default", None, None);
+        record_profile_at(&path, &data, now, "lucky", None, None);
+        assert_eq!(fs::read_to_string(path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn identity_change_and_mismatch_are_recorded_even_if_windows_match() {
+        let directory = temporary_directory("quota-history-identity-change");
+        let path = directory.join(HISTORY_FILE);
+        let now = Utc::now();
+        let data = json!({"five_hour":{"utilization":12.0}});
+        record_profile_at(
+            &path,
+            &data,
+            now,
+            "lucky",
+            Some("d5fb0b"),
+            Some(AccountSource::Credential),
+        );
+        record_profile_at(&path, &data, now, "lucky", None, None);
+        let contents = fs::read_to_string(path).unwrap();
+        let rows: Vec<Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1]["acct"].is_null());
+        assert!(rows[1]["acct_src"].is_null());
     }
 
     #[test]

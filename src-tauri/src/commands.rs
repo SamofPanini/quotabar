@@ -7,8 +7,8 @@ use crate::{
         CursorData, GrokData, QuotaData,
     },
     services::{
-        antigravity, claude, claude_snapshot, codex, codex_profiles, codex_weekly, cost, cursor,
-        grok, link, service_status, tray, tray_icon, window, window_ping,
+        antigravity, claude, claude_profiles, claude_snapshot, codex, codex_profiles, codex_weekly,
+        cost, cursor, grok, link, service_status, tray, tray_icon, window, window_ping,
     },
 };
 
@@ -23,8 +23,21 @@ pub async fn claude_credential_changed() -> Result<claude::ClaudeCredentialChang
 }
 
 #[tauri::command]
-pub async fn refresh_claude_login() -> Result<claude::ClaudeLoginRefreshResult, String> {
-    Ok(claude::refresh_claude_login().await)
+pub async fn refresh_claude_login(
+    alias: String,
+) -> Result<claude::ClaudeLoginRefreshResult, String> {
+    if alias == "default" {
+        return Ok(claude::refresh_claude_login().await);
+    }
+    match claude_profiles::resolve(&alias) {
+        Some(profile) => Ok(claude::refresh_profile_login(&profile).await),
+        None => Ok(claude::ClaudeLoginRefreshResult::Failed),
+    }
+}
+
+#[tauri::command]
+pub async fn get_claude_profiles() -> Result<claude_profiles::ProfilesResponse, String> {
+    Ok(claude_profiles::fetch_profiles().await)
 }
 
 #[tauri::command]
@@ -44,6 +57,19 @@ fn profile_for_ping(
         codex::get_codex_home().as_deref(),
     )
     .ok_or(window_ping::PingOutcome::ProfileUnavailable)
+}
+
+fn claude_profile_for_ping(
+    alias: &str,
+    resolve: impl FnOnce(&str) -> Option<claude_profiles::Profile>,
+) -> Result<Option<claude_profiles::Profile>, window_ping::PingOutcome> {
+    if alias == "default" {
+        Ok(None)
+    } else {
+        resolve(alias)
+            .map(Some)
+            .ok_or(window_ping::PingOutcome::ProfileUnavailable)
+    }
 }
 
 async fn resolve_and_ping_codex<F, Fut>(
@@ -162,6 +188,34 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn claude_ping_unavailable_alias_never_falls_back_to_default() {
+        for alias in ["unknown", "disabled"] {
+            assert!(matches!(
+                claude_profile_for_ping(alias, |_| None),
+                Err(window_ping::PingOutcome::ProfileUnavailable)
+            ));
+        }
+        assert!(matches!(
+            claude_profile_for_ping("default", |_| panic!("default must not use registry")),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn claude_ping_confirmation_preserves_selected_alias() {
+        let event = PingConfirmationEvent {
+            provider: "claude",
+            alias: "lucky".into(),
+            outcome: window_ping::PingOutcome::Confirming {
+                tokens: None,
+                expected_resets_at: 123,
+            },
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["alias"], "lucky");
+    }
 
     fn temp_root() -> std::path::PathBuf {
         // Canonicalize first: macOS temp dirs sit under the /var -> /private/var
@@ -360,18 +414,23 @@ mod tests {
 #[tauri::command]
 pub async fn ping_claude_window(
     app: AppHandle,
+    alias: String,
     force: bool,
 ) -> Result<window_ping::PingOutcome, String> {
+    let profile = match claude_profile_for_ping(&alias, claude_profiles::resolve) {
+        Ok(profile) => profile,
+        Err(outcome) => return Ok(outcome),
+    };
     Ok(route_ping_outcome(
         move |mut on_confirming| async move {
-            window_ping::ping_claude(force, &mut *on_confirming).await
+            window_ping::ping_claude(profile, force, &mut *on_confirming).await
         },
         move |outcome| {
             let _ = app.emit(
                 "ping-confirmation",
                 PingConfirmationEvent {
                     provider: "claude",
-                    alias: "default".to_string(),
+                    alias,
                     outcome,
                 },
             );

@@ -51,6 +51,8 @@ once_cell = "1.19"
 getrandom = "=0.3.4"
 subtle = "=2.6.1"
 zeroize = "=1.8.2"
+# Claude profile keychain service names use the already-locked SHA-256 primitive.
+sha2 = "=0.10.9"
 ccstats = "0.11.1"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-autostart = "2.5.1"

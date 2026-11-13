@@ -122,7 +122,7 @@ describe('Claude login recovery', () => {
       await flush();
     });
     expect(backend.pingClaudeWindow).toHaveBeenCalledTimes(1);
-    expect(backend.pingClaudeWindow).toHaveBeenCalledWith(true);
+    expect(backend.pingClaudeWindow).toHaveBeenCalledWith('default', true);
     await act(async () => renderer.unmount());
   });
 

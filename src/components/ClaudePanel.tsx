@@ -3,7 +3,7 @@ import QuotaCard from './QuotaCard';
 import ProviderDetailHeader from './ProviderDetailHeader';
 import ResetTimeline from './ResetTimeline';
 import SmartTip from './SmartTip';
-import type { QuotaData } from '../types/models';
+import type { ClaudeProfilesResponse, QuotaData } from '../types/models';
 import { formatPaceText, formatResetTime } from '../utils/quota_format';
 import { buildClaudeQuotaWindows, sortMostConstrained } from '../services/provider_summary';
 import { getHighUsageTip } from '../services/detail_helpers';
@@ -13,6 +13,9 @@ import type { ProviderServiceStatus } from '../services/service_status';
 import { formatServiceStatusDate } from '../services/service_status';
 
 interface ClaudePanelProps {
+  profiles?: ClaudeProfilesResponse;
+  selectedAlias?: string;
+  onSelectAlias?: (alias: string) => void;
   quota: QuotaData | null;
   loading: boolean;
   error: string | null;
@@ -54,22 +57,54 @@ function staleClaudeNotice(quota: QuotaData): string | null {
 }
 
 export default function ClaudePanel({
-  quota,
+  quota: defaultQuota,
+  profiles = { profiles: [] },
+  selectedAlias = 'default',
+  onSelectAlias,
   loading,
-  error,
+  error: defaultError,
   windowVisible,
   costRefreshKey,
   onRetry,
   sections = defaultPanelSections(),
   serviceStatus,
 }: ClaudePanelProps) {
+  const selected = profiles.profiles.find((profile) => profile.alias === selectedAlias);
+  const quota = selectedAlias === 'default' ? defaultQuota : selected?.status === 'mismatch' ? null : selected?.quota ?? null;
+  const error = selectedAlias === 'default' ? defaultError : null;
+  const statusLabels = {
+    disabled: 'Not enabled (directory missing)',
+    signedOut: 'Signed out',
+    expired: 'Login expired',
+    mismatch: 'Account mismatch',
+    unidentified: 'Account unidentified',
+    ok: 'Connected',
+  } as const;
   const windows = buildClaudeQuotaWindows(quota);
   const topWindow = sortMostConstrained(windows)[0];
   const staleNotice = quota ? staleClaudeNotice(quota) : null;
   const grayed = quota?.staleReason != null;
+  const appAccount = defaultQuota?.appAccount;
+  const appLabel = appAccount?.state === 'different' ? appAccount.appLabel : undefined;
+  const desktopAppLabel = profiles.profiles.find((profile) => profile.account?.tail === appLabel)?.label ?? appLabel;
 
   return (
     <>
+      {profiles.registryError && <div className="error-banner" role="alert">{profiles.registryError}</div>}
+      {profiles.profiles.length > 0 && (
+        <div className="codex-account-tabs" role="tablist" aria-label="Claude accounts">
+          {[{ alias: 'default', label: defaultQuota?.accountLabel ?? defaultQuota?.account?.email ?? defaultQuota?.account?.tail ?? 'Default' }, ...profiles.profiles].map((profile) => (
+            <button key={profile.alias} type="button" role="tab" aria-selected={selectedAlias === profile.alias}
+              className={`codex-account-tab ${selectedAlias === profile.alias ? 'selected' : ''}`}
+              onClick={() => onSelectAlias?.(profile.alias)}>{profile.label}</button>
+          ))}
+        </div>
+      )}
+      {selected && <div className="claude-stale-notice">{statusLabels[selected.status]}{selected.status === 'signedOut' && selected.expectedServiceName ? ` · ${selected.expectedServiceName}` : ''}</div>}
+      {selectedAlias === 'default' && defaultQuota?.connected && !defaultQuota.account && <div className="claude-stale-notice">Account unidentified</div>}
+      {selectedAlias === 'default' && defaultQuota?.appAccount?.state === 'different' && (
+        <div className="claude-stale-notice">Desktop app is signed in as {desktopAppLabel}; this view shows {defaultQuota.accountLabel ?? defaultQuota.account?.email ?? defaultQuota.account?.tail}.</div>
+      )}
       {loading && !quota && (
         <div className="loading-state">Loading Claude quota...</div>
       )}
@@ -181,13 +216,13 @@ export default function ClaudePanel({
 
           {sections.timeline && <ResetTimeline windows={windows} />}
 
-          {sections.cost && windowVisible && (
+          {sections.cost && windowVisible && selectedAlias === 'default' && (
             <CostSummarySection source="claude" refreshKey={costRefreshKey} showTrend={sections.trend} />
           )}
         </div>
       )}
 
-      {!quota && !loading && (
+      {!quota && !loading && selected?.status !== 'disabled' && selected?.status !== 'mismatch' && (
         <div className="empty-state">
           <p>Unable to load quota data</p>
           <button type="button" onClick={onRetry} className="retry-btn">

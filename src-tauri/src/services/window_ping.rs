@@ -543,7 +543,11 @@ fn claude_process_probe_command() -> Command {
 /// Runs the Claude child after the caller has acquired `ClaudeFlight` and
 /// completed all automatic-renewal safety checks.
 pub(crate) async fn run_claude_renewal_ping() -> bool {
-    let Ok(command) = build_claude_command() else {
+    run_claude_renewal_ping_for(None).await
+}
+
+pub(crate) async fn run_claude_renewal_ping_for(config_dir: Option<&str>) -> bool {
+    let Ok(command) = build_claude_command(config_dir) else {
         return false;
     };
     matches!(
@@ -554,6 +558,24 @@ pub(crate) async fn run_claude_renewal_ping() -> bool {
 
 fn other_claude_process_running_from_exit(exit_code: Option<i32>) -> bool {
     exit_code != Some(1)
+}
+
+async fn run_claude_if_idle<P, PF, R, RF>(
+    _profile_key: Option<String>,
+    probe: P,
+    run: R,
+) -> PingOutcome
+where
+    P: FnOnce() -> PF,
+    PF: Future<Output = bool>,
+    R: FnOnce() -> RF,
+    RF: Future<Output = PingOutcome>,
+{
+    if probe().await {
+        PingOutcome::Busy
+    } else {
+        run().await
+    }
 }
 
 pub(crate) enum ChildResult {
@@ -731,7 +753,7 @@ fn build_codex_command(profile: &CodexProfile) -> Result<Command, PingOutcome> {
     Ok(command)
 }
 
-fn build_claude_command() -> Result<Command, PingOutcome> {
+fn build_claude_command(config_dir: Option<&str>) -> Result<Command, PingOutcome> {
     let Some(binary) = claude_cli() else {
         return Err(PingOutcome::CliNotFound { cli: "claude" });
     };
@@ -740,26 +762,43 @@ fn build_claude_command() -> Result<Command, PingOutcome> {
             code: "spawnFailed",
         });
     };
-    let mut command = clean_command(&binary, &cwd, None);
-    // PING1: multi-account = CLAUDE_CONFIG_DIR per profile; gated on Claude multi-account acquisition
-    command.args(claude_args());
-    Ok(command)
+    Ok(build_claude_command_for(&binary, &cwd, config_dir))
 }
 
-pub(crate) fn build_claude_auth_status_command() -> Result<Command, PingOutcome> {
-    let Some(binary) = claude_cli() else {
-        return Err(PingOutcome::CliNotFound { cli: "claude" });
-    };
-    let Ok(cwd) = ping_cwd() else {
-        return Err(PingOutcome::CliFailed {
-            code: "spawnFailed",
-        });
-    };
-    Ok(build_claude_auth_status_command_for(&binary, &cwd))
-}
-
-fn build_claude_auth_status_command_for(binary: &Path, cwd: &Path) -> Command {
+fn build_claude_command_for(binary: &Path, cwd: &Path, config_dir: Option<&str>) -> Command {
     let mut command = clean_command(binary, cwd, None);
+    if let Some(dir) = config_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    command.args(claude_args());
+    command
+}
+
+pub(crate) fn build_claude_auth_status_command(
+    config_dir: Option<&str>,
+) -> Result<Command, PingOutcome> {
+    let Some(binary) = claude_cli() else {
+        return Err(PingOutcome::CliNotFound { cli: "claude" });
+    };
+    let Ok(cwd) = ping_cwd() else {
+        return Err(PingOutcome::CliFailed {
+            code: "spawnFailed",
+        });
+    };
+    Ok(build_claude_auth_status_command_for(
+        &binary, &cwd, config_dir,
+    ))
+}
+
+fn build_claude_auth_status_command_for(
+    binary: &Path,
+    cwd: &Path,
+    config_dir: Option<&str>,
+) -> Command {
+    let mut command = clean_command(binary, cwd, None);
+    if let Some(dir) = config_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
     command
         .args(["auth", "status", "--json"])
         .stdin(Stdio::null())
@@ -993,19 +1032,66 @@ pub async fn ping_codex(
 }
 
 pub async fn ping_claude(
+    profile: Option<crate::services::claude_profiles::Profile>,
     force: bool,
     on_confirming: &mut (dyn FnMut(PingOutcome) + Send),
 ) -> PingOutcome {
     let Some(_flight) = ClaudeFlight::acquire() else {
         return PingOutcome::Busy;
     };
-    let mut quota_reader = || Box::pin(claude::fetch_quota()) as CoreFuture<_>;
-    let mut renewal_needed = || Box::pin(claude::login_renewal_needed()) as CoreFuture<_>;
-    let mut after_renew = claude::invalidate_login_state;
+    let profile_key = profile.as_ref().map(|profile| profile.config_dir.clone());
+    run_claude_if_idle(
+        profile_key,
+        || async {
+            tauri::async_runtime::spawn_blocking(other_claude_process_running)
+                .await
+                .unwrap_or(true)
+        },
+        || ping_claude_after_probe(profile, force, on_confirming),
+    )
+    .await
+}
+
+async fn ping_claude_after_probe(
+    profile: Option<crate::services::claude_profiles::Profile>,
+    force: bool,
+    on_confirming: &mut (dyn FnMut(PingOutcome) + Send),
+) -> PingOutcome {
+    let quota_profile = profile.clone();
+    let mut quota_reader = move || {
+        let profile = quota_profile.clone();
+        Box::pin(async move {
+            match profile {
+                None => claude::fetch_quota().await,
+                Some(profile) => claude::fetch_profile(&profile, &std::collections::HashMap::new())
+                    .await
+                    .quota
+                    .unwrap_or_else(|| {
+                        crate::domain::models::QuotaData::disconnected("Profile unavailable")
+                    }),
+            }
+        }) as CoreFuture<_>
+    };
+    let renewal_profile = profile.clone();
+    let mut renewal_needed = move || {
+        let profile = renewal_profile.clone();
+        Box::pin(async move {
+            match profile {
+                None => claude::login_renewal_needed().await,
+                Some(profile) => claude::profile_login_renewal_needed(&profile).await,
+            }
+        }) as CoreFuture<_>
+    };
+    let after_profile = profile.clone();
+    let mut after_renew = move || match &after_profile {
+        None => claude::invalidate_login_state(),
+        Some(profile) => claude::invalidate_profile_login_state(profile),
+    };
     let clock = now_secs;
     let mut runner =
         |command| Box::pin(run_child_without_blocking(command, CLI_TIMEOUT)) as CoreFuture<_>;
-    let mut command_builder = build_claude_command;
+    let mut command_builder =
+        move || build_claude_command(profile.as_ref().map(|p| p.config_dir.as_str()));
     let mut sleeper = |delay| Box::pin(sleep_without_blocking_runtime(delay)) as CoreFuture<_>;
     ping_claude_core(
         force,
@@ -1030,6 +1116,60 @@ fn session_reset_epoch(session: &crate::domain::models::UsageInfo) -> Option<i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_commands_preserve_profile_environment_without_setting_default() {
+        let cli = Path::new("/synthetic/claude");
+        let cwd = Path::new("/synthetic");
+        for command in [
+            build_claude_command_for(cli, cwd, None),
+            build_claude_auth_status_command_for(cli, cwd, None),
+        ] {
+            assert!(!command
+                .get_envs()
+                .any(|(key, _)| key == "CLAUDE_CONFIG_DIR"));
+        }
+        for command in [
+            build_claude_command_for(cli, cwd, Some("/tmp/claude//lucky")),
+            build_claude_auth_status_command_for(cli, cwd, Some("/tmp/claude//lucky")),
+        ] {
+            let env = command
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CONFIG_DIR")
+                .and_then(|(_, value)| value);
+            assert_eq!(env, Some(std::ffi::OsStr::new("/tmp/claude//lucky")));
+        }
+    }
+
+    #[test]
+    fn lucky_process_blocks_default_send() {
+        let sends = std::cell::Cell::new(0);
+        let result = tauri::async_runtime::block_on(run_claude_if_idle(
+            None,
+            || async { true },
+            || async {
+                sends.set(sends.get() + 1);
+                PingOutcome::QuotaUnreadable
+            },
+        ));
+        assert_eq!(result, PingOutcome::Busy);
+        assert_eq!(sends.get(), 0);
+    }
+
+    #[test]
+    fn default_process_blocks_lucky_send() {
+        let sends = std::cell::Cell::new(0);
+        let result = tauri::async_runtime::block_on(run_claude_if_idle(
+            Some("/tmp/claude-lucky".into()),
+            || async { true },
+            || async {
+                sends.set(sends.get() + 1);
+                PingOutcome::QuotaUnreadable
+            },
+        ));
+        assert_eq!(result, PingOutcome::Busy);
+        assert_eq!(sends.get(), 0);
+    }
     use crate::domain::models::{CodexRateLimits, UsageInfo};
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -1083,7 +1223,7 @@ mod tests {
     }
 
     fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "quotabar-ping-{name}-{}-{}-{}",
             std::process::id(),
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -2391,7 +2531,7 @@ mod tests {
         let cwd = root.join("cwd");
         fs::create_dir_all(&cwd).unwrap();
         let cli = fake_cli(&root, "claude", "exit 0");
-        let command = build_claude_auth_status_command_for(&cli, &cwd);
+        let command = build_claude_auth_status_command_for(&cli, &cwd, None);
 
         assert_eq!(command.get_program(), cli.as_os_str());
         assert_eq!(

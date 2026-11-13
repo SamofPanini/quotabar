@@ -142,6 +142,20 @@ afterAll(() => {
 });
 
 describe('App ping result and provider refresh isolation', () => {
+  it('sends the selected Claude profile alias to Ping', async () => {
+    const customQuota = { connected: true, session: { used: 0, limit: 100, percentage: 0, resetTime: null },
+      weeklyTotal: null, weeklyOpus: null, weeklySonnet: null, weeklyDesign: null,
+      weeklyFable5: null, error: null, account: { tail: '8c6913', email: 'lucky@example.test' } };
+    vi.spyOn(backend, 'getClaudeProfiles').mockResolvedValue({ profiles: [{
+      alias: 'lucky', label: 'Lucky', status: 'ok', account: { tail: '8c6913', email: 'lucky@example.test' },
+      quota: customQuota as unknown as import('../src/types/models').QuotaData,
+    }] });
+    const renderer = await renderApp();
+    await act(async () => { accountTab(renderer, 'Lucky').props.onClick(); await flush(); });
+    await act(async () => { pingButton(renderer).props.onClick(); await flush(); });
+    expect(backend.pingClaudeWindow).toHaveBeenCalledWith('lucky', false);
+    await act(async () => renderer.unmount());
+  });
   it('syncs service-status defaults and both settings toggles to the backend', async () => {
     const renderer = await renderApp();
     expect(backend.setServiceStatusPrefs).toHaveBeenCalledWith(true, true);

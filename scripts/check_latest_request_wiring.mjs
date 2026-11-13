@@ -5,6 +5,17 @@ const owner_configs = [
   {
     path: 'src/App.tsx',
     component_name: 'App',
+    function_name: 'fetchClaudeProfiles',
+    owner_name: 'claude_profiles_request_generation',
+    backend_methods: ['getClaudeProfiles'],
+    loading: false,
+    await_kind: 'direct',
+    target_scope: 'component',
+    backend_arguments: { getClaudeProfiles: [] },
+  },
+  {
+    path: 'src/App.tsx',
+    component_name: 'App',
     function_name: 'fetchClaudeQuota',
     owner_name: 'claude_request_generation',
     backend_methods: ['getQuota'],

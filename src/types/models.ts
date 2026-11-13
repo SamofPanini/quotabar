@@ -6,6 +6,9 @@ export interface UsageInfo {
 }
 
 export interface QuotaData {
+  account?: ClaudeAccount | null;
+  accountLabel?: string;
+  appAccount?: { state: 'same' | 'unknown' } | { state: 'different'; appLabel: string };
   connected: boolean;
   session?: UsageInfo;
   weeklyTotal?: UsageInfo;
@@ -18,6 +21,18 @@ export interface QuotaData {
   autoRenew?: 'pending' | 'sent' | 'skipped';
   error?: string;
 }
+
+export interface ClaudeAccount { tail: string; email: string | null }
+export type ClaudeProfileStatus = 'disabled' | 'signedOut' | 'expired' | 'mismatch' | 'unidentified' | 'ok';
+export interface ClaudeProfile {
+  alias: string;
+  label: string;
+  status: ClaudeProfileStatus;
+  account: ClaudeAccount | null;
+  quota: QuotaData | null;
+  expectedServiceName?: string;
+}
+export interface ClaudeProfilesResponse { profiles: ClaudeProfile[]; registryError?: string }
 
 export type ClaudeLoginRefreshResult = 'refreshed' | 'unchanged' | 'failed' | 'signedOut';
 

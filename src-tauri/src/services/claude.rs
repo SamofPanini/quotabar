@@ -1,6 +1,9 @@
-use crate::domain::models::{ClaudeAutoRenewStatus, ClaudeStaleReason, QuotaData, UsageInfo};
+use crate::domain::models::{
+    ClaudeAppAccount, ClaudeAutoRenewStatus, ClaudeStaleReason, QuotaData, UsageInfo,
+};
 use crate::services::http::{is_transient_os_error, shared_http_client};
 use serde::Serialize;
+use std::collections::HashMap;
 #[cfg(not(test))]
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -11,8 +14,195 @@ use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+#[derive(serde::Deserialize)]
+struct DesktopAccountFile {
+    #[serde(rename = "lastKnownAccountUuid")]
+    last_known_account_uuid: Option<String>,
+}
+
+fn uuid_tail(value: &str) -> Option<String> {
+    let uuid = uuid::Uuid::parse_str(value).ok()?;
+    let full = uuid.simple().to_string();
+    Some(full[full.len() - 6..].to_string())
+}
+
+fn desktop_account_tail_from_content(content: Result<&str, ()>) -> Result<String, &'static str> {
+    let content = content.map_err(|_| "missing")?;
+    let parsed: DesktopAccountFile = serde_json::from_str(content).map_err(|_| "parse")?;
+    let uuid = parsed.last_known_account_uuid.ok_or("noKey")?;
+    uuid_tail(&uuid).ok_or("notUuid")
+}
+
+fn desktop_account_status(
+    default_tail: Option<&str>,
+    labels: &HashMap<String, String>,
+) -> ClaudeAppAccount {
+    let path =
+        dirs::home_dir().map(|home| home.join("Library/Application Support/Claude/config.json"));
+    let content = path.and_then(|path| std::fs::read_to_string(path).ok());
+    desktop_account_status_from(default_tail, labels, content.as_deref().ok_or(()))
+}
+
+fn desktop_account_status_from(
+    default_tail: Option<&str>,
+    labels: &HashMap<String, String>,
+    content: Result<&str, ()>,
+) -> ClaudeAppAccount {
+    match desktop_account_tail_from_content(content) {
+        Ok(tail) => match default_tail {
+            Some(default) if default == tail => ClaudeAppAccount::Same,
+            Some(_) => ClaudeAppAccount::Different {
+                app_label: labels.get(&tail).cloned().unwrap_or(tail),
+            },
+            None => ClaudeAppAccount::Unknown,
+        },
+        Err(reason) => {
+            static REASONS: OnceLock<Mutex<std::collections::HashSet<&'static str>>> =
+                OnceLock::new();
+            let mut seen = REASONS
+                .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seen.insert(reason) {
+                log_msg(&format!("[Claude] app account: unknown ({reason})"));
+            }
+            ClaudeAppAccount::Unknown
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ClaudeConfigIdentity {
+    #[serde(rename = "oauthAccount")]
+    oauth_account: Option<ClaudeConfigAccount>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClaudeConfigAccount {
+    #[serde(rename = "accountUuid")]
+    account_uuid: Option<String>,
+}
+
+fn cross_check_identity(config_dir: Option<&str>, identity: &Identity) -> bool {
+    let path = match config_dir {
+        Some(dir) => std::path::PathBuf::from(dir).join(".claude.json"),
+        None => match dirs::home_dir() {
+            Some(home) => home.join(".claude.json"),
+            None => return false,
+        },
+    };
+    cross_check_identity_from(std::fs::read_to_string(path).ok().as_deref(), identity)
+}
+
+fn cross_check_identity_from(content: Option<&str>, identity: &Identity) -> bool {
+    let saved = content
+        .and_then(|content| serde_json::from_str::<ClaudeConfigIdentity>(content).ok())
+        .and_then(|config| config.oauth_account?.account_uuid)
+        .and_then(|value| uuid::Uuid::parse_str(&value).ok());
+    match (saved, uuid::Uuid::parse_str(&identity.uuid).ok()) {
+        (Some(saved), Some(found)) => saved != found,
+        _ => false,
+    }
+}
+
+async fn resolve_identity(
+    state: &ProfileState,
+    credentials: &CachedCredentials,
+) -> Option<Identity> {
+    resolve_identity_with(state, credentials, Instant::now(), || {
+        fetch_profile_identity(&credentials.access_token)
+    })
+    .await
+}
+
+async fn resolve_identity_with<F, Fut>(
+    state: &ProfileState,
+    credentials: &CachedCredentials,
+    now: Instant,
+    fetch: F,
+) -> Option<Identity>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<Identity>>,
+{
+    if let Some(identity) = &credentials.identity {
+        return Some(identity.clone());
+    }
+    {
+        let mut cache = state.identity_cache.lock().ok()?;
+        if let Some(previous) = cache.as_ref() {
+            if previous.expires_at_ms == credentials.expires_at_ms
+                && previous.service == credentials.service
+                && (previous.identity.is_some()
+                    || now.saturating_duration_since(previous.attempted_at)
+                        < Duration::from_secs(600))
+            {
+                return previous.identity.clone();
+            }
+        }
+        *cache = Some(IdentityCache {
+            expires_at_ms: credentials.expires_at_ms,
+            service: credentials.service.clone(),
+            attempted_at: now,
+            identity: None,
+        });
+    }
+    let identity = fetch().await;
+    if let Ok(mut cache) = state.identity_cache.lock() {
+        if let Some(entry) = cache.as_mut() {
+            if entry.expires_at_ms == credentials.expires_at_ms
+                && entry.service == credentials.service
+            {
+                entry.identity = identity.clone();
+            }
+        }
+    }
+    identity
+}
+
+async fn fetch_profile_identity(access_token: &str) -> Option<Identity> {
+    let response = match shared_http_client() {
+        Ok(client) => client
+            .get("https://api.anthropic.com/api/oauth/profile")
+            .header("Accept", "application/json")
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("User-Agent", "claude-code/1.0.0")
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .ok(),
+        Err(_) => None,
+    };
+    if let Some(response) = response {
+        if response.status().is_success() {
+            response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|value| {
+                    let account = value.get("account")?;
+                    let uuid = account.get("uuid")?.as_str()?;
+                    uuid_tail(uuid)?;
+                    Some(Identity {
+                        uuid: uuid.to_string(),
+                        email: account
+                            .get("email")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                        source: crate::services::quota_history::AccountSource::ProfileApi,
+                    })
+                })
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
 
 const TOKEN_CACHE_TTL: Duration = Duration::from_secs(300);
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(120);
@@ -43,27 +233,67 @@ const FABLE5_QUOTA_KEYS: [&str; 5] = [
 ];
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static LAST_REQUEST_TIME: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-static LAST_AUTO_RENEW_ATTEMPT_MS: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
-static LAST_MANUAL_RENEW_ATTEMPT_MS: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
-static SIGNED_OUT_MARK: OnceLock<Mutex<Option<Option<u64>>>> = OnceLock::new();
 static CLAUDE_AUTO_RENEW_ENABLED: AtomicBool = AtomicBool::new(true);
-static AUTO_PING_HISTORY: OnceLock<Mutex<Option<AutoPingAttempt>>> = OnceLock::new();
+
+#[derive(Default)]
+struct ProfileState {
+    last_request_time: Mutex<Option<Instant>>,
+    last_auto_renew_attempt_ms: Mutex<Option<u64>>,
+    last_manual_renew_attempt_ms: Mutex<Option<u64>>,
+    signed_out_mark: Mutex<Option<Option<u64>>>,
+    auto_ping_history: Mutex<Option<AutoPingAttempt>>,
+    credentials_cache: Mutex<Option<CachedCredentials>>,
+    quota_cache: Mutex<Option<CachedQuota>>,
+    last_successful_quota: Mutex<Option<LastSuccessfulQuota>>,
+    request_gate_state: Mutex<RequestGateState>,
+    identity_cache: Mutex<Option<IdentityCache>>,
+}
+
+#[derive(Clone)]
+struct Identity {
+    uuid: String,
+    email: Option<String>,
+    source: crate::services::quota_history::AccountSource,
+}
+
+struct IdentityCache {
+    expires_at_ms: Option<u64>,
+    service: String,
+    attempted_at: Instant,
+    identity: Option<Identity>,
+}
+
+fn default_state() -> &'static Arc<ProfileState> {
+    static STATE: OnceLock<Arc<ProfileState>> = OnceLock::new();
+    STATE.get_or_init(|| Arc::new(ProfileState::default()))
+}
+
+fn profile_state(key: &str) -> Arc<ProfileState> {
+    static STATES: OnceLock<Mutex<HashMap<String, Arc<ProfileState>>>> = OnceLock::new();
+    if key == "default" {
+        return Arc::clone(default_state());
+    }
+    let mut states = STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(states.entry(key.to_owned()).or_default())
+}
 
 fn last_request_time() -> &'static Mutex<Option<Instant>> {
-    LAST_REQUEST_TIME.get_or_init(|| Mutex::new(None))
+    &default_state().last_request_time
 }
 
 fn last_auto_renew_attempt_ms() -> &'static Mutex<Option<u64>> {
-    LAST_AUTO_RENEW_ATTEMPT_MS.get_or_init(|| Mutex::new(None))
+    &default_state().last_auto_renew_attempt_ms
 }
 
 fn last_manual_renew_attempt_ms() -> &'static Mutex<Option<u64>> {
-    LAST_MANUAL_RENEW_ATTEMPT_MS.get_or_init(|| Mutex::new(None))
+    &default_state().last_manual_renew_attempt_ms
 }
 
 fn signed_out_mark() -> &'static Mutex<Option<Option<u64>>> {
-    SIGNED_OUT_MARK.get_or_init(|| Mutex::new(None))
+    &default_state().signed_out_mark
 }
 
 #[derive(Clone, Copy)]
@@ -73,7 +303,7 @@ struct AutoPingAttempt {
 }
 
 fn auto_ping_history() -> &'static Mutex<Option<AutoPingAttempt>> {
-    AUTO_PING_HISTORY.get_or_init(|| Mutex::new(None))
+    &default_state().auto_ping_history
 }
 
 pub(crate) fn set_auto_renew_enabled(enabled: bool) {
@@ -191,12 +421,12 @@ struct CachedCredentials {
     access_token: String,
     cached_at: Instant,
     expires_at_ms: Option<u64>,
+    service: String,
+    identity: Option<Identity>,
 }
 
-static CREDENTIALS_CACHE: OnceLock<Mutex<Option<CachedCredentials>>> = OnceLock::new();
-
 fn credentials_cache() -> &'static Mutex<Option<CachedCredentials>> {
-    CREDENTIALS_CACHE.get_or_init(|| Mutex::new(None))
+    &default_state().credentials_cache
 }
 
 struct CachedQuota {
@@ -210,16 +440,12 @@ struct LastSuccessfulQuota {
     recorded_at: String,
 }
 
-static QUOTA_CACHE: OnceLock<Mutex<Option<CachedQuota>>> = OnceLock::new();
-
 fn quota_cache() -> &'static Mutex<Option<CachedQuota>> {
-    QUOTA_CACHE.get_or_init(|| Mutex::new(None))
+    &default_state().quota_cache
 }
 
-static LAST_SUCCESSFUL_QUOTA: OnceLock<Mutex<Option<LastSuccessfulQuota>>> = OnceLock::new();
-
 fn last_successful_quota() -> &'static Mutex<Option<LastSuccessfulQuota>> {
-    LAST_SUCCESSFUL_QUOTA.get_or_init(|| Mutex::new(None))
+    &default_state().last_successful_quota
 }
 
 /// A remembered "401 after a forced re-read". Only the credential's expiry is
@@ -235,10 +461,8 @@ struct RequestGateState {
     rate_limited_until: Option<u64>,
 }
 
-static REQUEST_GATE_STATE: OnceLock<Mutex<RequestGateState>> = OnceLock::new();
-
 fn request_gate_state() -> &'static Mutex<RequestGateState> {
-    REQUEST_GATE_STATE.get_or_init(|| Mutex::new(RequestGateState::default()))
+    &default_state().request_gate_state
 }
 
 fn now_epoch_ms() -> u64 {
@@ -445,39 +669,84 @@ struct KeychainCredentials {
     access_token: String,
     expires_at_ms: Option<u64>,
     cred_name: String,
+    identity: Option<Identity>,
 }
 
 #[cfg(target_os = "macos")]
 fn read_credentials_from_system() -> Result<KeychainCredentials, String> {
-    let username = std::env::var("USER").unwrap_or_default();
+    read_credentials_for_system(None)
+}
 
-    for cred_name in CREDENTIAL_NAMES {
-        // Use -a $USER to match the exact keychain entry that Claude Code CLI uses
+#[cfg(target_os = "macos")]
+fn read_credentials_for_system(config_dir: Option<&str>) -> Result<KeychainCredentials, String> {
+    let username = std::env::var("USER").unwrap_or_default();
+    if config_dir.is_some() && username.is_empty() {
+        return Err("OAuth token not found".into());
+    }
+    read_credentials_with(config_dir, |cred_name| {
         let mut args = vec!["find-generic-password"];
         if !username.is_empty() {
             args.extend(["-a", &username]);
         }
         args.extend(["-s", cred_name, "-w"]);
+        let output = Command::new("security").args(&args).output().ok()?;
+        output.status.success().then_some(output.stdout)
+    })
+}
 
-        let output = Command::new("security").args(&args).output();
+fn read_credentials_with(
+    config_dir: Option<&str>,
+    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> Result<KeychainCredentials, String> {
+    let names: Vec<String> = match config_dir {
+        Some(dir) => vec![crate::services::claude_profiles::credential_service_name(
+            dir,
+        )],
+        None => CREDENTIAL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+    };
+    for cred_name in names {
+        if let Some(bytes) = read(&cred_name) {
+            let creds_json = String::from_utf8_lossy(&bytes).trim().to_string();
+            if creds_json.is_empty() {
+                continue;
+            }
 
-        if let Ok(result) = output {
-            if result.status.success() {
-                let creds_json = String::from_utf8_lossy(&result.stdout).trim().to_string();
-                if creds_json.is_empty() {
-                    continue;
-                }
-
-                if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_json) {
-                    let oauth = &creds["claudeAiOauth"];
-                    if let Some(access_token) = oauth["accessToken"].as_str() {
-                        let expires_at_ms = oauth["expiresAt"].as_u64();
-                        return Ok(KeychainCredentials {
-                            access_token: access_token.to_string(),
-                            expires_at_ms,
-                            cred_name: cred_name.to_string(),
-                        });
+            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_json) {
+                let oauth = &creds["claudeAiOauth"];
+                if let Some(access_token) = oauth["accessToken"].as_str() {
+                    if access_token.is_empty() && config_dir.is_some() {
+                        continue;
                     }
+                    let expires_at_ms = oauth["expiresAt"].as_u64();
+                    let token_account = oauth.get("tokenAccount");
+                    static LOG_TOKEN_ACCOUNT: OnceLock<()> = OnceLock::new();
+                    LOG_TOKEN_ACCOUNT.get_or_init(|| {
+                        log_msg(&format!(
+                            "[OAuth] tokenAccount present: {}",
+                            token_account.is_some()
+                        ));
+                    });
+                    let identity = token_account.and_then(|account| {
+                        let uuid = account.get("uuid")?.as_str()?;
+                        uuid_tail(uuid)?;
+                        Some(Identity {
+                            uuid: uuid.to_string(),
+                            email: account
+                                .get("emailAddress")
+                                .and_then(|email| email.as_str())
+                                .map(str::to_owned),
+                            source: crate::services::quota_history::AccountSource::Credential,
+                        })
+                    });
+                    return Ok(KeychainCredentials {
+                        access_token: access_token.to_string(),
+                        expires_at_ms,
+                        cred_name,
+                        identity,
+                    });
                 }
             }
         }
@@ -493,6 +762,11 @@ fn read_credentials_from_system() -> Result<KeychainCredentials, String> {
     Err(format!(
         "OAuth token not configured for this OS. Set {CLAUDE_TOKEN_ENV_KEY}."
     ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_credentials_for_system(_config_dir: Option<&str>) -> Result<KeychainCredentials, String> {
+    read_credentials_from_system()
 }
 
 struct RedactedCredential<'a> {
@@ -586,12 +860,16 @@ fn get_oauth_credentials(force_refresh: bool) -> Result<CachedCredentials, Strin
                 access_token: token.clone(),
                 cached_at: Instant::now(),
                 expires_at_ms: None,
+                service: "env".into(),
+                identity: None,
             });
         }
         return Ok(CachedCredentials {
             access_token: token,
             cached_at: Instant::now(),
             expires_at_ms: None,
+            service: "env".into(),
+            identity: None,
         });
     }
 
@@ -608,17 +886,38 @@ fn get_oauth_credentials(force_refresh: bool) -> Result<CachedCredentials, Strin
             access_token: keychain.access_token.clone(),
             cached_at: Instant::now(),
             expires_at_ms: keychain.expires_at_ms,
+            service: keychain.cred_name.clone(),
+            identity: keychain.identity.clone(),
         });
     }
     Ok(CachedCredentials {
         access_token: keychain.access_token,
         cached_at: Instant::now(),
         expires_at_ms: keychain.expires_at_ms,
+        service: keychain.cred_name,
+        identity: keychain.identity,
     })
 }
 
 async fn request_quota(access_token: &str) -> Result<reqwest::Response, String> {
-    let (count, gap) = track_request();
+    request_quota_for(access_token, default_state()).await
+}
+
+async fn request_quota_for(
+    access_token: &str,
+    state: &ProfileState,
+) -> Result<reqwest::Response, String> {
+    let (count, gap) = if std::ptr::eq(state, default_state().as_ref()) {
+        track_request()
+    } else {
+        let count = REQUEST_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let gap = state.last_request_time.lock().ok().and_then(|mut value| {
+            let gap = value.map(|time| time.elapsed().as_secs_f64());
+            *value = Some(Instant::now());
+            gap
+        });
+        (count, gap)
+    };
     log_msg(&request_quota_diagnostic(access_token, count, gap));
 
     let start = Instant::now();
@@ -1146,7 +1445,7 @@ fn renew_attempt_due(attempts: &'static Mutex<Option<u64>>, now_ms: u64, interva
 /// Runs `claude auth status --json` and keeps only its `loggedIn` boolean.
 /// The caller must already hold the `ClaudeFlight`.
 async fn auth_status_logged_in() -> Result<Option<bool>, &'static str> {
-    let command = match crate::services::window_ping::build_claude_auth_status_command() {
+    let command = match crate::services::window_ping::build_claude_auth_status_command(None) {
         Ok(command) => command,
         Err(crate::services::window_ping::PingOutcome::CliNotFound { .. }) => {
             return Err("cli_not_found");
@@ -1327,7 +1626,7 @@ pub async fn fetch_quota() -> QuotaData {
     )
     .await;
 
-    auto_renew_expired_quota_core(
+    let mut result = auto_renew_expired_quota_core(
         quota,
         CLAUDE_AUTO_RENEW_ENABLED.load(Ordering::Relaxed),
         chrono::Utc::now().timestamp(),
@@ -1358,7 +1657,43 @@ pub async fn fetch_quota() -> QuotaData {
         || Box::pin(fetch_quota_once()),
         invalidate_login_state,
     )
-    .await
+    .await;
+    let credentials = credentials_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.clone());
+    if result.connected {
+        if let Some(credentials) = credentials {
+            let identity = resolve_identity(default_state(), &credentials).await;
+            if identity
+                .as_ref()
+                .is_some_and(|identity| cross_check_identity(None, identity))
+            {
+                return QuotaData::disconnected("Claude account mismatch");
+            }
+            let tail = identity
+                .as_ref()
+                .and_then(|identity| uuid_tail(&identity.uuid));
+            result.account = identity.as_ref().and_then(|identity| {
+                Some(crate::domain::models::ClaudeAccount {
+                    tail: uuid_tail(&identity.uuid)?,
+                    email: identity.email.clone(),
+                })
+            });
+            let labels = crate::services::claude_profiles::load()
+                .map(|registry| registry.labels)
+                .unwrap_or_default();
+            result.account_label = result.account.as_ref().map(|account| {
+                labels
+                    .get(&account.tail)
+                    .cloned()
+                    .or_else(|| account.email.clone())
+                    .unwrap_or_else(|| account.tail.clone())
+            });
+            result.app_account = Some(desktop_account_status(tail.as_deref(), &labels));
+        }
+    }
+    result
 }
 
 async fn fetch_quota_once() -> QuotaData {
@@ -1404,17 +1739,18 @@ async fn fetch_quota_once() -> QuotaData {
         return cached;
     }
 
-    let credentials = match tauri::async_runtime::spawn_blocking(|| read_credentials(false)).await {
-        Ok(Ok(credentials)) => credentials,
-        Ok(Err(error)) => {
-            log_msg(&format!("[Quota] credential read failed: {error}"));
-            return credential_error_or_disconnected(error);
-        }
-        Err(error) => {
-            log_msg(&format!("[Quota] oauth token task failed: {error}"));
-            return QuotaData::disconnected(format!("OAuth token task failed: {error}"));
-        }
-    };
+    let mut credentials =
+        match tauri::async_runtime::spawn_blocking(|| read_credentials(false)).await {
+            Ok(Ok(credentials)) => credentials,
+            Ok(Err(error)) => {
+                log_msg(&format!("[Quota] credential read failed: {error}"));
+                return credential_error_or_disconnected(error);
+            }
+            Err(error) => {
+                log_msg(&format!("[Quota] oauth token task failed: {error}"));
+                return QuotaData::disconnected(format!("OAuth token task failed: {error}"));
+            }
+        };
 
     let (auth_failure, rate_limited_until) = gate_snapshot();
     let gate = quota_request_gate(
@@ -1521,6 +1857,7 @@ async fn fetch_quota_once() -> QuotaData {
             };
             return stale_login_or_disconnected(reason, message.to_string());
         }
+        credentials = fresh_credentials;
     }
 
     let final_status = response.status();
@@ -1572,7 +1909,7 @@ async fn fetch_quota_once() -> QuotaData {
         );
     }
 
-    let result = QuotaData::connected(
+    let mut result = QuotaData::connected(
         session,
         weekly_total,
         weekly_opus,
@@ -1581,9 +1918,706 @@ async fn fetch_quota_once() -> QuotaData {
         weekly_fable5,
     );
 
-    crate::services::quota_history::record_success(&data, final_status, chrono::Utc::now());
+    let identity = resolve_identity(default_state(), &credentials).await;
+    let mismatch = identity
+        .as_ref()
+        .is_some_and(|identity| cross_check_identity(None, identity));
+    let tail = identity
+        .as_ref()
+        .and_then(|identity| uuid_tail(&identity.uuid));
+    let labels = crate::services::claude_profiles::load()
+        .map(|registry| registry.labels)
+        .unwrap_or_default();
+    result.app_account = Some(desktop_account_status(
+        if mismatch { None } else { tail.as_deref() },
+        &labels,
+    ));
+    if mismatch {
+        crate::services::quota_history::record_profile_success(
+            &data,
+            final_status,
+            chrono::Utc::now(),
+            "default",
+            None,
+            None,
+        );
+        return QuotaData::disconnected("Claude account mismatch");
+    }
+    result.account = identity.as_ref().and_then(|identity| {
+        Some(crate::domain::models::ClaudeAccount {
+            tail: uuid_tail(&identity.uuid)?,
+            email: identity.email.clone(),
+        })
+    });
+    result.account_label = result.account.as_ref().map(|account| {
+        labels
+            .get(&account.tail)
+            .cloned()
+            .or_else(|| account.email.clone())
+            .unwrap_or_else(|| account.tail.clone())
+    });
+    crate::services::quota_history::record_profile_success(
+        &data,
+        final_status,
+        chrono::Utc::now(),
+        "default",
+        tail.as_deref(),
+        identity.as_ref().map(|identity| identity.source),
+    );
     save_quota_cache(&result);
     result
+}
+
+fn custom_credentials(
+    profile: &crate::services::claude_profiles::Profile,
+    state: &ProfileState,
+    force: bool,
+) -> Result<CachedCredentials, String> {
+    if !force {
+        if let Some(cached) = state
+            .credentials_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.clone())
+        {
+            if cached.cached_at.elapsed() < TOKEN_CACHE_TTL {
+                return Ok(cached);
+            }
+        }
+    }
+    let keychain = read_credentials_for_system(Some(&profile.config_dir))?;
+    let credentials = CachedCredentials {
+        access_token: keychain.access_token,
+        cached_at: Instant::now(),
+        expires_at_ms: keychain.expires_at_ms,
+        service: keychain.cred_name,
+        identity: keychain.identity,
+    };
+    if let Ok(mut mark) = state.signed_out_mark.lock() {
+        if mark
+            .as_ref()
+            .is_some_and(|saved| *saved != credentials.expires_at_ms)
+        {
+            *mark = None;
+        }
+    }
+    if let Ok(mut cache) = state.credentials_cache.lock() {
+        let changed = cache.as_ref().is_some_and(|old| {
+            old.expires_at_ms != credentials.expires_at_ms || old.service != credentials.service
+        });
+        if changed {
+            if let Ok(mut quota) = state.quota_cache.lock() {
+                *quota = None;
+            }
+            if let Ok(mut last) = state.last_successful_quota.lock() {
+                *last = None;
+            }
+            if let Ok(mut gate) = state.request_gate_state.lock() {
+                gate.auth_failure = None;
+            }
+        }
+        *cache = Some(credentials.clone());
+    }
+    Ok(credentials)
+}
+
+pub(crate) fn invalidate_profile_login_state(profile: &crate::services::claude_profiles::Profile) {
+    let state = profile_state(&profile.config_dir);
+    if let Ok(mut value) = state.credentials_cache.lock() {
+        *value = None;
+    }
+    if let Ok(mut value) = state.quota_cache.lock() {
+        *value = None;
+    }
+    if let Ok(mut value) = state.request_gate_state.lock() {
+        value.auth_failure = None;
+    }
+}
+
+pub(crate) async fn profile_login_renewal_needed(
+    profile: &crate::services::claude_profiles::Profile,
+) -> bool {
+    let state = profile_state(&profile.config_dir);
+    let input = profile.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        custom_credentials(&input, &state, true)
+            .ok()
+            .is_some_and(|c| {
+                let signed_out = state
+                    .signed_out_mark
+                    .lock()
+                    .ok()
+                    .is_some_and(|mark| *mark == Some(c.expires_at_ms));
+                let auth_failed = state.request_gate_state.lock().ok().is_some_and(|gate| {
+                    gate.auth_failure
+                        .is_some_and(|failure| failure.expires_at_ms == c.expires_at_ms)
+                });
+                !signed_out
+                    && (auth_failed
+                        || c.expires_at_ms.is_some_and(|expiry| {
+                            expiry <= now_epoch_ms().saturating_add(EXPIRY_SAFETY_WINDOW_MS)
+                        }))
+            })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+pub(crate) async fn refresh_profile_login(
+    profile: &crate::services::claude_profiles::Profile,
+) -> ClaudeLoginRefreshResult {
+    let state = profile_state(&profile.config_dir);
+    let input_before = profile.clone();
+    let before_state = Arc::clone(&state);
+    let before = match tauri::async_runtime::spawn_blocking(move || {
+        custom_credentials(&input_before, &before_state, false)
+    })
+    .await
+    {
+        Ok(Ok(credentials)) => credentials.expires_at_ms,
+        _ => return ClaudeLoginRefreshResult::SignedOut,
+    };
+    let input = profile.clone();
+    let refreshed_state = Arc::clone(&state);
+    let after = match tauri::async_runtime::spawn_blocking(move || {
+        custom_credentials(&input, &refreshed_state, true)
+    })
+    .await
+    {
+        Ok(Ok(credentials)) => credentials.expires_at_ms,
+        _ => return ClaudeLoginRefreshResult::SignedOut,
+    };
+    let result = login_refresh_result(before, after, now_epoch_ms());
+    if result == ClaudeLoginRefreshResult::Refreshed {
+        invalidate_profile_login_state(profile);
+        return result;
+    }
+    if !after.is_some_and(|expiry| expiry <= now_epoch_ms().saturating_add(EXPIRY_SAFETY_WINDOW_MS))
+    {
+        return result;
+    }
+    let now = now_epoch_ms();
+    {
+        let Ok(mut last) = state.last_manual_renew_attempt_ms.lock() else {
+            return result;
+        };
+        if last.is_some_and(|last| now.saturating_sub(last) < MANUAL_RENEW_INTERVAL_MS) {
+            return result;
+        }
+        *last = Some(now);
+    }
+    let Some(_flight) = crate::services::window_ping::ClaudeFlight::acquire() else {
+        return result;
+    };
+    if tauri::async_runtime::spawn_blocking(
+        crate::services::window_ping::other_claude_process_running,
+    )
+    .await
+    .unwrap_or(true)
+    {
+        return result;
+    }
+    let Ok(command) =
+        crate::services::window_ping::build_claude_auth_status_command(Some(&profile.config_dir))
+    else {
+        return result;
+    };
+    if let crate::services::window_ping::ChildResult::Success(stdout) =
+        crate::services::window_ping::run_claude_auth_status_without_blocking(
+            command,
+            Duration::from_secs(10),
+        )
+        .await
+    {
+        if parse_auth_status_logged_in(&stdout) == Some(false) {
+            if let Ok(mut mark) = state.signed_out_mark.lock() {
+                *mark = Some(after);
+            }
+            return ClaudeLoginRefreshResult::SignedOut;
+        }
+    }
+    result
+}
+
+async fn auto_renew_profile(
+    profile: &crate::services::claude_profiles::Profile,
+    state: &ProfileState,
+    credentials: &CachedCredentials,
+) -> bool {
+    let sent = auto_renew_profile_with(
+        state,
+        credentials.expires_at_ms,
+        now_epoch_ms(),
+        CLAUDE_AUTO_RENEW_ENABLED.load(Ordering::Relaxed),
+        || async {
+            tauri::async_runtime::spawn_blocking(
+                crate::services::window_ping::other_claude_process_running,
+            )
+            .await
+            .unwrap_or(true)
+        },
+        || async {
+            let Ok(command) = crate::services::window_ping::build_claude_auth_status_command(Some(
+                &profile.config_dir,
+            )) else {
+                return false;
+            };
+            match crate::services::window_ping::run_claude_auth_status_without_blocking(
+                command,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                crate::services::window_ping::ChildResult::Success(stdout) => {
+                    parse_auth_status_logged_in(&stdout) == Some(true)
+                }
+                _ => false,
+            }
+        },
+        || crate::services::window_ping::run_claude_renewal_ping_for(Some(&profile.config_dir)),
+    )
+    .await;
+    if sent {
+        invalidate_profile_login_state(profile);
+    }
+    sent
+}
+
+async fn auto_renew_profile_with<P, PF, A, AF, R, RF>(
+    state: &ProfileState,
+    expires_at_ms: Option<u64>,
+    now: u64,
+    enabled: bool,
+    probe: P,
+    auth: A,
+    run: R,
+) -> bool
+where
+    P: FnOnce() -> PF,
+    PF: Future<Output = bool>,
+    A: FnOnce() -> AF,
+    AF: Future<Output = bool>,
+    R: FnOnce() -> RF,
+    RF: Future<Output = bool>,
+{
+    if !enabled {
+        return false;
+    }
+    {
+        let Ok(mut last) = state.last_auto_renew_attempt_ms.lock() else {
+            return false;
+        };
+        if last.is_some_and(|last| now.saturating_sub(last) < AUTO_RENEW_INTERVAL_MS) {
+            return false;
+        }
+        *last = Some(now);
+    }
+    let Some(_flight) = crate::services::window_ping::ClaudeFlight::acquire() else {
+        return false;
+    };
+    if probe().await {
+        return false;
+    }
+    if !auth().await {
+        return false;
+    }
+    {
+        let Ok(mut history) = state.auto_ping_history.lock() else {
+            return false;
+        };
+        if history.as_ref().is_some_and(|entry| {
+            entry.expires_at_ms == expires_at_ms
+                || now.saturating_sub(entry.attempted_at_ms) < 30 * 60 * 1_000
+        }) {
+            return false;
+        }
+        *history = Some(AutoPingAttempt {
+            expires_at_ms,
+            attempted_at_ms: now,
+        });
+    }
+    run().await
+}
+
+async fn profile_preflight_with<F, Fut>(
+    enabled: bool,
+    read: F,
+) -> Result<CachedCredentials, &'static str>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<CachedCredentials, ()>>,
+{
+    if !enabled {
+        return Err("disabled");
+    }
+    read().await.map_err(|_| "signedOut")
+}
+
+type ProfileFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+struct ProfileUsage {
+    status: reqwest::StatusCode,
+    retry_after: u64,
+    data: Option<serde_json::Value>,
+}
+
+trait ProfileIo: Sync {
+    fn enabled(&self, profile: &crate::services::claude_profiles::Profile) -> bool;
+    fn now_ms(&self) -> u64;
+    fn credentials<'a>(
+        &'a self,
+        profile: &'a crate::services::claude_profiles::Profile,
+        state: Arc<ProfileState>,
+        force: bool,
+    ) -> ProfileFuture<'a, Result<CachedCredentials, ()>>;
+    fn identity<'a>(
+        &'a self,
+        state: &'a ProfileState,
+        credentials: &'a CachedCredentials,
+    ) -> ProfileFuture<'a, Option<Identity>>;
+    fn mismatch(
+        &self,
+        profile: &crate::services::claude_profiles::Profile,
+        identity: &Identity,
+    ) -> bool;
+    fn usage<'a>(
+        &'a self,
+        credentials: &'a CachedCredentials,
+        state: &'a ProfileState,
+    ) -> ProfileFuture<'a, Result<ProfileUsage, String>>;
+    fn renew<'a>(
+        &'a self,
+        profile: &'a crate::services::claude_profiles::Profile,
+        state: &'a ProfileState,
+        credentials: &'a CachedCredentials,
+    ) -> ProfileFuture<'a, bool>;
+    fn record(
+        &self,
+        data: &serde_json::Value,
+        status: reqwest::StatusCode,
+        alias: &str,
+        tail: Option<&str>,
+        source: Option<crate::services::quota_history::AccountSource>,
+    );
+}
+
+struct SystemProfileIo;
+impl ProfileIo for SystemProfileIo {
+    fn enabled(&self, profile: &crate::services::claude_profiles::Profile) -> bool {
+        crate::services::claude_profiles::directory_enabled(profile)
+    }
+    fn now_ms(&self) -> u64 {
+        now_epoch_ms()
+    }
+    fn credentials<'a>(
+        &'a self,
+        profile: &'a crate::services::claude_profiles::Profile,
+        state: Arc<ProfileState>,
+        force: bool,
+    ) -> ProfileFuture<'a, Result<CachedCredentials, ()>> {
+        let profile = profile.clone();
+        Box::pin(async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                custom_credentials(&profile, &state, force)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(())
+        })
+    }
+    fn identity<'a>(
+        &'a self,
+        state: &'a ProfileState,
+        credentials: &'a CachedCredentials,
+    ) -> ProfileFuture<'a, Option<Identity>> {
+        Box::pin(resolve_identity(state, credentials))
+    }
+    fn mismatch(
+        &self,
+        profile: &crate::services::claude_profiles::Profile,
+        identity: &Identity,
+    ) -> bool {
+        cross_check_identity(Some(&profile.config_dir), identity)
+    }
+    fn usage<'a>(
+        &'a self,
+        credentials: &'a CachedCredentials,
+        state: &'a ProfileState,
+    ) -> ProfileFuture<'a, Result<ProfileUsage, String>> {
+        Box::pin(async move {
+            let response = request_quota_for(&credentials.access_token, state).await?;
+            let status = response.status();
+            let retry_after = retry_after_secs(response.headers().get("retry-after"));
+            let data = if status.is_success() {
+                Some(
+                    response
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|_| "Failed to parse response".to_string())?,
+                )
+            } else {
+                None
+            };
+            Ok(ProfileUsage {
+                status,
+                retry_after,
+                data,
+            })
+        })
+    }
+    fn renew<'a>(
+        &'a self,
+        profile: &'a crate::services::claude_profiles::Profile,
+        state: &'a ProfileState,
+        credentials: &'a CachedCredentials,
+    ) -> ProfileFuture<'a, bool> {
+        Box::pin(auto_renew_profile(profile, state, credentials))
+    }
+    fn record(
+        &self,
+        data: &serde_json::Value,
+        status: reqwest::StatusCode,
+        alias: &str,
+        tail: Option<&str>,
+        source: Option<crate::services::quota_history::AccountSource>,
+    ) {
+        crate::services::quota_history::record_profile_success(
+            data,
+            status,
+            chrono::Utc::now(),
+            alias,
+            tail,
+            source,
+        );
+    }
+}
+
+pub(crate) async fn fetch_profile(
+    profile: &crate::services::claude_profiles::Profile,
+    labels: &HashMap<String, String>,
+) -> crate::services::claude_profiles::PublicProfile {
+    fetch_profile_with(profile, labels, &SystemProfileIo).await
+}
+
+async fn fetch_profile_with(
+    profile: &crate::services::claude_profiles::Profile,
+    labels: &HashMap<String, String>,
+    io: &dyn ProfileIo,
+) -> crate::services::claude_profiles::PublicProfile {
+    use crate::services::claude_profiles::{credential_service_name, PublicProfile};
+    let mut public = PublicProfile {
+        alias: profile.alias.clone(),
+        label: profile.alias.clone(),
+        status: "ok",
+        account: None,
+        quota: None,
+        expected_service_name: None,
+    };
+    let state = profile_state(&profile.config_dir);
+    let credentials_state = Arc::clone(&state);
+    let force_refresh = state
+        .request_gate_state
+        .lock()
+        .ok()
+        .is_some_and(|gate| gate.auth_failure.is_some());
+    let credentials = match profile_preflight_with(io.enabled(profile), || {
+        io.credentials(profile, credentials_state, force_refresh)
+    })
+    .await
+    {
+        Ok(credentials) => credentials,
+        Err(status) => {
+            public.status = status;
+            if status == "signedOut" {
+                public.expected_service_name = Some(credential_service_name(&profile.config_dir));
+            }
+            return public;
+        }
+    };
+    let now = io.now_ms();
+    if credentials
+        .expires_at_ms
+        .is_some_and(|expiry| expiry <= now)
+    {
+        public.status = "expired";
+        if io.renew(profile, &state, &credentials).await {
+            return Box::pin(fetch_profile_with(profile, labels, io)).await;
+        }
+        return public;
+    }
+    let identity = io.identity(&state, &credentials).await;
+    let mismatch = identity
+        .as_ref()
+        .is_some_and(|identity| io.mismatch(profile, identity));
+    if mismatch {
+        public.status = "mismatch";
+    }
+    let active_limit = state
+        .request_gate_state
+        .lock()
+        .ok()
+        .and_then(|gate| gate.rate_limited_until)
+        .is_some_and(|until| now < until);
+    if active_limit {
+        if !mismatch {
+            public.quota = Some(QuotaData::disconnected("API error: 429 Too Many Requests"));
+        }
+        return public;
+    }
+    let blocked_auth = state
+        .request_gate_state
+        .lock()
+        .ok()
+        .and_then(|gate| gate.auth_failure)
+        .is_some_and(|failure| failure.expires_at_ms == credentials.expires_at_ms);
+    if blocked_auth {
+        if !mismatch {
+            public.quota = Some(QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE));
+        }
+        return public;
+    }
+    let cached = state.quota_cache.lock().ok().and_then(|cache| {
+        cache
+            .as_ref()
+            .filter(|entry| entry.cached_at.elapsed() < QUOTA_CACHE_TTL)
+            .map(|entry| entry.data.clone())
+    });
+    if let Some(mut quota) = cached.filter(|_| !mismatch) {
+        public.account = identity.as_ref().and_then(|identity| {
+            Some(crate::domain::models::ClaudeAccount {
+                tail: uuid_tail(&identity.uuid)?,
+                email: identity.email.clone(),
+            })
+        });
+        quota.account = public.account.clone();
+        public.status = if public.account.is_some() {
+            "ok"
+        } else {
+            "unidentified"
+        };
+        if let Some(account) = &public.account {
+            public.label = labels
+                .get(&account.tail)
+                .cloned()
+                .unwrap_or_else(|| profile.alias.clone());
+        }
+        public.quota = Some(quota);
+        return public;
+    }
+    let response = match io.usage(&credentials, &state).await {
+        Ok(response) => response,
+        Err(error) => {
+            if !mismatch {
+                public.quota = Some(QuotaData::disconnected(error));
+            }
+            return public;
+        }
+    };
+    let status = response.status;
+    if is_auth_error(status) {
+        if let Ok(mut gate) = state.request_gate_state.lock() {
+            gate.auth_failure = Some(AuthFailure {
+                expires_at_ms: credentials.expires_at_ms,
+            });
+        }
+        if !mismatch {
+            public.quota = Some(QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE));
+        }
+        return public;
+    }
+    if is_rate_limited(status) {
+        let until = rate_limited_until(now, response.retry_after);
+        if let Ok(mut gate) = state.request_gate_state.lock() {
+            gate.rate_limited_until = Some(until);
+        }
+    }
+    if !status.is_success() {
+        if !mismatch {
+            public.quota = Some(QuotaData::disconnected(format!("API error: {status}")));
+        }
+        return public;
+    }
+    let data = match response.data {
+        Some(data) => data,
+        None => {
+            if !mismatch {
+                public.quota = Some(QuotaData::disconnected("Failed to parse response"));
+            }
+            return public;
+        }
+    };
+    let session = parse_quota_window(&data["five_hour"]);
+    let weekly_total = parse_quota_window(&data["seven_day"]);
+    let weekly_opus = parse_quota_window(&data["seven_day_opus"]);
+    let weekly_sonnet = parse_quota_window(&data["seven_day_sonnet"]);
+    let weekly_design = parse_quota_window(&data["seven_day_omelette"]);
+    let weekly_fable5 = parse_first_quota_window(&data, &FABLE5_QUOTA_KEYS)
+        .or_else(|| parse_weekly_scoped_model_quota(&data, "Fable"));
+    if session.is_none()
+        && weekly_total.is_none()
+        && weekly_opus.is_none()
+        && weekly_sonnet.is_none()
+        && weekly_design.is_none()
+        && weekly_fable5.is_none()
+    {
+        if !mismatch {
+            public.quota = Some(QuotaData::disconnected(
+                "Failed to parse response: no numeric quota utilization fields",
+            ));
+        }
+        return public;
+    }
+    if mismatch {
+        public.status = "mismatch";
+        io.record(&data, status, &profile.alias, None, None);
+        return public;
+    }
+    let account = identity.as_ref().and_then(|identity| {
+        Some(crate::domain::models::ClaudeAccount {
+            tail: uuid_tail(&identity.uuid)?,
+            email: identity.email.clone(),
+        })
+    });
+    if let Some(account) = &account {
+        public.label = labels
+            .get(&account.tail)
+            .cloned()
+            .unwrap_or_else(|| profile.alias.clone());
+    } else {
+        public.status = "unidentified";
+    }
+    let mut quota = QuotaData::connected(
+        session,
+        weekly_total,
+        weekly_opus,
+        weekly_sonnet,
+        weekly_design,
+        weekly_fable5,
+    );
+    quota.account = account.clone();
+    io.record(
+        &data,
+        status,
+        &profile.alias,
+        account.as_ref().map(|a| a.tail.as_str()),
+        identity.as_ref().map(|i| i.source),
+    );
+    if let Ok(mut cache) = state.quota_cache.lock() {
+        *cache = Some(CachedQuota {
+            data: quota.clone(),
+            cached_at: Instant::now(),
+        });
+    }
+    if let Ok(mut last) = state.last_successful_quota.lock() {
+        *last = Some(LastSuccessfulQuota {
+            data: quota.clone(),
+            recorded_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        });
+    }
+    public.account = account;
+    public.quota = Some(quota);
+    public
 }
 
 #[cfg(test)]
@@ -1611,8 +2645,570 @@ mod tests {
     const SENTINEL_TOKEN: &str = "secret-prefix-sensitive-value-secret-suffix";
     static AUTO_RENEW_TEST_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 
+    struct FakeProfileIo {
+        enabled: bool,
+        has_credentials: bool,
+        identity: Option<super::Identity>,
+        mismatch: bool,
+        expires_at_ms: Option<u64>,
+        usage_percent: f64,
+        reads: std::sync::atomic::AtomicUsize,
+        usages: std::sync::atomic::AtomicUsize,
+        records: Mutex<
+            Vec<(
+                Option<String>,
+                Option<crate::services::quota_history::AccountSource>,
+            )>,
+        >,
+    }
+
+    impl super::ProfileIo for FakeProfileIo {
+        fn enabled(&self, _: &crate::services::claude_profiles::Profile) -> bool {
+            self.enabled
+        }
+        fn now_ms(&self) -> u64 {
+            100
+        }
+        fn credentials<'a>(
+            &'a self,
+            _: &'a crate::services::claude_profiles::Profile,
+            _: Arc<super::ProfileState>,
+            _: bool,
+        ) -> super::ProfileFuture<'a, Result<super::CachedCredentials, ()>> {
+            Box::pin(async move {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self.has_credentials {
+                    return Err(());
+                }
+                Ok(super::CachedCredentials {
+                    access_token: "fixture".into(),
+                    cached_at: std::time::Instant::now(),
+                    expires_at_ms: self.expires_at_ms,
+                    service: "fixture".into(),
+                    identity: self.identity.clone(),
+                })
+            })
+        }
+        fn identity<'a>(
+            &'a self,
+            _: &'a super::ProfileState,
+            _: &'a super::CachedCredentials,
+        ) -> super::ProfileFuture<'a, Option<super::Identity>> {
+            Box::pin(async move { self.identity.clone() })
+        }
+        fn mismatch(
+            &self,
+            _: &crate::services::claude_profiles::Profile,
+            _: &super::Identity,
+        ) -> bool {
+            self.mismatch
+        }
+        fn usage<'a>(
+            &'a self,
+            _: &'a super::CachedCredentials,
+            _: &'a super::ProfileState,
+        ) -> super::ProfileFuture<'a, Result<super::ProfileUsage, String>> {
+            Box::pin(async move {
+                self.usages
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(super::ProfileUsage {
+                    status: reqwest::StatusCode::OK,
+                    retry_after: 300,
+                    data: Some(
+                        json!({"five_hour":{"utilization":self.usage_percent,"resets_at":null}}),
+                    ),
+                })
+            })
+        }
+        fn renew<'a>(
+            &'a self,
+            _: &'a crate::services::claude_profiles::Profile,
+            _: &'a super::ProfileState,
+            _: &'a super::CachedCredentials,
+        ) -> super::ProfileFuture<'a, bool> {
+            Box::pin(async { false })
+        }
+        fn record(
+            &self,
+            _: &Value,
+            _: reqwest::StatusCode,
+            _: &str,
+            tail: Option<&str>,
+            source: Option<crate::services::quota_history::AccountSource>,
+        ) {
+            self.records
+                .lock()
+                .unwrap()
+                .push((tail.map(str::to_owned), source));
+        }
+    }
+
+    fn fake_profile_io() -> FakeProfileIo {
+        FakeProfileIo {
+            enabled: true,
+            has_credentials: true,
+            identity: Some(super::Identity {
+                uuid: "7fd160a2-6103-4038-9fa1-000000d5fb0b".into(),
+                email: Some("fixture@example.test".into()),
+                source: crate::services::quota_history::AccountSource::Credential,
+            }),
+            mismatch: false,
+            expires_at_ms: Some(10_000),
+            usage_percent: 37.0,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            usages: std::sync::atomic::AtomicUsize::new(0),
+            records: Mutex::new(vec![]),
+        }
+    }
+
+    fn fake_profile(path: &str) -> crate::services::claude_profiles::Profile {
+        crate::services::claude_profiles::Profile {
+            alias: "lucky".into(),
+            config_dir: path.into(),
+        }
+    }
+
+    #[test]
+    fn profile_orchestration_distinguishes_disabled_and_signed_out() {
+        let mut io = fake_profile_io();
+        io.enabled = false;
+        let profile = fake_profile("/fixture/disabled-orchestration");
+        let disabled = tauri::async_runtime::block_on(super::fetch_profile_with(
+            &profile,
+            &std::collections::HashMap::new(),
+            &io,
+        ));
+        assert_eq!(disabled.status, "disabled");
+        assert_eq!(io.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        io.enabled = true;
+        io.has_credentials = false;
+        let signed_out = tauri::async_runtime::block_on(super::fetch_profile_with(
+            &profile,
+            &std::collections::HashMap::new(),
+            &io,
+        ));
+        assert_eq!(signed_out.status, "signedOut");
+        assert_eq!(io.usages.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn profile_orchestration_hides_mismatch_and_records_no_identity() {
+        let mut io = fake_profile_io();
+        io.mismatch = true;
+        let profile = fake_profile("/fixture/mismatch-orchestration");
+        let result = tauri::async_runtime::block_on(super::fetch_profile_with(
+            &profile,
+            &std::collections::HashMap::new(),
+            &io,
+        ));
+        assert_eq!(result.status, "mismatch");
+        assert!(result.quota.is_none());
+        assert_eq!(*io.records.lock().unwrap(), vec![(None, None)]);
+    }
+
+    #[test]
+    fn profile_orchestration_keeps_unidentified_quota_without_identity() {
+        let mut io = fake_profile_io();
+        io.identity = None;
+        io.mismatch = true;
+        let profile = fake_profile("/fixture/unidentified-orchestration");
+        let result = tauri::async_runtime::block_on(super::fetch_profile_with(
+            &profile,
+            &std::collections::HashMap::new(),
+            &io,
+        ));
+        assert_eq!(result.status, "unidentified");
+        assert!(result.quota.unwrap().session.is_some());
+        assert_eq!(*io.records.lock().unwrap(), vec![(None, None)]);
+    }
+
+    #[test]
+    fn profile_orchestration_expires_before_usage() {
+        let mut io = fake_profile_io();
+        io.expires_at_ms = Some(99);
+        let profile = fake_profile("/fixture/expired-orchestration");
+        let result = tauri::async_runtime::block_on(super::fetch_profile_with(
+            &profile,
+            &std::collections::HashMap::new(),
+            &io,
+        ));
+        assert_eq!(result.status, "expired");
+        assert_eq!(io.usages.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn profile_orchestration_never_reuses_another_profiles_quota_or_identity() {
+        let io_a = fake_profile_io();
+        let mut io_b = fake_profile_io();
+        io_b.usage_percent = 82.0;
+        io_b.identity.as_mut().unwrap().uuid = "7fd160a2-6103-4038-9fa1-0000008c6913".into();
+        let a = fake_profile("/fixture/isolation-a");
+        let b = fake_profile("/fixture/isolation-b");
+        let labels = std::collections::HashMap::from([("8c6913".into(), "Lucky".into())]);
+        let result_a =
+            tauri::async_runtime::block_on(super::fetch_profile_with(&a, &labels, &io_a));
+        let result_b =
+            tauri::async_runtime::block_on(super::fetch_profile_with(&b, &labels, &io_b));
+        assert_eq!(result_a.account.unwrap().tail, "d5fb0b");
+        assert_eq!(result_b.account.unwrap().tail, "8c6913");
+        assert_eq!(result_a.quota.unwrap().session.unwrap().percentage, 37.0);
+        assert_eq!(result_b.quota.unwrap().session.unwrap().percentage, 82.0);
+        assert_eq!(result_a.label, "lucky");
+        assert_eq!(result_b.label, "Lucky");
+    }
+
     fn auto_renew_test_lock() -> &'static Mutex<()> {
         AUTO_RENEW_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn profile_credentials_cache_is_isolated() {
+        let a = super::profile_state("test-credentials-a");
+        let b = super::profile_state("test-credentials-b");
+        *a.credentials_cache.lock().unwrap() = Some(super::CachedCredentials {
+            access_token: "test".into(),
+            cached_at: std::time::Instant::now(),
+            expires_at_ms: Some(123),
+            service: "test".into(),
+            identity: None,
+        });
+        assert!(b.credentials_cache.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_quota_cache_is_isolated() {
+        let a = super::profile_state("test-quota-a");
+        let b = super::profile_state("test-quota-b");
+        *a.quota_cache.lock().unwrap() = Some(super::CachedQuota {
+            data: QuotaData::disconnected("a"),
+            cached_at: std::time::Instant::now(),
+        });
+        assert!(b.quota_cache.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_last_successful_quota_is_isolated() {
+        let a = super::profile_state("test-last-a");
+        let b = super::profile_state("test-last-b");
+        *a.last_successful_quota.lock().unwrap() = Some(LastSuccessfulQuota {
+            data: QuotaData::disconnected("a"),
+            recorded_at: "a".into(),
+        });
+        assert!(b.last_successful_quota.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_signed_out_mark_is_isolated() {
+        let a = super::profile_state("test-signed-a");
+        let b = super::profile_state("test-signed-b");
+        *a.signed_out_mark.lock().unwrap() = Some(Some(1));
+        assert!(b.signed_out_mark.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_auto_renew_throttle_is_isolated() {
+        let a = super::profile_state("test-auto-a");
+        let b = super::profile_state("test-auto-b");
+        *a.last_auto_renew_attempt_ms.lock().unwrap() = Some(1);
+        assert!(b.last_auto_renew_attempt_ms.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_manual_renew_throttle_is_isolated() {
+        let a = super::profile_state("test-manual-a");
+        let b = super::profile_state("test-manual-b");
+        *a.last_manual_renew_attempt_ms.lock().unwrap() = Some(1);
+        assert!(b.last_manual_renew_attempt_ms.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_request_time_is_isolated() {
+        let a = super::profile_state("test-time-a");
+        let b = super::profile_state("test-time-b");
+        *a.last_request_time.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(b.last_request_time.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_request_gate_is_isolated() {
+        let a = super::profile_state("test-gate-a");
+        let b = super::profile_state("test-gate-b");
+        a.request_gate_state.lock().unwrap().rate_limited_until = Some(1);
+        assert!(b
+            .request_gate_state
+            .lock()
+            .unwrap()
+            .rate_limited_until
+            .is_none());
+    }
+
+    #[test]
+    fn profile_auto_ping_history_is_isolated() {
+        let a = super::profile_state("test-ping-a");
+        let b = super::profile_state("test-ping-b");
+        *a.auto_ping_history.lock().unwrap() = Some(AutoPingAttempt {
+            expires_at_ms: None,
+            attempted_at_ms: 1,
+        });
+        assert!(b.auto_ping_history.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn disabled_profile_does_not_read_keychain() {
+        let calls = Cell::new(0);
+        let result =
+            tauri::async_runtime::block_on(super::profile_preflight_with(false, || async {
+                calls.set(calls.get() + 1);
+                Err(())
+            }));
+        assert_eq!(result.err(), Some("disabled"));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn custom_keychain_lookup_uses_exact_single_service_without_default_fallback() {
+        let mut names = Vec::new();
+        let result = super::read_credentials_with(Some("/Users/sam/.claude-acct-lucky"), |name| {
+            names.push(name.to_owned());
+            None
+        });
+        assert!(result.is_err());
+        assert_eq!(names, vec!["Claude Code-credentials-2becd79b"]);
+    }
+
+    #[test]
+    fn default_keychain_lookup_keeps_four_candidates_in_order() {
+        let mut names = Vec::new();
+        let result = super::read_credentials_with(None, |name| {
+            names.push(name.to_owned());
+            None
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+            super::CREDENTIAL_NAMES.to_vec()
+        );
+    }
+
+    #[test]
+    fn keychain_token_account_is_the_preferred_identity() {
+        let json = br#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":123,"tokenAccount":{"uuid":"7fd160a2-6103-4038-9fa1-000000d5fb0b","emailAddress":"fixture@example.test"}}}"#;
+        let result = super::read_credentials_with(Some("/tmp/test"), |_| Some(json.to_vec()))
+            .ok()
+            .unwrap();
+        let identity = result.identity.unwrap();
+        assert_eq!(super::uuid_tail(&identity.uuid).as_deref(), Some("d5fb0b"));
+        assert_eq!(identity.email.as_deref(), Some("fixture@example.test"));
+        assert_eq!(
+            identity.source,
+            crate::services::quota_history::AccountSource::Credential
+        );
+    }
+
+    #[test]
+    fn missing_profile_credentials_is_signed_out_not_disabled() {
+        let calls = Cell::new(0);
+        let result =
+            tauri::async_runtime::block_on(super::profile_preflight_with(true, || async {
+                calls.set(calls.get() + 1);
+                Err(())
+            }));
+        assert_eq!(result.err(), Some("signedOut"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn profile_auto_renew_sends_at_most_once_per_expiry() {
+        let _guard = auto_renew_test_lock().lock().unwrap();
+        let state = super::ProfileState::default();
+        let sends = Cell::new(0);
+        let run = |now| {
+            tauri::async_runtime::block_on(super::auto_renew_profile_with(
+                &state,
+                Some(42),
+                now,
+                true,
+                || async { false },
+                || async { true },
+                || async {
+                    sends.set(sends.get() + 1);
+                    true
+                },
+            ))
+        };
+        assert!(run(1));
+        assert!(!run(1 + super::AUTO_RENEW_INTERVAL_MS));
+        assert_eq!(sends.get(), 1);
+    }
+
+    #[test]
+    fn profile_auto_renew_process_probe_blocks_send() {
+        let _guard = auto_renew_test_lock().lock().unwrap();
+        let state = super::ProfileState::default();
+        let sends = Cell::new(0);
+        let result = tauri::async_runtime::block_on(super::auto_renew_profile_with(
+            &state,
+            Some(42),
+            1,
+            true,
+            || async { true },
+            || async { true },
+            || async {
+                sends.set(sends.get() + 1);
+                true
+            },
+        ));
+        assert!(!result);
+        assert_eq!(sends.get(), 0);
+    }
+
+    #[test]
+    fn identity_profile_api_failure_is_not_retried_until_timeout_or_credential_change() {
+        let state = super::ProfileState::default();
+        let mut credentials = super::CachedCredentials {
+            access_token: "fixture".into(),
+            cached_at: std::time::Instant::now(),
+            expires_at_ms: Some(1),
+            service: "test".into(),
+            identity: None,
+        };
+        let now = std::time::Instant::now();
+        let calls = Cell::new(0);
+        let invoke = |credentials: &super::CachedCredentials, at| {
+            tauri::async_runtime::block_on(super::resolve_identity_with(
+                &state,
+                credentials,
+                at,
+                || async {
+                    calls.set(calls.get() + 1);
+                    None
+                },
+            ))
+        };
+        assert!(invoke(&credentials, now).is_none());
+        assert!(invoke(&credentials, now + Duration::from_secs(599)).is_none());
+        assert_eq!(calls.get(), 1);
+        assert!(invoke(&credentials, now + Duration::from_secs(600)).is_none());
+        assert_eq!(calls.get(), 2);
+        credentials.expires_at_ms = Some(2);
+        assert!(invoke(&credentials, now + Duration::from_secs(601)).is_none());
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn identity_profile_api_success_is_cached_until_credential_changes() {
+        let state = super::ProfileState::default();
+        let mut credentials = super::CachedCredentials {
+            access_token: "fixture".into(),
+            cached_at: std::time::Instant::now(),
+            expires_at_ms: Some(1),
+            service: "first".into(),
+            identity: None,
+        };
+        let calls = Cell::new(0);
+        let now = std::time::Instant::now();
+        let invoke = |credentials: &super::CachedCredentials, at| {
+            tauri::async_runtime::block_on(super::resolve_identity_with(
+                &state,
+                credentials,
+                at,
+                || async {
+                    calls.set(calls.get() + 1);
+                    Some(super::Identity {
+                        uuid: "7fd160a2-6103-4038-9fa1-000000d5fb0b".into(),
+                        email: None,
+                        source: crate::services::quota_history::AccountSource::ProfileApi,
+                    })
+                },
+            ))
+        };
+        assert!(invoke(&credentials, now).is_some());
+        assert!(invoke(&credentials, now + Duration::from_secs(3600)).is_some());
+        assert_eq!(calls.get(), 1);
+        credentials.service = "second".into();
+        assert!(invoke(&credentials, now + Duration::from_secs(3601)).is_some());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn credential_identity_does_not_call_profile_api() {
+        let state = super::ProfileState::default();
+        let credentials = super::CachedCredentials {
+            access_token: "fixture".into(),
+            cached_at: std::time::Instant::now(),
+            expires_at_ms: Some(1),
+            service: "test".into(),
+            identity: Some(super::Identity {
+                uuid: "7fd160a2-6103-4038-9fa1-000000d5fb0b".into(),
+                email: None,
+                source: crate::services::quota_history::AccountSource::Credential,
+            }),
+        };
+        let calls = Cell::new(0);
+        let identity = tauri::async_runtime::block_on(super::resolve_identity_with(
+            &state,
+            &credentials,
+            std::time::Instant::now(),
+            || async {
+                calls.set(calls.get() + 1);
+                None
+            },
+        ));
+        assert_eq!(
+            identity
+                .and_then(|value| super::uuid_tail(&value.uuid))
+                .as_deref(),
+            Some("d5fb0b")
+        );
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn claude_json_checks_identity_but_never_supplies_one() {
+        let identity = super::Identity {
+            uuid: "7fd160a2-6103-4038-9fa1-000000d5fb0b".into(),
+            email: None,
+            source: crate::services::quota_history::AccountSource::Credential,
+        };
+        let same = r#"{"oauthAccount":{"accountUuid":"7fd160a2-6103-4038-9fa1-000000d5fb0b"}}"#;
+        let other = r#"{"oauthAccount":{"accountUuid":"7fd160a2-6103-4038-9fa1-0000008c6913"}}"#;
+        assert!(!super::cross_check_identity_from(Some(same), &identity));
+        assert!(super::cross_check_identity_from(Some(other), &identity));
+        assert!(!super::cross_check_identity_from(None, &identity));
+        assert_eq!(
+            identity.source,
+            crate::services::quota_history::AccountSource::Credential
+        );
+    }
+
+    #[test]
+    fn desktop_account_sentinel_never_reaches_payload_or_diagnostics() {
+        let sentinel = "SENTINEL-TOKEN-7f3a";
+        let content = format!(
+            r#"{{"lastKnownAccountUuid":"7fd160a2-6103-4038-9fa1-000000d5fb0b","oauth:tokenCache":"{sentinel}"}}"#
+        );
+        let mut quota = QuotaData::disconnected("test");
+        quota.app_account = Some(super::desktop_account_status_from(
+            Some("8c6913"),
+            &std::collections::HashMap::new(),
+            Ok(&content),
+        ));
+        let payload = serde_json::to_string(&quota).unwrap();
+        assert!(!payload.contains(sentinel));
+        let invalid = format!("{{invalid {sentinel}");
+        let error = super::desktop_account_tail_from_content(Ok(&invalid)).unwrap_err();
+        let _ = super::desktop_account_status_from(
+            Some("8c6913"),
+            &std::collections::HashMap::new(),
+            Ok(&invalid),
+        );
+        assert_eq!(error, "parse");
+        assert!(!error.contains(sentinel));
+        assert!(!super::test_log_messages()
+            .lock()
+            .unwrap()
+            .join("")
+            .contains(sentinel));
     }
 
     fn assert_excludes_token_fragments(diagnostic: &str) {
@@ -1792,6 +3388,9 @@ mod tests {
     fn stale_quota_fallback_keeps_connected_data_and_sets_error() {
         let stale = mark_quota_fetch_error(
             crate::domain::models::QuotaData {
+                account: None,
+                account_label: None,
+                app_account: None,
                 connected: true,
                 session: None,
                 weekly_total: None,
@@ -2313,7 +3912,7 @@ mod tests {
     #[test]
     fn rotates_oversized_claude_logs() {
         use super::rotate_log_if_needed_with_limit;
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "quotabar-claude-log-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

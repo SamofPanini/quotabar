@@ -38,6 +38,12 @@ test('accepts the exact real owner wiring', () => {
   assert.doesNotThrow(() => check_latest_request_wiring(read_owner_sources()));
 });
 
+test('rejects a missing Claude profiles request generation guard', () => {
+  rejects_change(paths.app,
+    '      const data = await backend.getClaudeProfiles();\n      if (!claude_profiles_request_generation.isCurrent(generation)) return;',
+    '      const data = await backend.getClaudeProfiles();\n      if (false) return;', /success guard/);
+});
+
 test('rejects a missing owner source', () => {
   const sources = read_owner_sources();
   sources.delete(paths.app);
