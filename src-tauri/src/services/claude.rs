@@ -1693,10 +1693,11 @@ pub async fn fetch_quota() -> QuotaData {
             let labels = crate::services::claude_profiles::load()
                 .map(|registry| registry.labels)
                 .unwrap_or_default();
-            result.config_account = config_tail.map(|tail| crate::domain::models::ClaudeConfigAccount {
-                label: labels.get(&tail).cloned(),
-                tail,
-            });
+            result.config_account =
+                config_tail.map(|tail| crate::domain::models::ClaudeConfigAccount {
+                    label: labels.get(&tail).cloned(),
+                    tail,
+                });
             result.account_label = result.account.as_ref().map(|account| {
                 labels
                     .get(&account.tail)
@@ -1942,10 +1943,7 @@ async fn fetch_quota_once() -> QuotaData {
     let labels = crate::services::claude_profiles::load()
         .map(|registry| registry.labels)
         .unwrap_or_default();
-    result.app_account = Some(desktop_account_status(
-        tail.as_deref(),
-        &labels,
-    ));
+    result.app_account = Some(desktop_account_status(tail.as_deref(), &labels));
     result.config_account = config_tail.map(|tail| crate::domain::models::ClaudeConfigAccount {
         label: labels.get(&tail).cloned(),
         tail,
@@ -2538,10 +2536,13 @@ async fn fetch_profile_with(
             })
         });
         quota.account = public.account.clone();
-        quota.config_account = config_tail.clone().map(|tail| crate::domain::models::ClaudeConfigAccount {
-            label: labels.get(&tail).cloned(),
-            tail,
-        });
+        quota.config_account =
+            config_tail
+                .clone()
+                .map(|tail| crate::domain::models::ClaudeConfigAccount {
+                    label: labels.get(&tail).cloned(),
+                    tail,
+                });
         public.status = if public.account.is_some() {
             "ok"
         } else {
@@ -2837,18 +2838,18 @@ mod tests {
         io.mismatch = Some("8c6913".into());
         let profile = fake_profile("/fixture/mismatch-orchestration");
         let labels = std::collections::HashMap::from([("8c6913".into(), "Lucky".into())]);
-        let result = tauri::async_runtime::block_on(super::fetch_profile_with(
-            &profile,
-            &labels,
-            &io,
-        ));
+        let result =
+            tauri::async_runtime::block_on(super::fetch_profile_with(&profile, &labels, &io));
         assert_eq!(result.status, "ok");
         assert!(result.quota.as_ref().unwrap().session.is_some());
         assert_eq!(result.quota.unwrap().config_account.unwrap().tail, "8c6913");
-        assert_eq!(*io.records.lock().unwrap(), vec![(
-            Some("d5fb0b".into()),
-            Some(crate::services::quota_history::AccountSource::Credential),
-        )]);
+        assert_eq!(
+            *io.records.lock().unwrap(),
+            vec![(
+                Some("d5fb0b".into()),
+                Some(crate::services::quota_history::AccountSource::Credential),
+            )]
+        );
     }
 
     #[test]
@@ -3343,8 +3344,14 @@ mod tests {
         };
         let same = r#"{"oauthAccount":{"accountUuid":"7fd160a2-6103-4038-9fa1-000000d5fb0b"}}"#;
         let other = r#"{"oauthAccount":{"accountUuid":"7fd160a2-6103-4038-9fa1-0000008c6913"}}"#;
-        assert_eq!(super::cross_check_identity_from(Some(same), &identity), None);
-        assert_eq!(super::cross_check_identity_from(Some(other), &identity).as_deref(), Some("8c6913"));
+        assert_eq!(
+            super::cross_check_identity_from(Some(same), &identity),
+            None
+        );
+        assert_eq!(
+            super::cross_check_identity_from(Some(other), &identity).as_deref(),
+            Some("8c6913")
+        );
         assert_eq!(super::cross_check_identity_from(None, &identity), None);
         assert_eq!(
             identity.source,
