@@ -1,13 +1,16 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import {
   AUTH_REFRESH_INTERVAL_MS,
   AUTO_REFRESH_INTERVAL_MS,
   BACKOFF_REFRESH_INTERVAL_MS,
   getClaudeRefreshIntervalMs,
   getClaudeTrayUsedPercent,
+  getClaudeTrayQuotaForAccount,
+  getClaudeTrayUsedPercentForAccount,
   getClaudeTrayUsedPercentForWindow,
   keepClaudeQuotaOnError,
 } from '../src/App';
+import { getSavedClaudeMenuBarAccount, saveClaudeMenuBarAccount } from '../src/services/app_state';
 import type { QuotaData, UsageInfo } from '../src/types/models';
 
 const usage = (percentage: number): UsageInfo => ({
@@ -109,6 +112,60 @@ describe('getClaudeTrayUsedPercentForWindow', () => {
   test('returns null without quota in either mode', () => {
     expect(getClaudeTrayUsedPercentForWindow(null, 'weekly')).toBeNull();
     expect(getClaudeTrayUsedPercentForWindow(null, 'five_hour')).toBeNull();
+  });
+});
+
+const profile = (alias: string, percentage: number | null, status: 'ok' | 'signedOut' | 'disabled' = 'ok') => ({
+  alias,
+  label: alias,
+  status,
+  account: null,
+  quota: percentage === null ? null : { connected: true, weeklyTotal: usage(percentage) },
+});
+
+describe('Claude tray account selection', () => {
+  const defaultQuota = { connected: true, weeklyTotal: usage(42) };
+
+  test('claude_tray_account_default_unchanged', () => {
+    expect(getClaudeTrayUsedPercentForAccount(defaultQuota, [profile('lucky', 81)], 'default', 'weekly'))
+      .toBe(getClaudeTrayUsedPercentForWindow(defaultQuota, 'weekly'));
+  });
+
+  test('claude_tray_account_alias', () => {
+    expect(getClaudeTrayUsedPercentForAccount(defaultQuota, [profile('lucky', 81)], 'lucky', 'weekly')).toBe(81);
+  });
+
+  test('claude_tray_account_missing_alias_falls_back', () => {
+    expect(getClaudeTrayUsedPercentForAccount(defaultQuota, [], 'missing', 'weekly')).toBe(42);
+  });
+
+  test('claude_tray_account_signed_out_is_null', () => {
+    expect(getClaudeTrayUsedPercentForAccount(defaultQuota, [profile('lucky', 81, 'signedOut')], 'lucky', 'weekly')).toBeNull();
+    expect(getClaudeTrayUsedPercentForAccount(defaultQuota, [profile('lucky', 81, 'disabled')], 'lucky', 'weekly')).toBeNull();
+  });
+
+  test('claude_tray_account_highest', () => {
+    const profiles = [profile('lucky', 81), profile('other', 65)];
+    expect(getClaudeTrayUsedPercentForAccount(defaultQuota, profiles, 'highest', 'weekly')).toBe(81);
+  });
+
+  test('claude_tray_account_grayed_follows_selection', () => {
+    const stale = { connected: true, weeklyTotal: usage(81), staleReason: 'expired' as const };
+    const selected = getClaudeTrayQuotaForAccount(defaultQuota, [{ ...profile('lucky', 81), quota: stale }], 'lucky', 'weekly');
+    expect(selected?.staleReason).toBe('expired');
+    expect(getClaudeTrayQuotaForAccount(defaultQuota, [{ ...profile('lucky', 81), quota: stale }], 'default', 'weekly')?.staleReason).toBeUndefined();
+  });
+
+  test('Claude menu-bar account setting persists its selection', () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    });
+    expect(getSavedClaudeMenuBarAccount()).toBe('default');
+    expect(saveClaudeMenuBarAccount('lucky')).toBe(true);
+    expect(getSavedClaudeMenuBarAccount()).toBe('lucky');
+    vi.unstubAllGlobals();
   });
 });
 

@@ -48,6 +48,8 @@ pub struct QuotaData {
     pub account: Option<ClaudeAccount>,
     #[serde(rename = "accountLabel", skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
+    #[serde(rename = "configAccount", skip_serializing_if = "Option::is_none")]
+    pub config_account: Option<ClaudeConfigAccount>,
     #[serde(rename = "appAccount", skip_serializing_if = "Option::is_none")]
     pub app_account: Option<ClaudeAppAccount>,
     pub connected: bool,
@@ -76,6 +78,7 @@ impl QuotaData {
         Self {
             account: None,
             account_label: None,
+            config_account: None,
             app_account: None,
             connected: false,
             session: None,
@@ -102,6 +105,7 @@ impl QuotaData {
         Self {
             account: None,
             account_label: None,
+            config_account: None,
             app_account: None,
             connected: true,
             session,
@@ -116,6 +120,13 @@ impl QuotaData {
             error: None,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ClaudeConfigAccount {
+    pub tail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

@@ -20,7 +20,7 @@ import {
   type NotificationKey,
   type NotificationSettings,
 } from '../services/notifications';
-import type { CostSource } from '../types/models';
+import type { ClaudeProfilesResponse, CostSource } from '../types/models';
 import {
   PANEL_SECTION_LABELS,
   PANEL_SECTION_ORDER,
@@ -28,6 +28,7 @@ import {
   type PanelSectionVisibility,
 } from '../services/panel_sections';
 import type { MenuBarQuotaWindow } from '../services/codex_tray_window';
+import type { ClaudeMenuBarAccount } from '../services/app_state';
 import { UI_SCALES, type UiScale } from '../hooks/use_ui_scale';
 import {
   getClaudeAutoRenewEnabled,
@@ -46,6 +47,9 @@ interface SettingsViewProps {
   trayCycle: boolean;
   menuBarQuotaWindow: MenuBarQuotaWindow;
   claudeMenuBarQuotaWindow: MenuBarQuotaWindow;
+  claudeMenuBarAccount?: ClaudeMenuBarAccount;
+  claudeProfiles?: ClaudeProfilesResponse;
+  defaultClaudeLabel?: string;
   events: AppEvent[];
   notificationSettings: NotificationSettings;
   serviceStatusEnabled: boolean;
@@ -60,6 +64,7 @@ interface SettingsViewProps {
   onTrayCycleToggle: () => void;
   onMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
   onClaudeMenuBarQuotaWindowChange: (window: MenuBarQuotaWindow) => void;
+  onClaudeMenuBarAccountChange?: (selection: ClaudeMenuBarAccount) => void;
   onNotificationToggle: (key: NotificationKey) => void;
   onServiceStatusToggle: () => void;
   onSwitcherToggle: (service: TrayServiceName) => void;
@@ -80,6 +85,9 @@ export default function SettingsView({
   trayCycle,
   menuBarQuotaWindow,
   claudeMenuBarQuotaWindow,
+  claudeMenuBarAccount = 'default',
+  claudeProfiles = { profiles: [] },
+  defaultClaudeLabel = 'Default',
   events,
   notificationSettings,
   serviceStatusEnabled,
@@ -94,6 +102,7 @@ export default function SettingsView({
   onTrayCycleToggle,
   onMenuBarQuotaWindowChange,
   onClaudeMenuBarQuotaWindowChange,
+  onClaudeMenuBarAccountChange,
   onNotificationToggle,
   onServiceStatusToggle,
   onSwitcherToggle,
@@ -291,6 +300,20 @@ export default function SettingsView({
             aria-pressed={claudeMenuBarQuotaWindow === 'five_hour'}
           >
             5-hour
+          </button>
+        </div>
+        <div className="settings-subsection-title">Claude menu bar account</div>
+        <div className="settings-seg" aria-label="Claude menu bar account">
+          <button type="button" className={`settings-seg-btn ${claudeMenuBarAccount === 'default' ? 'active' : ''}`} onClick={() => onClaudeMenuBarAccountChange?.('default')} aria-pressed={claudeMenuBarAccount === 'default'}>
+            {defaultClaudeLabel}
+          </button>
+          {claudeProfiles.profiles.map((profile) => (
+            <button key={profile.alias} type="button" className={`settings-seg-btn ${claudeMenuBarAccount === profile.alias ? 'active' : ''}`} onClick={() => onClaudeMenuBarAccountChange?.(profile.alias)} aria-pressed={claudeMenuBarAccount === profile.alias}>
+              {profile.label}
+            </button>
+          ))}
+          <button type="button" className={`settings-seg-btn ${claudeMenuBarAccount === 'highest' ? 'active' : ''}`} onClick={() => onClaudeMenuBarAccountChange?.('highest')} aria-pressed={claudeMenuBarAccount === 'highest'}>
+            Highest
           </button>
         </div>
       </section>

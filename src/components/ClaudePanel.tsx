@@ -72,7 +72,7 @@ export default function ClaudePanel({
   serviceStatus,
 }: ClaudePanelProps) {
   const selected = profiles.profiles.find((profile) => profile.alias === selectedAlias);
-  const quota = selectedAlias === 'default' ? defaultQuota : selected?.status === 'mismatch' ? null : selected?.quota ?? null;
+  const quota = selectedAlias === 'default' ? defaultQuota : selected?.quota ?? null;
   const error = selectedAlias === 'default' ? defaultError : profileRefreshError ?? null;
   const statusLabels = {
     disabled: 'Not enabled (directory missing)',
@@ -106,6 +106,9 @@ export default function ClaudePanel({
       {selectedAlias === 'default' && defaultQuota?.connected && !defaultQuota.account && <div className="claude-stale-notice">Account unidentified</div>}
       {selectedAlias === 'default' && defaultQuota?.appAccount?.state === 'different' && (
         <div className="claude-stale-notice">Desktop app is signed in as {desktopAppLabel}; this view shows {defaultQuota.accountLabel ?? defaultQuota.account?.email ?? defaultQuota.account?.tail}.</div>
+      )}
+      {quota?.configAccount && (
+        <div className="claude-stale-notice">~/.claude.json records {quota.configAccount.label ?? quota.configAccount.tail}; quota shown is for {quota.accountLabel ?? quota.account?.email ?? quota.account?.tail}.</div>
       )}
       {loading && !quota && (
         <div className="loading-state">Loading Claude quota...</div>
@@ -224,7 +227,7 @@ export default function ClaudePanel({
         </div>
       )}
 
-      {!quota && !loading && selected?.status !== 'disabled' && selected?.status !== 'mismatch' && (
+      {!quota && !loading && selected?.status !== 'disabled' && (
         <div className="empty-state">
           <p>Unable to load quota data</p>
           <button type="button" onClick={onRetry} className="retry-btn">

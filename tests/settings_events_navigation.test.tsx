@@ -23,6 +23,9 @@ function settingsProps() {
     trayCycle: false,
     menuBarQuotaWindow: 'weekly' as const,
     claudeMenuBarQuotaWindow: 'weekly' as const,
+    claudeMenuBarAccount: 'lucky',
+    claudeProfiles: { profiles: [{ alias: 'lucky', label: 'Lucky', status: 'ok', account: null, quota: null }] },
+    defaultClaudeLabel: 'Default Account',
     events: [
       { id: '1', time: '2026-09-03T10:00:00Z', level: 'critical' as const, text: 'Codex usage crossed 95%' },
       { id: '2', time: '2026-09-03T10:00:00Z', level: 'critical' as const, text: 'Failed to persist local setting.' },
@@ -50,6 +53,7 @@ function settingsProps() {
     onTrayCycleToggle: () => {},
     onMenuBarQuotaWindowChange: () => {},
     onClaudeMenuBarQuotaWindowChange: () => {},
+    onClaudeMenuBarAccountChange: () => {},
     onNotificationToggle: () => {},
     onSwitcherToggle: () => {},
     onApplyPreset: vi.fn(),
@@ -73,5 +77,9 @@ describe('settings event navigation', () => {
     expect(html).toContain('Claude menu-bar icon window');
     expect(html).toContain('>Weekly<');
     expect(html).toContain('>5-hour<');
+    expect(html).toContain('Claude menu bar account');
+    expect(html).toContain('>Default Account<');
+    expect(html).toContain('>Lucky<');
+    expect(html).toContain('>Highest<');
   });
 });
