@@ -87,7 +87,9 @@ import {
   defaultServiceMap,
   getClaudeRefreshIntervalMs,
   getClaudeTrayUsedPercent,
-  getClaudeTrayUsedPercentForWindow,
+  getClaudeTrayQuotaForAccount,
+  getClaudeTrayUsedPercentForAccount,
+  getSavedClaudeMenuBarAccount,
   isClaudeAuthError,
   isClaudeSignedOutError,
   keepClaudeQuotaOnError,
@@ -99,10 +101,12 @@ import {
   isMacOSPlatform,
   providerRefreshIntervalMs,
   saveActiveTab,
+  saveClaudeMenuBarAccount,
   saveDockHidden,
   saveSettingsExpanded,
   saveTheme,
   type ServiceMap,
+  type ClaudeMenuBarAccount,
   type TrayEnabledState,
   type TrayServiceActivatedPayload,
 } from './services/app_state';
@@ -130,6 +134,8 @@ export {
   getClaudeRefreshIntervalMs,
   getClaudeTrayUsedPercent,
   getClaudeTrayUsedPercentForWindow,
+  getClaudeTrayQuotaForAccount,
+  getClaudeTrayUsedPercentForAccount,
   keepClaudeQuotaOnError,
   providerRefreshIntervalMs,
 } from './services/app_state';
@@ -256,6 +262,9 @@ export default function App() {
   );
   const [claudeMenuBarQuotaWindow, setClaudeMenuBarQuotaWindow] = useState<MenuBarQuotaWindow>(
     getSavedClaudeMenuBarQuotaWindow,
+  );
+  const [claudeMenuBarAccount, setClaudeMenuBarAccount] = useState<ClaudeMenuBarAccount>(
+    getSavedClaudeMenuBarAccount,
   );
   const [trayCycleIndex, setTrayCycleIndex] = useState(0);
   const [events, setEvents] = useState<AppEvent[]>(getSavedEvents);
@@ -556,22 +565,27 @@ export default function App() {
     });
 
     for (const svc of SERVICES) {
+      const selectedClaudeQuota = getClaudeTrayQuotaForAccount(
+        quota, claudeProfiles.profiles, claudeMenuBarAccount, claudeMenuBarQuotaWindow,
+      );
       const pct = svc === 'claude'
-        ? getClaudeTrayUsedPercentForWindow(quota, claudeMenuBarQuotaWindow)
+        ? getClaudeTrayUsedPercentForAccount(quota, claudeProfiles.profiles, claudeMenuBarAccount, claudeMenuBarQuotaWindow)
         : svc === 'codex'
           ? getCodexTrayUsedPercent(codexTraySnapshots, menuBarQuotaWindow)
           : usedPercent[svc];
-      const grayed = svc === 'claude' && quota?.staleReason != null;
+      const grayed = svc === 'claude' && selectedClaudeQuota?.staleReason != null;
       const visible = resolveTrayVisible(svc, candidates, trayCycle, trayCycleIndex);
       updateTrayIcon(svc, pct, visible, force, trayStyle, grayed);
     }
   }, [
     quota,
+    claudeProfiles,
     connected,
     usedPercent,
     codexTraySnapshots,
     menuBarQuotaWindow,
     claudeMenuBarQuotaWindow,
+    claudeMenuBarAccount,
     trayEnabled,
     trayCycle,
     trayCycleIndex,
@@ -727,6 +741,11 @@ export default function App() {
   const handleClaudeMenuBarQuotaWindowChange = useCallback((window: MenuBarQuotaWindow) => {
     saveClaudeMenuBarQuotaWindow(window);
     setClaudeMenuBarQuotaWindow(window);
+  }, []);
+
+  const handleClaudeMenuBarAccountChange = useCallback((selection: ClaudeMenuBarAccount) => {
+    saveClaudeMenuBarAccount(selection);
+    setClaudeMenuBarAccount(selection);
   }, []);
 
   const handleThemeChange = useCallback((newTheme: ThemeName) => {
@@ -1176,6 +1195,9 @@ export default function App() {
               trayCycle={trayCycle}
               menuBarQuotaWindow={menuBarQuotaWindow}
               claudeMenuBarQuotaWindow={claudeMenuBarQuotaWindow}
+              claudeMenuBarAccount={claudeMenuBarAccount}
+              claudeProfiles={claudeProfiles}
+              defaultClaudeLabel={quota?.accountLabel ?? quota?.account?.email ?? quota?.account?.tail ?? 'Default'}
               events={events}
               notificationSettings={notifSettings}
               serviceStatusEnabled={serviceStatusEnabled}
@@ -1190,6 +1212,7 @@ export default function App() {
               onTrayCycleToggle={handleTrayCycleToggle}
               onMenuBarQuotaWindowChange={handleMenuBarQuotaWindowChange}
               onClaudeMenuBarQuotaWindowChange={handleClaudeMenuBarQuotaWindowChange}
+              onClaudeMenuBarAccountChange={handleClaudeMenuBarAccountChange}
               onNotificationToggle={handleNotificationToggle}
               onServiceStatusToggle={handleServiceStatusToggle}
               onSwitcherToggle={handleSwitcherToggle}

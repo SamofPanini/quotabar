@@ -8,6 +8,7 @@ export interface UsageInfo {
 export interface QuotaData {
   account?: ClaudeAccount | null;
   accountLabel?: string;
+  configAccount?: { tail: string; label?: string };
   appAccount?: { state: 'same' | 'unknown' } | { state: 'different'; appLabel: string };
   connected: boolean;
   session?: UsageInfo;

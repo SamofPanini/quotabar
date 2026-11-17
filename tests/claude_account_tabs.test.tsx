@@ -1,4 +1,5 @@
 import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import ClaudePanel from '../src/components/ClaudePanel';
@@ -174,5 +175,20 @@ describe('Claude account tabs', () => {
     await act(async () => view.unmount());
     vi.restoreAllMocks();
     delete (globalThis as Record<string, unknown>).localStorage;
+  });
+});
+
+describe('Claude config account notice', () => {
+  it('configAccount keeps quota visible and shows a notice only when present', () => {
+    const base = { ...quota, accountLabel: 'Current', appAccount: undefined };
+    const props = (q: QuotaData) => ({
+      quota: q, loading: false, error: null, windowVisible: false, costRefreshKey: 0, onRetry: () => {},
+      sections: { timeline: false, cost: false, trend: false, tips: false },
+    });
+    const withNotice = renderToStaticMarkup(createElement(ClaudePanel, props({ ...base, configAccount: { tail: '8c6913', label: 'Lucky' } } as QuotaData)));
+    const withoutNotice = renderToStaticMarkup(createElement(ClaudePanel, props(base as QuotaData)));
+    expect(withNotice).toContain('~/.claude.json records Lucky; quota shown is for Current.');
+    expect(withNotice).toContain('37%');
+    expect(withoutNotice).not.toContain('~/.claude.json records');
   });
 });

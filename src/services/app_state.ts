@@ -1,5 +1,5 @@
 import type { ThemeName } from '../components/ThemeSelector';
-import type { QuotaData } from '../types/models';
+import type { ClaudeProfile, QuotaData } from '../types/models';
 import { SERVICES } from './service_meta';
 import type { AppTabName } from './provider_summary';
 import { readStorageValue, writeStorageItem } from './storage';
@@ -23,6 +23,8 @@ export const TRAY_CYCLE_INTERVAL_MS = 15 * 1000;
 export const TRAY_FORCE_SYNC_INTERVAL_MS = 60 * 1000;
 export const TRAY_GUARD_MESSAGE = 'At least one tray must remain enabled';
 export const VALID_TABS = new Set<string>(['all', ...SERVICES]);
+export const CLAUDE_MENU_BAR_ACCOUNT_STORAGE_KEY = 'claudeMenuBarAccount';
+export type ClaudeMenuBarAccount = 'default' | 'highest' | string;
 
 export interface TrayServiceActivatedPayload {
   service: TrayServiceName;
@@ -168,6 +170,64 @@ export function getClaudeTrayUsedPercentForWindow(
     && percentage >= 0
     ? percentage
     : null;
+}
+
+export function getSavedClaudeMenuBarAccount(): ClaudeMenuBarAccount {
+  const result = readStorageValue(CLAUDE_MENU_BAR_ACCOUNT_STORAGE_KEY, (raw) => {
+    if (!raw || raw === 'weekly' || raw === 'five_hour') throw new Error('Invalid saved Claude menu-bar account');
+    return raw;
+  }, { notifyUser: true });
+  return result.status === 'value' ? result.value : 'default';
+}
+
+export function saveClaudeMenuBarAccount(selection: ClaudeMenuBarAccount): boolean {
+  return writeStorageItem(CLAUDE_MENU_BAR_ACCOUNT_STORAGE_KEY, selection, {
+    preserveSessionValue: true,
+    notifyUser: true,
+  });
+}
+
+function selectableProfileQuota(profile: ClaudeProfile | undefined): QuotaData | null {
+  if (!profile || profile.status === 'disabled' || profile.status === 'signedOut') return null;
+  return profile.quota;
+}
+
+export function getClaudeTrayQuotaForAccount(
+  defaultQuota: QuotaData | null,
+  profiles: ClaudeProfile[],
+  selection: ClaudeMenuBarAccount,
+  window: MenuBarQuotaWindow,
+): QuotaData | null {
+  if (selection === 'default') return defaultQuota;
+  if (selection !== 'highest') {
+    const profile = profiles.find((item) => item.alias === selection);
+    return profile ? selectableProfileQuota(profile) : defaultQuota;
+  }
+  const candidates = [defaultQuota, ...profiles.map(selectableProfileQuota)].filter(
+    (quota): quota is QuotaData => quota !== null,
+  );
+  let selected: QuotaData | null = null;
+  let highest = -Infinity;
+  for (const quota of candidates) {
+    const percentage = getClaudeTrayUsedPercentForWindow(quota, window);
+    if (percentage !== null && percentage > highest) {
+      selected = quota;
+      highest = percentage;
+    }
+  }
+  return selected;
+}
+
+export function getClaudeTrayUsedPercentForAccount(
+  defaultQuota: QuotaData | null,
+  profiles: ClaudeProfile[],
+  selection: ClaudeMenuBarAccount,
+  window: MenuBarQuotaWindow,
+): number | null {
+  return getClaudeTrayUsedPercentForWindow(
+    getClaudeTrayQuotaForAccount(defaultQuota, profiles, selection, window),
+    window,
+  );
 }
 
 export function isClaudeAuthError(error: string): boolean {

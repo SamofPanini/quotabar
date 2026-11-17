@@ -98,25 +98,25 @@ struct ClaudeConfigAccount {
     account_uuid: Option<String>,
 }
 
-fn cross_check_identity(config_dir: Option<&str>, identity: &Identity) -> bool {
+fn cross_check_identity(config_dir: Option<&str>, identity: &Identity) -> Option<String> {
     let path = match config_dir {
         Some(dir) => std::path::PathBuf::from(dir).join(".claude.json"),
         None => match dirs::home_dir() {
             Some(home) => home.join(".claude.json"),
-            None => return false,
+            None => return None,
         },
     };
     cross_check_identity_from(std::fs::read_to_string(path).ok().as_deref(), identity)
 }
 
-fn cross_check_identity_from(content: Option<&str>, identity: &Identity) -> bool {
+fn cross_check_identity_from(content: Option<&str>, identity: &Identity) -> Option<String> {
     let saved = content
         .and_then(|content| serde_json::from_str::<ClaudeConfigIdentity>(content).ok())
         .and_then(|config| config.oauth_account?.account_uuid)
         .and_then(|value| uuid::Uuid::parse_str(&value).ok());
     match (saved, uuid::Uuid::parse_str(&identity.uuid).ok()) {
-        (Some(saved), Some(found)) => saved != found,
-        _ => false,
+        (Some(saved), Some(found)) if saved != found => uuid_tail(&saved.to_string()),
+        _ => None,
     }
 }
 
@@ -1678,12 +1678,9 @@ pub async fn fetch_quota() -> QuotaData {
     if result.connected {
         if let Some(credentials) = credentials {
             let identity = resolve_identity(default_state(), &credentials).await;
-            if identity
+            let config_tail = identity
                 .as_ref()
-                .is_some_and(|identity| cross_check_identity(None, identity))
-            {
-                return QuotaData::disconnected("Claude account mismatch");
-            }
+                .and_then(|identity| cross_check_identity(None, identity));
             let tail = identity
                 .as_ref()
                 .and_then(|identity| uuid_tail(&identity.uuid));
@@ -1696,6 +1693,11 @@ pub async fn fetch_quota() -> QuotaData {
             let labels = crate::services::claude_profiles::load()
                 .map(|registry| registry.labels)
                 .unwrap_or_default();
+            result.config_account =
+                config_tail.map(|tail| crate::domain::models::ClaudeConfigAccount {
+                    label: labels.get(&tail).cloned(),
+                    tail,
+                });
             result.account_label = result.account.as_ref().map(|account| {
                 labels
                     .get(&account.tail)
@@ -1932,30 +1934,20 @@ async fn fetch_quota_once() -> QuotaData {
     );
 
     let identity = resolve_identity(default_state(), &credentials).await;
-    let mismatch = identity
+    let config_tail = identity
         .as_ref()
-        .is_some_and(|identity| cross_check_identity(None, identity));
+        .and_then(|identity| cross_check_identity(None, identity));
     let tail = identity
         .as_ref()
         .and_then(|identity| uuid_tail(&identity.uuid));
     let labels = crate::services::claude_profiles::load()
         .map(|registry| registry.labels)
         .unwrap_or_default();
-    result.app_account = Some(desktop_account_status(
-        if mismatch { None } else { tail.as_deref() },
-        &labels,
-    ));
-    if mismatch {
-        crate::services::quota_history::record_profile_success(
-            &data,
-            final_status,
-            chrono::Utc::now(),
-            "default",
-            None,
-            None,
-        );
-        return QuotaData::disconnected("Claude account mismatch");
-    }
+    result.app_account = Some(desktop_account_status(tail.as_deref(), &labels));
+    result.config_account = config_tail.map(|tail| crate::domain::models::ClaudeConfigAccount {
+        label: labels.get(&tail).cloned(),
+        tail,
+    });
     result.account = identity.as_ref().and_then(|identity| {
         Some(crate::domain::models::ClaudeAccount {
             tail: uuid_tail(&identity.uuid)?,
@@ -2339,7 +2331,7 @@ trait ProfileIo: Sync {
         &self,
         profile: &crate::services::claude_profiles::Profile,
         identity: &Identity,
-    ) -> bool;
+    ) -> Option<String>;
     fn usage<'a>(
         &'a self,
         credentials: &'a CachedCredentials,
@@ -2397,7 +2389,7 @@ impl ProfileIo for SystemProfileIo {
         &self,
         profile: &crate::services::claude_profiles::Profile,
         identity: &Identity,
-    ) -> bool {
+    ) -> Option<String> {
         cross_check_identity(Some(&profile.config_dir), identity)
     }
     fn usage<'a>(
@@ -2507,12 +2499,9 @@ async fn fetch_profile_with(
         return public;
     }
     let identity = io.identity(&state, &credentials).await;
-    let mismatch = identity
+    let config_tail = identity
         .as_ref()
-        .is_some_and(|identity| io.mismatch(profile, identity));
-    if mismatch {
-        public.status = "mismatch";
-    }
+        .and_then(|identity| io.mismatch(profile, identity));
     let active_limit = state
         .request_gate_state
         .lock()
@@ -2520,9 +2509,7 @@ async fn fetch_profile_with(
         .and_then(|gate| gate.rate_limited_until)
         .is_some_and(|until| now < until);
     if active_limit {
-        if !mismatch {
-            public.quota = Some(QuotaData::disconnected("API error: 429 Too Many Requests"));
-        }
+        public.quota = Some(QuotaData::disconnected("API error: 429 Too Many Requests"));
         return public;
     }
     let blocked_auth = state
@@ -2532,9 +2519,7 @@ async fn fetch_profile_with(
         .and_then(|gate| gate.auth_failure)
         .is_some_and(|failure| failure.expires_at_ms == credentials.expires_at_ms);
     if blocked_auth {
-        if !mismatch {
-            public.quota = Some(QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE));
-        }
+        public.quota = Some(QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE));
         return public;
     }
     let cached = state.quota_cache.lock().ok().and_then(|cache| {
@@ -2543,7 +2528,7 @@ async fn fetch_profile_with(
             .filter(|entry| entry.cached_at.elapsed() < QUOTA_CACHE_TTL)
             .map(|entry| entry.data.clone())
     });
-    if let Some(mut quota) = cached.filter(|_| !mismatch) {
+    if let Some(mut quota) = cached {
         public.account = identity.as_ref().and_then(|identity| {
             Some(crate::domain::models::ClaudeAccount {
                 tail: uuid_tail(&identity.uuid)?,
@@ -2551,6 +2536,13 @@ async fn fetch_profile_with(
             })
         });
         quota.account = public.account.clone();
+        quota.config_account =
+            config_tail
+                .clone()
+                .map(|tail| crate::domain::models::ClaudeConfigAccount {
+                    label: labels.get(&tail).cloned(),
+                    tail,
+                });
         public.status = if public.account.is_some() {
             "ok"
         } else {
@@ -2568,9 +2560,7 @@ async fn fetch_profile_with(
     let response = match io.usage(&credentials, &state).await {
         Ok(response) => response,
         Err(error) => {
-            if !mismatch {
-                public.quota = Some(QuotaData::disconnected(error));
-            }
+            public.quota = Some(QuotaData::disconnected(error));
             return public;
         }
     };
@@ -2581,9 +2571,7 @@ async fn fetch_profile_with(
                 expires_at_ms: credentials.expires_at_ms,
             });
         }
-        if !mismatch {
-            public.quota = Some(QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE));
-        }
+        public.quota = Some(QuotaData::disconnected(CLAUDE_AUTH_RELOGIN_MESSAGE));
         return public;
     }
     if is_rate_limited(status) {
@@ -2593,17 +2581,13 @@ async fn fetch_profile_with(
         }
     }
     if !status.is_success() {
-        if !mismatch {
-            public.quota = Some(QuotaData::disconnected(format!("API error: {status}")));
-        }
+        public.quota = Some(QuotaData::disconnected(format!("API error: {status}")));
         return public;
     }
     let data = match response.data {
         Some(data) => data,
         None => {
-            if !mismatch {
-                public.quota = Some(QuotaData::disconnected("Failed to parse response"));
-            }
+            public.quota = Some(QuotaData::disconnected("Failed to parse response"));
             return public;
         }
     };
@@ -2621,16 +2605,9 @@ async fn fetch_profile_with(
         && weekly_design.is_none()
         && weekly_fable5.is_none()
     {
-        if !mismatch {
-            public.quota = Some(QuotaData::disconnected(
-                "Failed to parse response: no numeric quota utilization fields",
-            ));
-        }
-        return public;
-    }
-    if mismatch {
-        public.status = "mismatch";
-        io.record(&data, status, &profile.alias, None, None);
+        public.quota = Some(QuotaData::disconnected(
+            "Failed to parse response: no numeric quota utilization fields",
+        ));
         return public;
     }
     let account = identity.as_ref().and_then(|identity| {
@@ -2656,6 +2633,10 @@ async fn fetch_profile_with(
         weekly_fable5,
     );
     quota.account = account.clone();
+    quota.config_account = config_tail.map(|tail| crate::domain::models::ClaudeConfigAccount {
+        label: labels.get(&tail).cloned(),
+        tail,
+    });
     io.record(
         &data,
         status,
@@ -2709,7 +2690,7 @@ mod tests {
         enabled: bool,
         has_credentials: bool,
         identity: Option<super::Identity>,
-        mismatch: bool,
+        mismatch: Option<String>,
         expires_at_ms: Option<u64>,
         usage_percent: f64,
         reads: std::sync::atomic::AtomicUsize,
@@ -2760,8 +2741,8 @@ mod tests {
             &self,
             _: &crate::services::claude_profiles::Profile,
             _: &super::Identity,
-        ) -> bool {
-            self.mismatch
+        ) -> Option<String> {
+            self.mismatch.clone()
         }
         fn usage<'a>(
             &'a self,
@@ -2812,7 +2793,7 @@ mod tests {
                 email: Some("fixture@example.test".into()),
                 source: crate::services::quota_history::AccountSource::Credential,
             }),
-            mismatch: false,
+            mismatch: None,
             expires_at_ms: Some(10_000),
             usage_percent: 37.0,
             reads: std::sync::atomic::AtomicUsize::new(0),
@@ -2852,25 +2833,30 @@ mod tests {
     }
 
     #[test]
-    fn profile_orchestration_hides_mismatch_and_records_no_identity() {
+    fn profile_mismatch_is_notice_only() {
         let mut io = fake_profile_io();
-        io.mismatch = true;
+        io.mismatch = Some("8c6913".into());
         let profile = fake_profile("/fixture/mismatch-orchestration");
-        let result = tauri::async_runtime::block_on(super::fetch_profile_with(
-            &profile,
-            &std::collections::HashMap::new(),
-            &io,
-        ));
-        assert_eq!(result.status, "mismatch");
-        assert!(result.quota.is_none());
-        assert_eq!(*io.records.lock().unwrap(), vec![(None, None)]);
+        let labels = std::collections::HashMap::from([("8c6913".into(), "Lucky".into())]);
+        let result =
+            tauri::async_runtime::block_on(super::fetch_profile_with(&profile, &labels, &io));
+        assert_eq!(result.status, "ok");
+        assert!(result.quota.as_ref().unwrap().session.is_some());
+        assert_eq!(result.quota.unwrap().config_account.unwrap().tail, "8c6913");
+        assert_eq!(
+            *io.records.lock().unwrap(),
+            vec![(
+                Some("d5fb0b".into()),
+                Some(crate::services::quota_history::AccountSource::Credential),
+            )]
+        );
     }
 
     #[test]
     fn profile_orchestration_keeps_unidentified_quota_without_identity() {
         let mut io = fake_profile_io();
         io.identity = None;
-        io.mismatch = true;
+        io.mismatch = Some("8c6913".into());
         let profile = fake_profile("/fixture/unidentified-orchestration");
         let result = tauri::async_runtime::block_on(super::fetch_profile_with(
             &profile,
@@ -3350,7 +3336,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_json_checks_identity_but_never_supplies_one() {
+    fn claude_json_mismatch_returns_saved_tail() {
         let identity = super::Identity {
             uuid: "7fd160a2-6103-4038-9fa1-000000d5fb0b".into(),
             email: None,
@@ -3358,9 +3344,15 @@ mod tests {
         };
         let same = r#"{"oauthAccount":{"accountUuid":"7fd160a2-6103-4038-9fa1-000000d5fb0b"}}"#;
         let other = r#"{"oauthAccount":{"accountUuid":"7fd160a2-6103-4038-9fa1-0000008c6913"}}"#;
-        assert!(!super::cross_check_identity_from(Some(same), &identity));
-        assert!(super::cross_check_identity_from(Some(other), &identity));
-        assert!(!super::cross_check_identity_from(None, &identity));
+        assert_eq!(
+            super::cross_check_identity_from(Some(same), &identity),
+            None
+        );
+        assert_eq!(
+            super::cross_check_identity_from(Some(other), &identity).as_deref(),
+            Some("8c6913")
+        );
+        assert_eq!(super::cross_check_identity_from(None, &identity), None);
         assert_eq!(
             identity.source,
             crate::services::quota_history::AccountSource::Credential
@@ -3584,6 +3576,7 @@ mod tests {
             crate::domain::models::QuotaData {
                 account: None,
                 account_label: None,
+                config_account: None,
                 app_account: None,
                 connected: true,
                 session: None,
