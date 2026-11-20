@@ -526,18 +526,59 @@ pub(crate) fn auto_ping_decision(input: AutoPingInput<'_>) -> AutoPingDecision {
 }
 
 pub(crate) fn other_claude_process_running() -> bool {
-    other_claude_process_running_from_exit(
-        claude_process_probe_command()
-            .status()
-            .ok()
-            .and_then(|status| status.code()),
-    )
+    let Some(home) = dirs::home_dir() else {
+        return true;
+    };
+    match claude_process_probe_command().output() {
+        Ok(output) if output.status.success() => busy_from_process_list(&output.stdout, &home),
+        _ => true,
+    }
 }
 
 fn claude_process_probe_command() -> Command {
-    let mut command = Command::new("/usr/bin/pgrep");
-    command.args(["-x", "claude"]);
+    let mut command = Command::new("/bin/ps");
     command
+        .args(["-axo", "pid=,comm="])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn busy_from_process_list(output: &[u8], home: &Path) -> bool {
+    let Ok(output) = std::str::from_utf8(output) else {
+        return true;
+    };
+    if !home.is_absolute()
+        || home
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return true;
+    }
+    let desktop = home.join("Library/Application Support/Claude/claude-code");
+    for line in output.lines() {
+        let line = line.trim_start();
+        let Some(separator) = line.find(char::is_whitespace) else {
+            return true;
+        };
+        let (pid, path) = line.split_at(separator);
+        if pid.parse::<u32>().is_err() {
+            return true;
+        }
+        let path = Path::new(path.trim_start());
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return true;
+        }
+        if path.file_name() == Some(std::ffi::OsStr::new("claude")) && !path.starts_with(&desktop) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Runs the Claude child after the caller has acquired `ClaudeFlight` and
@@ -554,10 +595,6 @@ pub(crate) async fn run_claude_renewal_ping_for(config_dir: Option<&str>) -> boo
         run_child_without_blocking(command, CLI_TIMEOUT).await,
         ChildResult::Success(_)
     )
-}
-
-fn other_claude_process_running_from_exit(exit_code: Option<i32>) -> bool {
-    exit_code != Some(1)
 }
 
 async fn run_claude_if_idle<P, PF, R, RF>(
@@ -2341,18 +2378,68 @@ mod tests {
             auto_ping_decision(input),
             AutoPingDecision::OtherClaudeRunning
         );
-        // The production pgrep adapter maps both a match and a probe failure
-        // to this same conservative input.
-        assert!(other_claude_process_running_from_exit(Some(0)));
-        assert!(other_claude_process_running_from_exit(None));
     }
 
     #[test]
-    fn pgrep_uses_absolute_path() {
+    fn process_probe_uses_absolute_path_and_cleared_environment() {
+        let command = claude_process_probe_command();
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("/bin/ps"));
         assert_eq!(
-            claude_process_probe_command().get_program(),
-            std::ffi::OsStr::new("/usr/bin/pgrep")
+            command.get_args().collect::<Vec<_>>(),
+            ["-axo", "pid=,comm="]
         );
+        assert!(command.get_envs().next().is_none());
+    }
+
+    #[test]
+    fn process_list_classification_is_conservative() {
+        let home = Path::new("/Users/test");
+        let desktop = "  12 /Users/test/Library/Application Support/Claude/claude-code/1/claude.app/Contents/MacOS/claude\n";
+        let cases: Vec<(&str, Vec<u8>, bool)> = vec![
+            (
+                "desktop sessions",
+                format!("{desktop}{desktop}").into_bytes(),
+                false,
+            ),
+            (
+                "desktop and cli",
+                format!("{desktop} 13 /Users/x/.local/bin/claude\n").into_bytes(),
+                true,
+            ),
+            ("cli", b"1 /usr/local/bin/claude\n".to_vec(), true),
+            (
+                "similar prefix",
+                b"1 /Users/test/Library/Application Support/Claude/claude-code-other/claude\n"
+                    .to_vec(),
+                true,
+            ),
+            (
+                "other basenames",
+                b"1 /bin/claude-helper\n2 /bin/claudex\n3 /bin/Claude\n".to_vec(),
+                false,
+            ),
+            ("empty", vec![], false),
+            ("pid zero", b"0 kernel_task\n".to_vec(), false),
+            (
+                "other home",
+                b"1 /Users/other/Library/Application Support/Claude/claude-code/1/claude\n"
+                    .to_vec(),
+                true,
+            ),
+            ("invalid utf8", vec![0xff], true),
+            ("invalid pid", b"no /bin/other\n".to_vec(), true),
+            ("missing path", b"1 \n".to_vec(), true),
+            (
+                "parent traversal",
+                b"1 /Users/test/Library/Application Support/Claude/claude-code/../claude\n"
+                    .to_vec(),
+                true,
+            ),
+        ];
+        for (name, output, expected) in cases {
+            assert_eq!(busy_from_process_list(&output, home), expected, "{name}");
+        }
+        assert!(busy_from_process_list(b"", Path::new("relative")));
     }
 
     #[test]
