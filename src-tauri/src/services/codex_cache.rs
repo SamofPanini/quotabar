@@ -3,7 +3,24 @@ use crate::domain::models::CodexRateLimits;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+pub(super) const AUTH_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+struct AuthBackoff {
+    stamp: AuthFileStamp,
+    failed_at: Instant,
+}
+
+fn should_skip_auth_request(
+    backoff: Option<&AuthBackoff>,
+    stamp: &AuthFileStamp,
+    now: Instant,
+) -> bool {
+    backoff.is_some_and(|entry| {
+        entry.stamp == *stamp && now.saturating_duration_since(entry.failed_at) < AUTH_BACKOFF
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AuthFileStamp {
@@ -19,6 +36,7 @@ struct Cached {
 #[derive(Default)]
 struct RouteState {
     cached: Option<Cached>,
+    auth_backoff: Option<AuthBackoff>,
     known_auth_failures: HashMap<AccountCacheKey, u64>,
     unknown_auth_failure: Option<u64>,
 }
@@ -161,17 +179,38 @@ pub(super) fn invalidate(
         .invalidate(route, key, sequence);
     Ok(())
 }
+pub(super) fn skip_auth_request(route: &RouteKey, stamp: &AuthFileStamp) -> Result<bool, String> {
+    let cache = cache().lock().map_err(|e| e.to_string())?;
+    Ok(should_skip_auth_request(
+        cache
+            .routes
+            .get(route)
+            .and_then(|state| state.auth_backoff.as_ref()),
+        stamp,
+        Instant::now(),
+    ))
+}
+
+pub(super) fn record_auth_failure(route: &RouteKey, stamp: AuthFileStamp) -> Result<(), String> {
+    let mut cache = cache().lock().map_err(|e| e.to_string())?;
+    cache.routes.entry(route.clone()).or_default().auth_backoff = Some(AuthBackoff {
+        stamp,
+        failed_at: Instant::now(),
+    });
+    Ok(())
+}
+
 pub(super) fn next_request_sequence() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthFileStamp, Cache};
+    use super::{should_skip_auth_request, AuthBackoff, AuthFileStamp, Cache, AUTH_BACKOFF};
     use crate::domain::account::{CodexProfile, CodexProfileInput};
     use crate::domain::models::{CodexRateLimitWindow, CodexRateLimits};
     use std::fs;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
     fn profile(name: &str) -> CodexProfile {
         let path =
             std::env::temp_dir().join(format!("quotabar-cache-{name}-{}", std::process::id()));
@@ -182,6 +221,48 @@ mod tests {
         })
         .unwrap()
     }
+    #[test]
+    fn auth_backoff_is_bounded_by_stamp_time_and_route() {
+        let mut cache = Cache::default();
+        let first = profile("backoff-first");
+        let second = profile("backoff-second");
+        let now = Instant::now();
+        cache
+            .routes
+            .entry(first.route().clone())
+            .or_default()
+            .auth_backoff = Some(AuthBackoff {
+            stamp: stamp(1),
+            failed_at: now,
+        });
+        let lookup = |route: &crate::domain::account::RouteKey| {
+            cache
+                .routes
+                .get(route)
+                .and_then(|state| state.auth_backoff.as_ref())
+        };
+        assert!(should_skip_auth_request(
+            lookup(first.route()),
+            &stamp(1),
+            now + Duration::from_secs(899)
+        ));
+        assert!(!should_skip_auth_request(
+            lookup(first.route()),
+            &stamp(1),
+            now + AUTH_BACKOFF
+        ));
+        assert!(!should_skip_auth_request(
+            lookup(first.route()),
+            &stamp(2),
+            now
+        ));
+        assert!(!should_skip_auth_request(
+            lookup(second.route()),
+            &stamp(1),
+            now
+        ));
+    }
+
     fn limits() -> CodexRateLimits {
         CodexRateLimits {
             connected: true,

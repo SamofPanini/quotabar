@@ -147,6 +147,20 @@ pub async fn get_cost_daily(
     .map_err(|err| format!("Daily cost task failed: {err}"))?
 }
 
+fn daily_cache_key(source: &str, days: u32, currency: &str, timezone: &str) -> String {
+    format!(
+        "daily|{source}|{days}|{currency}|{timezone}|{}",
+        pricing_snapshot::snapshot_identity()
+    )
+}
+
+fn overview_cache_key(source: &str, currency: &str, timezone: &str) -> String {
+    format!(
+        "{source}|{currency}|{timezone}|{}",
+        pricing_snapshot::snapshot_identity()
+    )
+}
+
 fn build_cost_daily(
     source: String,
     days: u32,
@@ -165,12 +179,11 @@ fn build_cost_daily(
     let source = UsageSource::from_str(&source).map_err(|err| err.to_string())?;
     let currency = normalize_optional(currency);
     let timezone = normalize_optional(timezone);
-    let cache_key = format!(
-        "daily|{}|{}|{}|{}",
+    let cache_key = daily_cache_key(
         source.as_str(),
         days,
         currency.as_deref().unwrap_or("USD"),
-        timezone.as_deref().unwrap_or("local")
+        timezone.as_deref().unwrap_or("local"),
     );
 
     if !force {
@@ -382,11 +395,10 @@ fn build_cost_overview(
     let source = UsageSource::from_str(&source).map_err(|err| err.to_string())?;
     let currency = normalize_optional(currency);
     let timezone = normalize_optional(timezone);
-    let cache_key = format!(
-        "{}|{}|{}",
+    let cache_key = overview_cache_key(
         source.as_str(),
         currency.as_deref().unwrap_or("USD"),
-        timezone.as_deref().unwrap_or("local")
+        timezone.as_deref().unwrap_or("local"),
     );
 
     if !force {
@@ -628,6 +640,14 @@ impl From<ModelCostSummary> for CostModelSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_cache_keys_include_bundled_snapshot_identity() {
+        let identity = pricing_snapshot::snapshot_identity();
+        assert_eq!(identity.len(), 12);
+        assert!(daily_cache_key("codex", 7, "USD", "local").ends_with(&format!("|{identity}")));
+        assert!(overview_cache_key("codex", "USD", "local").ends_with(&format!("|{identity}")));
+    }
 
     fn batch(summaries: Vec<CostSummary>) -> MultiCostSummary {
         MultiCostSummary {

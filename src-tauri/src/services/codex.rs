@@ -187,13 +187,6 @@ fn read_auth_json_with_stamp(
         })
 }
 
-fn read_auth_json(profile: &CodexProfile) -> Result<serde_json::Value, String> {
-    let auth_file = auth_file_path(profile)?;
-    let content =
-        fs::read_to_string(&auth_file).map_err(|e| format!("Failed to read auth.json: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse auth.json: {e}"))
-}
-
 fn parse_used_percent(window: &serde_json::Value) -> Option<f64> {
     window
         .get("used_percent")
@@ -392,6 +385,32 @@ fn should_preserve_transport_failure(
     is_timeout || is_connect || is_transient_os_error
 }
 
+const TOKEN_EXPIRED: &str = "Token expired. Please run 'codex' to re-login.";
+
+fn record_auth_failure(profile: &CodexProfile, stamp: AuthFileStamp, status: reqwest::StatusCode) {
+    let alias = profile
+        .profile_id()
+        .strip_prefix("codex/")
+        .unwrap_or("unknown");
+    let alias = if !alias.is_empty()
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        alias
+    } else {
+        "unknown"
+    };
+    log_msg(&format!(
+        "[RateLimits] auth failure: profile={alias} status={status}"
+    ));
+    if let Err(cache_error) = codex_cache::record_auth_failure(profile.route(), stamp) {
+        log_msg(&format!(
+            "[RateLimits] failed to record auth backoff: {cache_error}"
+        ));
+    }
+}
+
 pub async fn fetch_codex_rate_limits() -> CodexRateLimits {
     fetch_codex_rate_limits_for(&default_codex_profile()).await
 }
@@ -416,6 +435,9 @@ async fn fetch_codex_rate_limits_from_auth(
     auth_json: serde_json::Value,
     auth_stamp: AuthFileStamp,
 ) -> CodexRateLimits {
+    if codex_cache::skip_auth_request(profile.route(), &auth_stamp).unwrap_or(false) {
+        return CodexRateLimits::disconnected(TOKEN_EXPIRED);
+    }
     let access_token = match auth_json["tokens"]["access_token"].as_str() {
         Some(token) => token,
         None => {
@@ -489,8 +511,8 @@ async fn fetch_codex_rate_limits_from_auth(
     }
 
     if status.as_u16() == 401 || status.as_u16() == 403 {
-        let error = "Token expired. Please run 'codex' to re-login.";
-        log_msg(&format!("[RateLimits] auth failure: status={status}"));
+        let error = TOKEN_EXPIRED;
+        record_auth_failure(profile, auth_stamp, status);
         if let Err(cache_error) =
             codex_cache::invalidate(profile.route(), account_key.as_ref(), request_sequence)
         {
@@ -573,17 +595,21 @@ pub async fn fetch_codex_reset_credits() -> CodexResetCredits {
 }
 
 pub(crate) async fn fetch_codex_reset_credits_for(profile: &CodexProfile) -> CodexResetCredits {
-    let auth_json = match read_auth_json(profile) {
-        Ok(v) => v,
-        Err(error) => return CodexResetCredits::disconnected(error),
+    let (auth_json, stamp) = match read_auth_json_with_stamp(profile) {
+        Ok(value) => value,
+        Err(error) => return CodexResetCredits::disconnected(error.message),
     };
-    fetch_codex_reset_credits_from_auth(profile, auth_json).await
+    fetch_codex_reset_credits_from_auth(profile, auth_json, stamp).await
 }
 
 async fn fetch_codex_reset_credits_from_auth(
-    _profile: &CodexProfile,
+    profile: &CodexProfile,
     auth_json: serde_json::Value,
+    auth_stamp: AuthFileStamp,
 ) -> CodexResetCredits {
+    if codex_cache::skip_auth_request(profile.route(), &auth_stamp).unwrap_or(false) {
+        return CodexResetCredits::disconnected(TOKEN_EXPIRED);
+    }
     let access_token = match auth_json["tokens"]["access_token"].as_str() {
         Some(token) => token,
         None => return CodexResetCredits::disconnected("No access_token found in auth.json"),
@@ -618,7 +644,8 @@ async fn fetch_codex_reset_credits_from_auth(
     };
 
     if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
-        return CodexResetCredits::disconnected("Token expired. Please run 'codex' to re-login.");
+        record_auth_failure(profile, auth_stamp, response.status());
+        return CodexResetCredits::disconnected(TOKEN_EXPIRED);
     }
 
     if !response.status().is_success() {
@@ -711,10 +738,10 @@ impl BatchAuthSnapshot {
         (self.auth_json.clone(), self.stamp.clone())
     }
 
-    fn for_reset_credits(&self) -> serde_json::Value {
+    fn for_reset_credits(&self) -> (serde_json::Value, AuthFileStamp) {
         #[cfg(test)]
         record_batch_snapshot_use(&self.auth_json, false);
-        self.auth_json.clone()
+        (self.auth_json.clone(), self.stamp.clone())
     }
 }
 
@@ -732,8 +759,9 @@ pub(crate) async fn fetch_codex_profiles(profiles: Vec<CodexProfile>) -> Vec<Cod
                 let (limits_auth, limits_stamp) = snapshot.for_rate_limits();
                 let rate_limits =
                     fetch_codex_rate_limits_from_auth(&profile, limits_auth, limits_stamp).await;
+                let (credits_auth, credits_stamp) = snapshot.for_reset_credits();
                 let reset_credits =
-                    fetch_codex_reset_credits_from_auth(&profile, snapshot.for_reset_credits())
+                    fetch_codex_reset_credits_from_auth(&profile, credits_auth, credits_stamp)
                         .await;
                 results.push(CodexProfileQuota {
                     profile_id: profile.profile_id().to_string(),

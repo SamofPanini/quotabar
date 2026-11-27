@@ -4,6 +4,8 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import ClaudePanel from '../src/components/ClaudePanel';
 import App from '../src/App';
+import TabSwitcher from '../src/components/TabSwitcher';
+import OverviewPanel from '../src/components/OverviewPanel';
 import { backend } from '../src/services/backend';
 import type { ClaudeProfile, ClaudeProfileStatus, QuotaData } from '../src/types/models';
 
@@ -84,6 +86,58 @@ describe('Claude account tabs', () => {
     expect(JSON.stringify(view.toJSON())).toContain('Claude profile unavailable.');
     await act(async () => view.unmount());
   });
+  it('replaces the weekly percentage node on account and value changes', async () => {
+    const defaultQuota = { ...quota, weeklyTotal: { percentage: 15 } } as unknown as QuotaData;
+    const luckyQuota = { ...quota, weeklyTotal: { percentage: 84 } } as unknown as QuotaData;
+    const props = {
+      quota: defaultQuota, loading: false, error: null, windowVisible: false,
+      costRefreshKey: 0, onRetry: () => {}, profiles: { profiles: [{ ...profile('ok'), quota: luckyQuota }] },
+      sections: { timeline: false, cost: false, trend: false, tips: false },
+    };
+    let view!: ReactTestRenderer;
+    await act(async () => { view = create(createElement(ClaudePanel, { ...props, selectedAlias: 'default' })); });
+    const before = view.root.findAllByProps({ className: 'quota-percentage' })[1];
+    expect(before.children.join('')).toBe('15%');
+    await act(async () => { view.update(createElement(ClaudePanel, { ...props, selectedAlias: 'lucky' })); });
+    const after = view.root.findAllByProps({ className: 'quota-percentage' })[1];
+    expect(after.children.join('')).toBe('84%');
+    expect(after).not.toBe(before);
+    const changed = { ...props, profiles: { profiles: [{ ...profile('ok'), quota: { ...luckyQuota, weeklyTotal: { percentage: 85 } } as unknown as QuotaData }] } };
+    await act(async () => { view.update(createElement(ClaudePanel, { ...changed, selectedAlias: 'lucky' })); });
+    const updated = view.root.findAllByProps({ className: 'quota-percentage' })[1];
+    expect(updated.children.join('')).toBe('85%');
+    expect(updated).not.toBe(after);
+    await act(async () => view.unmount());
+  });
+
+  it('updates the switcher for the selected Claude account', async () => {
+    const values = new Map([['claude-quota-tab', 'claude']]);
+    (globalThis as Record<string, unknown>).localStorage = {
+      getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key), clear: () => values.clear(),
+      key: (index: number) => [...values.keys()][index] ?? null, get length() { return values.size; },
+    };
+    const defaultQuota = { ...quota, weeklyTotal: { percentage: 15 } } as unknown as QuotaData;
+    const luckyQuota = { ...quota, weeklyTotal: { percentage: 84 } } as unknown as QuotaData;
+    vi.spyOn(backend, 'setClaudeAutoRenew').mockResolvedValue(undefined);
+    vi.spyOn(backend, 'getQuota').mockResolvedValue(defaultQuota);
+    vi.spyOn(backend, 'getClaudeProfiles').mockResolvedValue({ profiles: [{ ...profile('ok'), quota: luckyQuota }] });
+    let view!: ReactTestRenderer;
+    await act(async () => { view = create(createElement(App)); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+    const claudePercent = () => view.root.findByType(TabSwitcher).props.summaries.find((summary: { id: string }) => summary.id === 'claude').usedPercent;
+    expect(claudePercent()).toBe(15);
+    await act(async () => { view.root.find((node) => node.props.role === 'tab' && node.children.join('') === 'Lucky').props.onClick(); });
+    expect(claudePercent()).toBe(84);
+    await act(async () => { view.root.findByType(TabSwitcher).props.onTabChange('all'); });
+    expect(view.root.findByType(OverviewPanel).props.mostConstrained).toEqual(expect.arrayContaining([expect.objectContaining({ provider: 'claude', usedPercent: 84 })]));
+    await act(async () => { view.root.findByType(TabSwitcher).props.onTabChange('claude'); });
+    await act(async () => { view.root.find((node) => node.props.role === 'tab' && node.children.join('') === 'test@example.test').props.onClick(); });
+    expect(claudePercent()).toBe(15);
+    await act(async () => view.unmount());
+    vi.restoreAllMocks();
+    delete (globalThis as Record<string, unknown>).localStorage;
+  });
+
   it('sends Ping to the selected profile alias', async () => {
     const values = new Map([['claude-quota-tab', 'claude']]);
     (globalThis as Record<string, unknown>).localStorage = {

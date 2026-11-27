@@ -17,6 +17,14 @@ use std::{
 const SNAPSHOT: &[u8] = include_bytes!("../../resources/pricing/litellm_model_prices.json");
 const SOURCE: &str = include_str!("../../resources/pricing/pricing-source.json");
 
+pub(crate) fn snapshot_identity() -> String {
+    let source: Value = serde_json::from_str(SOURCE).expect("invalid bundled pricing metadata");
+    let hash = source["snapshot_sha256"]
+        .as_str()
+        .expect("missing snapshot_sha256");
+    hash.get(..12).expect("invalid snapshot_sha256").to_string()
+}
+
 static INSTALL_ONCE: Once = Once::new();
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -336,8 +344,25 @@ mod tests {
             "gpt-5.6-luna",
             "gpt-5.6-sol",
             "gpt-6.1-terra",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
         ] {
             assert!(pricing.contains_key(model), "missing {model}");
+        }
+    }
+    #[test]
+    fn gpt_6_2_sol_snapshot_prices_cover_short_and_long_context() {
+        let pricing: Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        let model = &pricing["gpt-6.2-sol"];
+        for (field, expected) in [
+            ("input_cost_per_token", 2e-6),
+            ("cache_read_input_token_cost", 1e-7),
+            ("output_cost_per_token", 1e-5),
+            ("input_cost_per_token_above_272k_tokens", 4e-6),
+            ("cache_read_input_token_cost_above_272k_tokens", 2e-7),
+            ("output_cost_per_token_above_272k_tokens", 1.5e-5),
+        ] {
+            assert_eq!(model[field].as_f64(), Some(expected), "{field}");
         }
     }
 }

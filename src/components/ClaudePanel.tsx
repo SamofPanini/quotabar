@@ -127,7 +127,7 @@ export default function ClaudePanel({
       {!quota && <ServiceStatusNotice provider="claude" status={serviceStatus} />}
 
       {quota && (
-        <div className="detail-stack">
+        <div className="detail-stack" key={selectedAlias}>
           <ProviderDetailHeader
             service="claude"
             status={error ? 'Stale data' : quota.connected ? 'Connected' : 'Offline'}
