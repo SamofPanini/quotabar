@@ -1156,7 +1156,7 @@ export default function App() {
 
   const serviceUsage: ServiceMap<number | null> = {
     ...usedPercent,
-    claude: getClaudeTrayUsedPercent(quota),
+    claude: getClaudeTrayUsedPercent(selectedClaudeQuota),
   };
   const serviceLoading: ServiceMap<boolean> = {
     ...panelLoading,
@@ -1166,7 +1166,7 @@ export default function App() {
   const providerSummaries = buildProviderSummaries(tabConnected, serviceLoading, serviceUsage);
   const switcherSummaries = providerSummaries.filter((summary) => switcherVisibility[summary.id]);
   const allQuotaWindows = [
-    ...buildClaudeQuotaWindows(quota),
+    ...buildClaudeQuotaWindows(selectedClaudeQuota),
     ...providerQuotaWindows.codex,
     ...providerQuotaWindows.cursor,
     ...providerQuotaWindows.grok,

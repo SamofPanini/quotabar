@@ -32,7 +32,7 @@ export default function QuotaCard({ label, percentage, resetsIn, pace, featured 
     <div className={`quota-card${featured ? ' featured' : ''}${grayed ? ' quota-card-stale' : ''}`}>
       <div className="quota-header">
         <span className="quota-label">{label}</span>
-        <span className="quota-percentage">{percentage}%</span>
+        <span className="quota-percentage" key={percentage}>{percentage}%</span>
       </div>
 
       <div

@@ -4,6 +4,11 @@ All notable QuotaBar changes should be summarized here before a release is cut.
 
 ## Unreleased
 
+- Switching between Claude accounts now always shows the selected account's numbers. Previously the percentage text on a quota card could keep the previous account's value (the bar was right). The service switcher's Claude percentage and the overview's Claude windows also follow the selected account now; the menu bar icon and alerts are unchanged.
+- Updated the bundled pricing snapshot (LiteLLM, 2026-11) so `gpt-6.2-sol` and `gpt-6.2-astra` usage is priced, including the higher rate for requests above 272K input tokens. Cached cost results are now tied to the bundled snapshot, so an update no longer serves results computed with the old prices.
+- When a Codex sign-in is rejected (401/403), QuotaBar now waits 15 minutes before asking again for that account, unless the sign-in file changes (re-login resumes immediately). The log line now names the account alias. No tokens, emails or account IDs are logged.
+- Updated vite to 7.3.8 and vitest to 4.1.12 (npm audit clean).
+
 - Updated the bundled pricing snapshot (LiteLLM, 2026-11-11) so `claude-fable-5-2` usage is priced in local cost summaries ($8 input, $40 output, $0.20 cache read, $10 / $16 for 5-minute / 1-hour cache writes per million tokens). Prices for every model QuotaBar already priced are unchanged; the snapshot is still bundled and nothing is fetched at runtime.
 - The shared Fable weekly quota is now labelled "Fable" (and "Fable 7-day" in the overview) instead of "Fable 5": Anthropic reports one Fable limit that also covers Fable 5.2. The quota itself, its parsing and stored fields are unchanged.
 - Updated ccstats to 0.11.1: Claude Haiku 5.5 requests with more than 100K input tokens are now priced at the long-context rate instead of the standard rate. Also picks up patched `rustls-webpki` 0.103.16, `webpki-roots` 1.0.12 and `zstd` 0.14.3 (RUSTSEC-2026-0382, -0381, -0391).
